@@ -135,7 +135,6 @@ Environment Variables:
   OPENERAL_HOME           Home directory path
   OPENERAL_DATA_DIR       Embedded DB data path (default: ~/.openeral/data)
   DATABASE_URL            Use external PostgreSQL instead of embedded DB
-  STRINGCOST_API_KEY      Track API costs via StringCost proxy
 `);
 }
 
@@ -251,15 +250,13 @@ Query the connected database:
 
 The \`pg\` command uses psql if available, otherwise Node.js pg.
 
-## Cost Analysis
+## Usage Analysis
 
-With StringCost enabled, you can analyze your API usage:
+Analyze and optimize your token usage:
 
-    npx openeral optimize sync      # Fetch data from StringCost
-    npx openeral optimize stats     # View statistics
-    npx openeral optimize analyze   # Get recommendations
-
-StringCost tracks all API calls automatically.
+    npx openeral optimize stats     # View API call statistics
+    npx openeral optimize analyze   # Analyze where tokens are spent
+    npx openeral optimize apply     # Apply recommended optimizations
 `);
     }
 
@@ -278,69 +275,6 @@ StringCost tracks all API calls automatically.
     OPENERAL_WORKSPACE_ID: workspaceId,
   };
 
-  // --- Determine upstream Anthropic URL ---
-  // Default: direct Anthropic. If StringCost is configured, use its proxy URL
-  // so that both StringCost tracking and local DB tracking work together.
-  let upstreamBaseUrl = 'https://api.anthropic.com';
-
-  if (process.env.STRINGCOST_API_KEY && process.env.ANTHROPIC_API_KEY) {
-    process.stderr.write('\x1b[2mopeneral: presigning with StringCost...\x1b[0m\n');
-    try {
-      const controller = new AbortController();
-      const timeoutId = setTimeout(() => controller.abort(), 10000);
-
-      const res = await fetch('https://app.stringcost.com/v1/presign', {
-        method: 'POST',
-        headers: {
-          'Authorization': `Bearer ${process.env.STRINGCOST_API_KEY}`,
-          'Content-Type': 'application/json',
-        },
-        body: JSON.stringify({
-          provider: 'anthropic',
-          client_api_key: process.env.ANTHROPIC_API_KEY,
-          path: ['/v1/messages'],
-          expires_in: -1,
-          max_uses: -1,
-          tags: ['openeral'],
-          metadata: { source: 'openeral' },
-        }),
-        signal: controller.signal,
-      });
-      clearTimeout(timeoutId);
-
-      if (res.ok) {
-        const data = await res.json() as { url?: string };
-        if (data.url) {
-          upstreamBaseUrl = data.url.replace(/\/v1\/.*$/, '');
-          process.stderr.write('\x1b[2mopeneral: StringCost enabled — costs tracked via StringCost + local DB\x1b[0m\n');
-
-          // Save the presign session URL so `npx openeral optimize sync` can
-          // still decode the JWT and query token-usage data from StringCost.
-          if (pool) {
-            try {
-              await pool.query(
-                `UPDATE _openeral.workspace_config
-                 SET config = config || $2::jsonb, updated_at = NOW()
-                 WHERE id = $1`,
-                [
-                  workspaceId,
-                  JSON.stringify({
-                    stringcost_session_url: data.url,
-                    stringcost_session_started: new Date().toISOString(),
-                  }),
-                ],
-              );
-            } catch {
-              // Non-critical
-            }
-          }
-        }
-      }
-    } catch (err: any) {
-      process.stderr.write(`\x1b[33mopeneral: StringCost presign failed: ${err.message}\x1b[0m\n`);
-    }
-  }
-
   // --- Start local optimizer proxy ---
   // The proxy intercepts every /v1/messages call, saves token usage to the
   // local DB immediately, then forwards to the upstream URL. This means
@@ -353,7 +287,7 @@ StringCost tracks all API calls automatically.
       const { OptimizerProxy } = await import('./optimize/proxy.js');
       proxyServer = new OptimizerProxy({
         anthropicApiKey: process.env.ANTHROPIC_API_KEY,
-        anthropicBaseUrl: upstreamBaseUrl,
+        anthropicBaseUrl: 'https://api.anthropic.com',
         pool,
         workspaceId,
         sessionId,

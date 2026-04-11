@@ -147,14 +147,14 @@ export function formatStats(stats: Awaited<ReturnType<typeof getOptimizationStat
     '═'.repeat(60),
     '',
     'TOTAL SAVINGS',
-    `  Cost without optimizer:  $${stats.totalCostWithout.toFixed(2)}`,
-    `  Cost with optimizer:     $${stats.totalCostWith.toFixed(2)}`,
-    `  Total saved:             $${stats.totalSaved.toFixed(2)} (${stats.savingsPercentage.toFixed(0)}% reduction)`,
+    `  Cost without optimizer:  $${stats.totalCostWithout.toFixed(6)}`,
+    `  Cost with optimizer:     $${stats.totalCostWith.toFixed(6)}`,
+    `  Total saved:             $${stats.totalSaved.toFixed(6)} (${stats.savingsPercentage.toFixed(2)}% reduction)`,
     '',
     'TOKEN USAGE',
     `  Original tokens:         ${stats.totalTokensOriginal.toLocaleString()}`,
     `  Optimized tokens:        ${stats.totalTokensOptimized.toLocaleString()}`,
-    `  Tokens saved:            ${stats.tokensSaved.toLocaleString()} (${((stats.tokensSaved / stats.totalTokensOriginal) * 100).toFixed(0)}% reduction)`,
+    `  Tokens saved:            ${stats.tokensSaved.toLocaleString()} (${stats.totalTokensOriginal > 0 ? ((stats.tokensSaved / stats.totalTokensOriginal) * 100).toFixed(2) : '0.00'}% reduction)`,
     '',
     'MODEL DISTRIBUTION',
   ];
@@ -169,8 +169,8 @@ export function formatStats(stats: Awaited<ReturnType<typeof getOptimizationStat
   lines.push('');
   lines.push('OPTIMIZATION BREAKDOWN');
   for (const [opt, saved] of Object.entries(stats.optimizationBreakdown)) {
-    const percentage = ((saved / stats.totalSaved) * 100).toFixed(0);
-    lines.push(`  ${opt}:  $${saved.toFixed(2)} saved (${percentage}%)`);
+    const percentage = stats.totalSaved > 0 ? ((saved / stats.totalSaved) * 100).toFixed(2) : '0.00';
+    lines.push(`  ${opt}:  $${saved.toFixed(6)} saved (${percentage}%)`);
   }
 
   lines.push('');

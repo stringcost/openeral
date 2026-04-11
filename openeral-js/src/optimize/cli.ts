@@ -8,7 +8,6 @@ import { hostname } from 'node:os';
 import { createPool } from '../db/pool.js';
 import { runMigrations } from '../db/migrations.js';
 import { getOptimizationStats, formatStats } from './metrics.js';
-import { analyzeUsage, formatAnalysisReport } from './analyzer.js';
 
 async function main() {
   const args = process.argv.slice(2);
@@ -22,9 +21,9 @@ Usage:
   npx openeral optimize <command> [options]
 
 Commands:
-  stats                Show optimization statistics
-  analyze              Analyze usage and provide recommendations
-  sync                 Sync usage data from StringCost (requires STRINGCOST_API_KEY)
+  stats                Show API call statistics (costs, tokens, cache hits)
+  analyze              Analyze session history and propose changes to reduce future token usage
+  apply                Apply proposals from analyze (patches CLAUDE.md, creates context file, etc.)
   test-db              Test database connection
   help                 Show this help message
 
@@ -32,25 +31,32 @@ Stats Options:
   --workspace <id>     Workspace ID (default: hostname)
   --days <n>           Number of days to analyze (default: 7)
 
-Analyze Options:
+Analyze / Apply Options:
   --workspace <id>     Workspace ID (default: hostname)
-  --days <n>           Number of days to analyze (default: 7)
-  --json               Output as JSON
+  --days <n>           Days of session history to analyze (default: 7)
+  --project-root <p>   Project root directory (default: auto-detect from cwd)
+  --dry-run            Preview changes without writing files (apply only)
+  --proposal <id>      Apply a specific proposal by ID (apply only; omit = apply all)
+  --json               Output as JSON (analyze only)
 
-Sync Options:
-  --workspace <id>     Workspace ID (default: hostname)
-  --days <n>           Number of days to sync (default: 7)
+Proposal IDs:
+  model-routing        Add model selection rules to CLAUDE.md
+  context-file         Create .claude/CONTEXT.md + add read/update instruction
+  readme-updates       Add README maintenance instruction to CLAUDE.md
+  lazy-reading         Add file reading efficiency rules to CLAUDE.md
+  memory-compact       Strip code blocks and duplicates from memory files
 
 Note:
   Database is embedded PGlite (auto-starts, no Docker needed).
   Set DATABASE_URL to use an external PostgreSQL instead.
-  The 'sync' command requires STRINGCOST_API_KEY to fetch usage data.
+  Run sessions via 'npx openeral' first so analyze has usage data.
 
 Examples:
-  npx openeral optimize test-db
-  npx openeral optimize sync
-  npx openeral optimize stats
   npx openeral optimize analyze
+  npx openeral optimize apply
+  npx openeral optimize apply --dry-run
+  npx openeral optimize apply --proposal model-routing
+  npx openeral optimize apply --proposal context-file
 `);
     process.exit(0);
   }
@@ -59,8 +65,9 @@ Examples:
   let workspaceId = process.env.OPENERAL_WORKSPACE_ID || hostname();
   let days = 7;
   let jsonOutput = false;
-  let port = 8000;
-  let optimizerEnabled = true;
+  let dryRun = false;
+  let projectRoot = '';
+  const proposalIds: string[] = [];
 
   for (let i = 1; i < args.length; i++) {
     if (args[i] === '--workspace' && args[i + 1]) {
@@ -69,14 +76,14 @@ Examples:
       days = parseInt(args[++i], 10);
     } else if (args[i] === '--json') {
       jsonOutput = true;
-    } else if (args[i] === '--port' && args[i + 1]) {
-      port = parseInt(args[++i], 10);
-    } else if (args[i] === '--no-optimize') {
-      optimizerEnabled = false;
+    } else if (args[i] === '--dry-run') {
+      dryRun = true;
+    } else if (args[i] === '--project-root' && args[i + 1]) {
+      projectRoot = args[++i];
+    } else if (args[i] === '--proposal' && args[i + 1]) {
+      proposalIds.push(args[++i]);
     }
   }
-
-  // Proxy command doesn't need database (REMOVED - using StringCost instead)
 
   // Test database connection
   if (command === 'test-db') {
@@ -132,62 +139,31 @@ Examples:
       const stats = await getOptimizationStats(pool, workspaceId, days);
       console.log(formatStats(stats));
     } else if (command === 'analyze') {
-      const report = await analyzeUsage(pool, workspaceId, days);
-      
-      if (jsonOutput) {
-        console.log(JSON.stringify(report, null, 2));
-      } else {
-        console.log(formatAnalysisReport(report));
-      }
-    } else if (command === 'sync') {
-      const apiKey = process.env.STRINGCOST_API_KEY;
-      if (!apiKey) {
-        console.error('❌ STRINGCOST_API_KEY is required for sync');
-        console.error('   export STRINGCOST_API_KEY="sk-stringcost-..."');
-        console.error('\nStringCost tracks API usage and costs automatically.');
-        console.error('Get your API key at: https://stringcost.com');
-        process.exit(1);
-      }
-
-      // Look up the session URL saved during the last `npx openeral` run.
-      // The JWT in the URL encodes the session ID so we can scope the query.
-      let sessionId: string | undefined;
-      let clientId: string | undefined;
-
-      try {
-        const { decodePresignUrl } = await import('./stringcost-api.js');
-        const configResult = await pool.query(
-          `SELECT config FROM _openeral.workspace_config WHERE id = $1`,
-          [workspaceId],
-        );
-        const config = configResult.rows[0]?.config as Record<string, string> | undefined;
-        if (config?.stringcost_session_url) {
-          const decoded = decodePresignUrl(config.stringcost_session_url);
-          sessionId = decoded.sessionId;
-          clientId = decoded.clientId;
-        }
-      } catch {
-        // No stored session — will fall back to account-wide event fetch
-      }
-
-      console.log(`📥 Fetching usage data from StringCost (last ${days} days)...`);
-      if (sessionId) {
-        console.log(`   Session ID: ${sessionId.slice(0, 8)}...`);
-      } else {
-        console.log(`   (no session ID stored — fetching all account events)`);
-      }
-
-      const { syncStringCostData } = await import('./stringcost-api.js');
-      const result = await syncStringCostData(pool, workspaceId, apiKey, {
-        sessionId,
-        clientId,
+      const { analyzePromptSurface, formatPromptSurfaceReport } = await import('./analyzer.js');
+      const report = await analyzePromptSurface({
+        pool,
+        workspaceId,
+        projectRoot: projectRoot || process.cwd(),
         daysBack: days,
       });
 
-      console.log(`\n✅ Sync complete!`);
-      console.log(`   Fetched: ${result.fetched} events`);
-      console.log(`   Stored: ${result.stored} new records`);
-      console.log(`\nRun 'npx openeral optimize stats' to see your usage`);
+      if (jsonOutput) {
+        console.log(JSON.stringify(report, null, 2));
+      } else {
+        console.log(formatPromptSurfaceReport(report));
+      }
+    } else if (command === 'apply') {
+      const { analyzePromptSurface, applyRecommendations } = await import('./analyzer.js');
+      const report = await analyzePromptSurface({
+        pool,
+        workspaceId,
+        projectRoot: projectRoot || process.cwd(),
+        daysBack: days,
+      });
+      await applyRecommendations(report, {
+        dryRun,
+        proposals: proposalIds.length > 0 ? proposalIds : undefined,
+      });
     } else {
       console.error(`Unknown command: ${command}`);
       console.error('Run "npx openeral optimize help" for usage');

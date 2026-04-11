@@ -8,7 +8,8 @@ export { compressPrompt, estimateRequestTokens } from './prompt-compressor.js';
 export { enablePromptCaching, generateCacheKey, getCachedResponse, setCachedResponse } from './caching.js';
 export { calculateCost, storeMetrics, getOptimizationStats, formatStats } from './metrics.js';
 export { OptimizerProxy, startProxy } from './proxy.js';
-export { analyzeUsage, formatAnalysisReport } from './analyzer.js';
+export { analyzePromptSurface, formatPromptSurfaceReport, applyRecommendations } from './analyzer.js';
+export type { StrategicReport, AnalyzeOptions, ApplyOptions, Proposal, SessionStats } from './analyzer.js';
 export type {
   APIRequest,
   APIResponse,

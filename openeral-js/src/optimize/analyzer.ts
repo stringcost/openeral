@@ -1,213 +1,974 @@
 /**
- * Clawptimizer-style analyzer
- * Audits usage and provides recommendations
+ * Strategic optimizer — analyzes session history and project structure to
+ * propose concrete changes that reduce token usage in every future session.
+ *
+ * The analysis combines two data sources:
+ *   1. DB (proxy logs): actual model usage, tokens per call, task types
+ *   2. Filesystem: CLAUDE.md, memory files, project structure
+ *
+ * Output: ranked proposals each with a concrete apply action.
  */
 
+import {
+  readFileSync,
+  readdirSync,
+  existsSync,
+  statSync,
+  writeFileSync,
+  mkdirSync,
+} from 'node:fs';
+import { join, resolve, relative } from 'node:path';
+import { hostname } from 'node:os';
 import type { DbPool } from '../db/pool.js';
-import { getOptimizationStats } from './metrics.js';
 
-export interface AnalysisRule {
-  id: string;
-  category: 'cost' | 'performance' | 'configuration';
-  severity: 'critical' | 'warning' | 'info';
-  title: string;
-  description: string;
-  recommendation: string;
-  potentialSavings?: number;
-  docUrl?: string;
+// ---------------------------------------------------------------------------
+// Types
+// ---------------------------------------------------------------------------
+
+export interface ModelBreakdown {
+  model: string;
+  displayName: string;
+  calls: number;
+  tokens: number;
+  pct: number;
 }
 
-export interface AnalysisReport {
-  workspaceId: string;
-  analyzedAt: Date;
+export interface TaskBreakdown {
+  taskType: string;
+  calls: number;
+  tokens: number;
+  wastedOnExpensiveModel: number; // calls that used sonnet/opus but could use haiku
+}
+
+export interface SessionStats {
+  hasData: boolean;
+  sessionsAnalyzed: number;
   period: string;
-  summary: {
-    totalCost: number;
-    totalTokens: number;
-    apiCalls: number;
-    potentialSavings: number;
-  };
-  issues: AnalysisRule[];
+  totalTokens: number;
+  totalApiCalls: number;
+  totalCost: number;
+  avgTokensPerSession: number;
+  avgTokensPerCall: number;
+  avgCallsPerSession: number;
+  avgCostPerSession: number;
+  cacheHitRate: number;
+  models: ModelBreakdown[];
+  tasks: TaskBreakdown[];
 }
 
-/**
- * Analyze usage and generate recommendations
- */
-export async function analyzeUsage(
+export interface Proposal {
+  id: string;
+  priority: 'HIGH' | 'MEDIUM' | 'LOW';
+  category: 'model-routing' | 'context-efficiency' | 'memory' | 'workflow' | 'caching';
+  title: string;
+  /** What's happening right now (specific numbers from the data). */
+  currentState: string;
+  /** What will change after applying this proposal. */
+  proposedChange: string;
+  estimatedSavingsPct: number;
+  estimatedSavingsTokensPerSession: number;
+  howToApply: string;
+  canAutoApply: boolean;
+}
+
+export interface PromptSurface {
+  totalTokens: number;
+  instructionFiles: Array<{ relPath: string; tokens: number }>;
+  memoryFiles: Array<{ relPath: string; tokens: number }>;
+  hasModelRouting: boolean;
+  hasContextFile: boolean;
+  hasContextFileInstruction: boolean;
+  hasReadmeUpdateInstruction: boolean;
+  hasLazyLoadInstruction: boolean;
+}
+
+export interface StrategicReport {
+  generatedAt: string;
+  projectRoot: string;
+  memoryDir: string | null;
+  sessionStats: SessionStats;
+  promptSurface: PromptSurface;
+  proposals: Proposal[];
+  hotspots: Array<{ relPath: string; tokens: number }>;
+}
+
+export interface AnalyzeOptions {
+  pool?: DbPool | null;
+  workspaceId?: string;
+  projectRoot?: string;
+  daysBack?: number;
+}
+
+// ---------------------------------------------------------------------------
+// Token estimation
+// ---------------------------------------------------------------------------
+
+function estimateTokens(content: string): number {
+  return Math.ceil(content.length / 4);
+}
+
+// ---------------------------------------------------------------------------
+// Project root / memory dir detection
+// ---------------------------------------------------------------------------
+
+function detectProjectRoot(startDir: string): string {
+  let dir = resolve(startDir);
+  let claudeCandidate: string | null = null;
+
+  while (true) {
+    if (existsSync(join(dir, 'CLAUDE.md'))) claudeCandidate = dir;
+    if (existsSync(join(dir, '.git'))) {
+      return existsSync(join(dir, 'CLAUDE.md')) ? dir : claudeCandidate ?? dir;
+    }
+    const parent = resolve(dir, '..');
+    if (parent === dir) break;
+    dir = parent;
+  }
+  return claudeCandidate ?? startDir;
+}
+
+function detectMemoryDir(projectRoot: string, workspaceId: string): string | null {
+  const encodedProject = projectRoot.replace(/\//g, '-');
+  const candidates = [
+    join(process.env.OPENERAL_HOME ?? `/tmp/openeral-${workspaceId}`, '.claude', 'projects', encodedProject, 'memory'),
+    ...(process.env.HOME ? [join(process.env.HOME, '.claude', 'projects', encodedProject, 'memory')] : []),
+  ];
+  return candidates.find(c => existsSync(c)) ?? null;
+}
+
+// ---------------------------------------------------------------------------
+// DB analysis — session history
+// ---------------------------------------------------------------------------
+
+async function querySessionStats(
   pool: DbPool,
   workspaceId: string,
-  daysBack: number = 7
-): Promise<AnalysisReport> {
-  const stats = await getOptimizationStats(pool, workspaceId, daysBack);
-  const issues: AnalysisRule[] = [];
+  daysBack: number,
+): Promise<SessionStats> {
+  // Check if the table exists at all
+  try {
+    await pool.query(`SELECT 1 FROM _openeral.optimization_metrics LIMIT 1`);
+  } catch {
+    return emptySessionStats(daysBack);
+  }
 
-  // Rule 1: Expensive model for simple tasks
-  const modelUsage = await pool.query(
-    `SELECT 
-      optimized_model,
-      task_type,
-      COUNT(*) as count,
-      AVG(optimized_actual_cost) as avg_cost
-    FROM _openeral.optimization_metrics
-    WHERE workspace_id = $1
-    AND timestamp > NOW() - INTERVAL '1 day' * $2
-    GROUP BY optimized_model, task_type`,
-    [workspaceId, daysBack]
+  // Overall totals
+  const totals = await pool.query<{
+    total_tokens: string;
+    total_calls: string;
+    total_cost: string;
+    cache_hits: string;
+  }>(
+    `SELECT
+       COALESCE(SUM(optimized_prompt_tokens), 0)::text   AS total_tokens,
+       COUNT(*)::text                                      AS total_calls,
+       COALESCE(SUM(optimized_actual_cost), 0)::text      AS total_cost,
+       COALESCE(SUM(CASE WHEN cache_hit THEN 1 ELSE 0 END), 0)::text AS cache_hits
+     FROM _openeral.optimization_metrics
+     WHERE workspace_id = $1
+       AND timestamp > NOW() - INTERVAL '1 day' * $2`,
+    [workspaceId, daysBack],
   );
 
-  for (const row of modelUsage.rows) {
-    const model = row.optimized_model;
-    const taskType = row.task_type;
-    const count = parseInt(row.count);
+  const row = totals.rows[0];
+  const totalTokens = parseInt(row?.total_tokens ?? '0', 10);
+  const totalCalls = parseInt(row?.total_calls ?? '0', 10);
+  const totalCost = parseFloat(row?.total_cost ?? '0');
+  const cacheHits = parseInt(row?.cache_hits ?? '0', 10);
 
-    // Check if expensive model used for simple tasks
-    if ((model.includes('opus') || model.includes('sonnet')) && 
-        (taskType === 'file_read' || taskType === 'file_list' || taskType === 'bash')) {
-      const potentialSavings = parseFloat(row.avg_cost) * count * 0.8; // 80% cheaper with Haiku
-      
-      issues.push({
-        id: 'expensive-model-simple-task',
-        category: 'cost',
-        severity: 'warning',
-        title: `Using ${model.includes('opus') ? 'Opus' : 'Sonnet'} for simple ${taskType} tasks`,
-        description: `${count} ${taskType} operations used ${model}. These simple tasks could use Haiku (80% cheaper).`,
-        recommendation: `Configure Claude Code to use claude-3-5-haiku for file operations and simple queries.`,
-        potentialSavings,
-        docUrl: 'https://docs.anthropic.com/en/docs/models-overview',
-      });
-    }
-  }
+  if (totalCalls === 0) return emptySessionStats(daysBack);
 
-  // Rule 2: Low cache hit rate
-  if (stats.cacheHits > 0) {
-    const cacheHitRate = (stats.cacheHits / stats.apiCallsMade) * 100;
-    if (cacheHitRate < 20) {
-      issues.push({
-        id: 'low-cache-hit-rate',
-        category: 'performance',
-        severity: 'info',
-        title: 'Low cache hit rate',
-        description: `Only ${cacheHitRate.toFixed(0)}% of requests are hitting cache. This suggests repetitive queries that could be cached.`,
-        recommendation: 'Enable prompt caching and increase cache timeout. Consider batching similar requests.',
-        docUrl: 'https://docs.anthropic.com/en/docs/prompt-caching',
-      });
-    }
-  }
-
-  // Rule 3: No optimization applied
-  if (stats.apiCallsMade > 0 && stats.totalSaved === 0) {
-    issues.push({
-      id: 'optimizer-not-active',
-      category: 'configuration',
-      severity: 'critical',
-      title: 'Optimizer not active',
-      description: 'No optimizations are being applied to your API calls. You\'re paying full price.',
-      recommendation: 'Start the optimizer proxy: npx openeral proxy\nThen set: export ANTHROPIC_BASE_URL=http://localhost:8000',
-      potentialSavings: stats.totalCostWith * 0.6, // Estimate 60% savings
-    });
-  }
-
-  // Rule 4: High token usage
-  const avgTokensPerCall = stats.totalTokensOptimized / stats.apiCallsMade;
-  if (avgTokensPerCall > 5000) {
-    issues.push({
-      id: 'high-token-usage',
-      category: 'cost',
-      severity: 'warning',
-      title: 'High average token usage per request',
-      description: `Average ${avgTokensPerCall.toFixed(0)} tokens per request. This suggests large context windows or verbose prompts.`,
-      recommendation: 'Enable prompt compression and context optimization. Review your system prompts for redundancy.',
-      potentialSavings: stats.totalCostWith * 0.15, // Estimate 15% savings
-    });
-  }
-
-  // Rule 5: Missing prompt caching
-  const cachingEnabled = await pool.query(
-    `SELECT COUNT(*) as count
-    FROM _openeral.optimization_metrics
-    WHERE workspace_id = $1
-    AND timestamp > NOW() - INTERVAL '1 day' * $2
-    AND 'prompt_caching' = ANY(optimizations_applied)`,
-    [workspaceId, daysBack]
+  // Session grouping (sessions identified by metadata->>'session_id')
+  const sessionsResult = await pool.query<{ session_id: string; tokens: string; calls: string; cost: string }>(
+    `SELECT
+       COALESCE(metadata->>'session_id', 'unknown') AS session_id,
+       SUM(optimized_prompt_tokens)::text            AS tokens,
+       COUNT(*)::text                                AS calls,
+       SUM(optimized_actual_cost)::text              AS cost
+     FROM _openeral.optimization_metrics
+     WHERE workspace_id = $1
+       AND timestamp > NOW() - INTERVAL '1 day' * $2
+     GROUP BY metadata->>'session_id'`,
+    [workspaceId, daysBack],
   );
 
-  if (parseInt(cachingEnabled.rows[0].count) === 0 && stats.apiCallsMade > 10) {
-    issues.push({
-      id: 'missing-prompt-caching',
-      category: 'cost',
-      severity: 'warning',
-      title: 'Prompt caching not enabled',
-      description: 'Anthropic prompt caching can reduce costs by 90% on repeated context.',
-      recommendation: 'Enable prompt caching in the optimizer configuration.',
-      potentialSavings: stats.totalCostWith * 0.3, // Estimate 30% savings
-      docUrl: 'https://docs.anthropic.com/en/docs/prompt-caching',
-    });
-  }
+  const sessionsAnalyzed = sessionsResult.rows.length;
+  const avgTokensPerSession = sessionsAnalyzed > 0 ? Math.round(totalTokens / sessionsAnalyzed) : totalTokens;
+  const avgCallsPerSession = sessionsAnalyzed > 0 ? parseFloat((totalCalls / sessionsAnalyzed).toFixed(1)) : totalCalls;
 
-  // Calculate total potential savings
-  const potentialSavings = issues.reduce((sum, issue) => sum + (issue.potentialSavings || 0), 0);
+  // Model breakdown
+  const modelResult = await pool.query<{ model: string; calls: string; tokens: string }>(
+    `SELECT optimized_model AS model, COUNT(*)::text AS calls, SUM(optimized_prompt_tokens)::text AS tokens
+     FROM _openeral.optimization_metrics
+     WHERE workspace_id = $1
+       AND timestamp > NOW() - INTERVAL '1 day' * $2
+     GROUP BY optimized_model`,
+    [workspaceId, daysBack],
+  );
+
+  const models: ModelBreakdown[] = modelResult.rows.map(r => ({
+    model: r.model,
+    displayName: r.model.includes('haiku') ? 'Haiku' : r.model.includes('sonnet') ? 'Sonnet' : r.model.includes('opus') ? 'Opus' : r.model,
+    calls: parseInt(r.calls, 10),
+    tokens: parseInt(r.tokens, 10),
+    pct: Math.round((parseInt(r.tokens, 10) / totalTokens) * 100),
+  })).sort((a, b) => b.tokens - a.tokens);
+
+  // Task breakdown
+  const taskResult = await pool.query<{ task_type: string; calls: string; tokens: string; wasted: string }>(
+    `SELECT
+       task_type,
+       COUNT(*)::text AS calls,
+       SUM(optimized_prompt_tokens)::text AS tokens,
+       SUM(CASE WHEN (optimized_model LIKE '%sonnet%' OR optimized_model LIKE '%opus%')
+                 AND task_type IN ('file_read', 'file_list', 'bash', 'search')
+                THEN 1 ELSE 0 END)::text AS wasted
+     FROM _openeral.optimization_metrics
+     WHERE workspace_id = $1
+       AND timestamp > NOW() - INTERVAL '1 day' * $2
+     GROUP BY task_type`,
+    [workspaceId, daysBack],
+  );
+
+  const tasks: TaskBreakdown[] = taskResult.rows.map(r => ({
+    taskType: r.task_type || 'unknown',
+    calls: parseInt(r.calls, 10),
+    tokens: parseInt(r.tokens, 10),
+    wastedOnExpensiveModel: parseInt(r.wasted, 10),
+  })).sort((a, b) => b.tokens - a.tokens);
 
   return {
-    workspaceId,
-    analyzedAt: new Date(),
+    hasData: true,
+    sessionsAnalyzed,
     period: `Last ${daysBack} days`,
-    summary: {
-      totalCost: stats.totalCostWith,
-      totalTokens: stats.totalTokensOptimized,
-      apiCalls: stats.apiCallsMade,
-      potentialSavings,
-    },
-    issues,
+    totalTokens,
+    totalApiCalls: totalCalls,
+    totalCost,
+    avgTokensPerSession,
+    avgTokensPerCall: Math.round(totalTokens / totalCalls),
+    avgCallsPerSession,
+    avgCostPerSession: totalCost / (sessionsAnalyzed || 1),
+    cacheHitRate: totalCalls > 0 ? Math.round((cacheHits / totalCalls) * 100) : 0,
+    models,
+    tasks,
   };
 }
 
-/**
- * Format analysis report for display
- */
-export function formatAnalysisReport(report: AnalysisReport): string {
-  const lines = [
-    'Openeral Optimization Analysis',
-    '═'.repeat(60),
-    '',
-    `Workspace: ${report.workspaceId}`,
-    `Period: ${report.period}`,
-    `Analyzed: ${report.analyzedAt.toLocaleString()}`,
-    '',
-    'SUMMARY',
-    `  Total Cost:        $${report.summary.totalCost.toFixed(2)}`,
-    `  Total Tokens:      ${report.summary.totalTokens.toLocaleString()}`,
-    `  API Calls:         ${report.summary.apiCalls}`,
-    `  Potential Savings: $${report.summary.potentialSavings.toFixed(2)}`,
-    '',
-  ];
+function emptySessionStats(daysBack: number): SessionStats {
+  return {
+    hasData: false,
+    sessionsAnalyzed: 0,
+    period: `Last ${daysBack} days`,
+    totalTokens: 0,
+    totalApiCalls: 0,
+    totalCost: 0,
+    avgTokensPerSession: 0,
+    avgTokensPerCall: 0,
+    avgCallsPerSession: 0,
+    avgCostPerSession: 0,
+    cacheHitRate: 0,
+    models: [],
+    tasks: [],
+  };
+}
 
-  if (report.issues.length === 0) {
-    lines.push('✅ No issues found! Your setup is optimized.');
-    return lines.join('\n');
+// ---------------------------------------------------------------------------
+// File / prompt surface analysis
+// ---------------------------------------------------------------------------
+
+function readFile(path: string): string {
+  try { return readFileSync(path, 'utf8'); } catch { return ''; }
+}
+
+function readMarkdownFiles(dir: string): Array<{ name: string; content: string }> {
+  try {
+    return readdirSync(dir)
+      .filter((n): n is string => typeof n === 'string' && n.endsWith('.md'))
+      .sort()
+      .map(name => {
+        const content = readFile(join(dir, name));
+        return { name, content };
+      })
+      .filter(f => f.content.length > 0);
+  } catch {
+    return [];
+  }
+}
+
+function analyzePromptSurfaceFiles(
+  projectRoot: string,
+  memoryDir: string | null,
+): PromptSurface {
+  // Instruction files: CLAUDE.md in project root and parent
+  const claudeMdPath = join(projectRoot, 'CLAUDE.md');
+  const parentClaudeMd = join(projectRoot, '..', 'CLAUDE.md');
+  const instructionFiles: Array<{ relPath: string; tokens: number }> = [];
+
+  const claudeContent = readFile(claudeMdPath);
+  if (claudeContent) {
+    instructionFiles.push({ relPath: 'CLAUDE.md', tokens: estimateTokens(claudeContent) });
+  }
+  const parentContent = readFile(resolve(parentClaudeMd));
+  if (parentContent && resolve(parentClaudeMd) !== claudeMdPath) {
+    instructionFiles.push({ relPath: relative(projectRoot, resolve(parentClaudeMd)), tokens: estimateTokens(parentContent) });
   }
 
-  lines.push(`ISSUES (${report.issues.length})`);
+  // Memory files
+  const memFiles = memoryDir ? readMarkdownFiles(memoryDir) : [];
+  const memoryFiles = memFiles.map(f => ({
+    relPath: `memory/${f.name}`,
+    tokens: estimateTokens(f.content),
+  }));
+
+  const totalTokens =
+    instructionFiles.reduce((s, f) => s + f.tokens, 0) +
+    memoryFiles.reduce((s, f) => s + f.tokens, 0);
+
+  // Detect what's already in CLAUDE.md
+  const allInstructions = [claudeContent, parentContent].join('\n').toLowerCase();
+
+  const hasModelRouting =
+    allInstructions.includes('model selection') ||
+    allInstructions.includes('model routing') ||
+    allInstructions.includes('haiku') ||
+    allInstructions.includes('use claude');
+
+  const contextFilePath = join(projectRoot, '.claude', 'CONTEXT.md');
+  const hasContextFile = existsSync(contextFilePath) || existsSync(join(projectRoot, 'CONTEXT.md'));
+
+  const hasContextFileInstruction =
+    allInstructions.includes('context.md') ||
+    allInstructions.includes('context file');
+
+  const hasReadmeUpdateInstruction =
+    allInstructions.includes('update readme') ||
+    allInstructions.includes('readme after') ||
+    allInstructions.includes('update the readme');
+
+  const hasLazyLoadInstruction =
+    allInstructions.includes('only read files') ||
+    allInstructions.includes('grep') && allInstructions.includes('before reading');
+
+  return {
+    totalTokens,
+    instructionFiles,
+    memoryFiles,
+    hasModelRouting,
+    hasContextFile,
+    hasContextFileInstruction,
+    hasReadmeUpdateInstruction,
+    hasLazyLoadInstruction,
+  };
+}
+
+// ---------------------------------------------------------------------------
+// Hotspot detection
+// ---------------------------------------------------------------------------
+
+function findHotspots(projectRoot: string, topN = 5): Array<{ relPath: string; tokens: number }> {
+  const extensions = new Set(['.ts', '.js', '.mjs', '.rs', '.go', '.py', '.md', '.yaml', '.yml', '.lock', '.json', '.toml']);
+  const ignoreDirs = new Set(['node_modules', '.git', 'dist', 'build', 'target', '.pnpm', '__pycache__', '.next', 'coverage']);
+  const results: Array<{ relPath: string; tokens: number }> = [];
+
+  function walk(dir: string, depth: number) {
+    if (depth > 6) return;
+    let names: string[];
+    try { names = readdirSync(dir).filter((n): n is string => typeof n === 'string'); }
+    catch { return; }
+
+    for (const name of names) {
+      if (ignoreDirs.has(name)) continue;
+      const fullPath = join(dir, name);
+      let s;
+      try { s = statSync(fullPath); } catch { continue; }
+
+      if (s.isDirectory()) {
+        walk(fullPath, depth + 1);
+      } else if (s.isFile()) {
+        const ext = name.includes('.') ? `.${name.split('.').pop()!}` : '';
+        if (!extensions.has(ext) || s.size < 2048) continue;
+        try {
+          const tokens = estimateTokens(readFileSync(fullPath, 'utf8'));
+          if (tokens >= 1000) results.push({ relPath: relative(projectRoot, fullPath), tokens });
+        } catch { /* skip */ }
+      }
+    }
+  }
+
+  walk(projectRoot, 0);
+  return results.sort((a, b) => b.tokens - a.tokens).slice(0, topN);
+}
+
+// ---------------------------------------------------------------------------
+// Proposal generation
+// ---------------------------------------------------------------------------
+
+function buildProposals(
+  stats: SessionStats,
+  surface: PromptSurface,
+  projectRoot: string,
+): Proposal[] {
+  const proposals: Proposal[] = [];
+
+  const avgTokens = stats.hasData ? stats.avgTokensPerSession : surface.totalTokens;
+  const hasReadme = existsSync(join(projectRoot, 'README.md'));
+
+  // ── 1. Model routing ──────────────────────────────────────────────────────
+  if (!surface.hasModelRouting) {
+    // Figure out how many calls used expensive models for simple tasks
+    const wastedCalls = stats.tasks.reduce((s, t) => s + t.wastedOnExpensiveModel, 0);
+    const expensiveModels = stats.models.filter(m => m.displayName !== 'Haiku');
+    const expensivePct = expensiveModels.reduce((s, m) => s + m.pct, 0);
+    const current = stats.hasData
+      ? `${expensivePct}% of tokens spent on Sonnet/Opus (${wastedCalls} simple-task calls used expensive models)`
+      : 'No model routing rules in CLAUDE.md — Claude uses the default model for every call';
+    const savings = stats.hasData ? Math.round(avgTokens * 0.35) : 0;
+
+    proposals.push({
+      id: 'model-routing',
+      priority: 'HIGH',
+      category: 'model-routing',
+      title: 'Add model routing rules to CLAUDE.md',
+      currentState: current,
+      proposedChange:
+        'Claude selects Haiku for file reads / searches / simple edits, Sonnet for coding tasks, ' +
+        'Opus only for complex multi-step reasoning. Routing is enforced via instructions in CLAUDE.md.',
+      estimatedSavingsPct: 35,
+      estimatedSavingsTokensPerSession: savings,
+      howToApply: 'Run: npx openeral optimize apply --proposal model-routing',
+      canAutoApply: true,
+    });
+  }
+
+  // ── 2. Compact context file ────────────────────────────────────────────────
+  if (!surface.hasContextFile && !surface.hasContextFileInstruction) {
+    const current = stats.hasData
+      ? `Each session averages ${stats.avgTokensPerSession.toLocaleString()} tokens. ` +
+        `Claude re-explores project files every session instead of reading a compact state file.`
+      : 'No .claude/CONTEXT.md found. Claude starts each session with no compact project state.';
+    const savings = stats.hasData ? Math.round(avgTokens * 0.28) : 0;
+
+    proposals.push({
+      id: 'context-file',
+      priority: 'HIGH',
+      category: 'context-efficiency',
+      title: 'Create a living CONTEXT.md Claude reads and updates each session',
+      currentState: current,
+      proposedChange:
+        'Create .claude/CONTEXT.md as a compact project state file. ' +
+        'Claude reads it first (instead of re-exploring), then updates it after each task. ' +
+        'Next session starts with fresh context in ~200 tokens instead of reading 5-10 files.',
+      estimatedSavingsPct: 28,
+      estimatedSavingsTokensPerSession: savings,
+      howToApply: 'Run: npx openeral optimize apply --proposal context-file',
+      canAutoApply: true,
+    });
+  }
+
+  // ── 3. README auto-update instruction ─────────────────────────────────────
+  if (hasReadme && !surface.hasReadmeUpdateInstruction) {
+    const savings = stats.hasData ? Math.round(avgTokens * 0.15) : 0;
+
+    proposals.push({
+      id: 'readme-updates',
+      priority: stats.hasData && avgTokens > 3000 ? 'HIGH' : 'MEDIUM',
+      category: 'workflow',
+      title: 'Instruct Claude to keep README current after each task',
+      currentState:
+        'Claude re-reads source files for context in each session. ' +
+        'README is not used as a live state document.',
+      proposedChange:
+        'Add a workflow rule to CLAUDE.md: after completing a coding task, Claude updates the ' +
+        'relevant section of README.md. Future sessions read README for context instead of ' +
+        'exploring source files from scratch — saves 1-3 file reads per session.',
+      estimatedSavingsPct: 15,
+      estimatedSavingsTokensPerSession: savings,
+      howToApply: 'Run: npx openeral optimize apply --proposal readme-updates',
+      canAutoApply: true,
+    });
+  }
+
+  // ── 4. Lazy file reading rule ─────────────────────────────────────────────
+  if (!surface.hasLazyLoadInstruction && stats.hasData && stats.avgTokensPerCall > 2500) {
+    const savings = Math.round(avgTokens * 0.20);
+
+    proposals.push({
+      id: 'lazy-reading',
+      priority: 'HIGH',
+      category: 'context-efficiency',
+      title: 'Add lazy-loading rule — grep before reading full files',
+      currentState:
+        `Avg ${stats.avgTokensPerCall.toLocaleString()} tokens per API call. ` +
+        'Large files are likely being read in full when only a few lines are needed.',
+      proposedChange:
+        'Add rule to CLAUDE.md: "Before reading any file in full, use Grep to find the relevant ' +
+        'section. Read only what is needed. Prefer targeted reads over full file reads." ' +
+        'This prevents expensive full reads of large source files.',
+      estimatedSavingsPct: 20,
+      estimatedSavingsTokensPerSession: savings,
+      howToApply: 'Run: npx openeral optimize apply --proposal lazy-reading',
+      canAutoApply: true,
+    });
+  }
+
+  // ── 5. Memory compaction ──────────────────────────────────────────────────
+  const memTokens = surface.memoryFiles.reduce((s, f) => s + f.tokens, 0);
+  if (surface.memoryFiles.length > 2 || memTokens > 1500) {
+    const savings = stats.hasData ? Math.round(memTokens * 0.5) : Math.round(memTokens * 0.5);
+    const topMem = [...surface.memoryFiles].sort((a, b) => b.tokens - a.tokens).slice(0, 3);
+
+    proposals.push({
+      id: 'memory-compact',
+      priority: memTokens > 3000 ? 'HIGH' : 'MEDIUM',
+      category: 'memory',
+      title: 'Compact Claude memory files — remove code blocks and duplicates',
+      currentState:
+        `${surface.memoryFiles.length} memory files, ~${memTokens} tokens loaded every session. ` +
+        `Largest: ${topMem.map(f => `${f.relPath} (${f.tokens}t)`).join(', ')}.`,
+      proposedChange:
+        'Strip code blocks from memory files (code belongs in source, not memory), ' +
+        'remove lines already covered by CLAUDE.md, collapse multi-line paragraphs to single facts. ' +
+        `Estimated reduction: ${memTokens} → ~${Math.round(memTokens * 0.5)} tokens.`,
+      estimatedSavingsPct: Math.round((savings / (avgTokens || memTokens)) * 100),
+      estimatedSavingsTokensPerSession: savings,
+      howToApply: 'Run: npx openeral optimize apply --proposal memory-compact',
+      canAutoApply: true,
+    });
+  }
+
+  // ── 6. Cache ordering ─────────────────────────────────────────────────────
+  if (stats.hasData && stats.cacheHitRate < 25 && stats.totalApiCalls >= 5) {
+    proposals.push({
+      id: 'cache-ordering',
+      priority: 'MEDIUM',
+      category: 'caching',
+      title: 'Improve cache hit rate by reordering CLAUDE.md sections',
+      currentState:
+        `Cache hit rate: ${stats.cacheHitRate}% (${stats.totalApiCalls} calls). ` +
+        'Anthropic prompt caching requires stable content at the start of every prompt. ' +
+        'If CLAUDE.md has volatile content near the top, cache entries get invalidated every call.',
+      proposedChange:
+        'Reorder CLAUDE.md: hard rules and conventions at the top (stable, cacheable), ' +
+        'session-specific notes and recent context at the bottom (volatile). ' +
+        'Target: >50% cache hit rate, saving ~90% on cached input tokens.',
+      estimatedSavingsPct: 12,
+      estimatedSavingsTokensPerSession: stats.hasData ? Math.round(avgTokens * 0.12) : 0,
+      howToApply: 'Review CLAUDE.md and move stable sections (rules, conventions) above dynamic ones.',
+      canAutoApply: false,
+    });
+  }
+
+  // Sort: HIGH first, then by estimated savings
+  return proposals.sort((a, b) => {
+    const pri = { HIGH: 0, MEDIUM: 1, LOW: 2 };
+    if (pri[a.priority] !== pri[b.priority]) return pri[a.priority] - pri[b.priority];
+    return b.estimatedSavingsTokensPerSession - a.estimatedSavingsTokensPerSession;
+  });
+}
+
+// ---------------------------------------------------------------------------
+// Main entry point
+// ---------------------------------------------------------------------------
+
+export async function analyzePromptSurface(opts: AnalyzeOptions = {}): Promise<StrategicReport> {
+  const workspaceId = opts.workspaceId ?? process.env.OPENERAL_WORKSPACE_ID ?? hostname();
+  const startDir = opts.projectRoot ? resolve(opts.projectRoot) : process.cwd();
+  const daysBack = opts.daysBack ?? 7;
+
+  const projectRoot = detectProjectRoot(startDir);
+  const memoryDir = detectMemoryDir(projectRoot, workspaceId);
+
+  const [sessionStats, promptSurface, hotspots] = await Promise.all([
+    opts.pool
+      ? querySessionStats(opts.pool, workspaceId, daysBack)
+      : Promise.resolve(emptySessionStats(daysBack)),
+    Promise.resolve(analyzePromptSurfaceFiles(projectRoot, memoryDir)),
+    Promise.resolve(findHotspots(projectRoot)),
+  ]);
+
+  const proposals = buildProposals(sessionStats, promptSurface, projectRoot);
+
+  return {
+    generatedAt: new Date().toISOString(),
+    projectRoot,
+    memoryDir,
+    sessionStats,
+    promptSurface,
+    proposals,
+    hotspots,
+  };
+}
+
+// ---------------------------------------------------------------------------
+// Report formatter
+// ---------------------------------------------------------------------------
+
+export function formatPromptSurfaceReport(report: StrategicReport): string {
+  const lines: string[] = [];
+  const { sessionStats: s, promptSurface: p } = report;
+
+  lines.push('# Openeral Token Analysis Report');
+  lines.push('');
+  lines.push(`Generated: ${report.generatedAt}`);
+  lines.push(`Project:   ${report.projectRoot}`);
+  lines.push(`Memory:    ${report.memoryDir ?? '(not found)'}`);
   lines.push('');
 
-  // Group by severity
-  const critical = report.issues.filter(i => i.severity === 'critical');
-  const warnings = report.issues.filter(i => i.severity === 'warning');
-  const info = report.issues.filter(i => i.severity === 'info');
+  // ── Session summary ────────────────────────────────────────────────────────
+  if (s.hasData) {
+    lines.push('## Session Summary  (' + s.period + ')');
+    lines.push('');
+    lines.push(`  Sessions analyzed:    ${s.sessionsAnalyzed}`);
+    lines.push(`  Total tokens used:    ${s.totalTokens.toLocaleString()}`);
+    lines.push(`  Total API calls:      ${s.totalApiCalls}`);
+    lines.push(`  Total cost:           $${s.totalCost.toFixed(6)}`);
+    lines.push(`  Avg tokens/session:   ${s.avgTokensPerSession.toLocaleString()}`);
+    lines.push(`  Avg tokens/call:      ${s.avgTokensPerCall.toLocaleString()}`);
+    lines.push(`  Avg calls/session:    ${s.avgCallsPerSession}`);
+    lines.push(`  Cache hit rate:       ${s.cacheHitRate}%`);
+    lines.push('');
 
-  for (const issue of [...critical, ...warnings, ...info]) {
-    const icon = issue.severity === 'critical' ? '🔴' : issue.severity === 'warning' ? '⚠️' : 'ℹ️';
-    
-    lines.push(`${icon}  ${issue.title}`);
-    lines.push(`    ${issue.description}`);
-    if (issue.potentialSavings) {
-      lines.push(`    Potential savings: $${issue.potentialSavings.toFixed(2)}`);
+    if (s.models.length > 0) {
+      lines.push('  Model usage:');
+      for (const m of s.models) {
+        lines.push(`    ${m.displayName.padEnd(8)} ${m.calls} calls  ${m.tokens.toLocaleString()} tokens  (${m.pct}%)`);
+      }
+      lines.push('');
     }
-    lines.push(`    → ${issue.recommendation}`);
-    if (issue.docUrl) {
-      lines.push(`    📖 ${issue.docUrl}`);
+
+    if (s.tasks.length > 0) {
+      lines.push('  Task breakdown:');
+      for (const t of s.tasks) {
+        const wasted = t.wastedOnExpensiveModel > 0 ? `  ⚠ ${t.wastedOnExpensiveModel} used expensive model` : '';
+        lines.push(`    ${t.taskType.padEnd(15)} ${t.calls} calls  ${t.tokens.toLocaleString()} tokens${wasted}`);
+      }
+      lines.push('');
+    }
+  } else {
+    lines.push('## Session Summary');
+    lines.push('');
+    lines.push('  No session data yet. Run a Claude Code session via `npx openeral` to collect data.');
+    lines.push('  Proposals below are based on project file analysis.');
+    lines.push('');
+  }
+
+  // ── Prompt surface ────────────────────────────────────────────────────────
+  lines.push('## Prompt Surface (loaded every session)');
+  lines.push('');
+  lines.push(`  Total always-loaded tokens: ~${p.totalTokens}`);
+  if (p.instructionFiles.length > 0) {
+    lines.push('  Instruction files:');
+    for (const f of p.instructionFiles) {
+      lines.push(`    ${f.relPath.padEnd(30)} ~${f.tokens} tokens`);
+    }
+  }
+  if (p.memoryFiles.length > 0) {
+    lines.push('  Memory files:');
+    for (const f of p.memoryFiles) {
+      lines.push(`    ${f.relPath.padEnd(30)} ~${f.tokens} tokens`);
+    }
+  }
+  lines.push('');
+
+  // ── Proposals ────────────────────────────────────────────────────────────
+  lines.push('## Proposals  (ranked by impact)');
+  lines.push('');
+
+  if (report.proposals.length === 0) {
+    lines.push('  All major optimizations are already in place.');
+  } else {
+    const totalSavings = report.proposals.reduce((s, p) => s + p.estimatedSavingsTokensPerSession, 0);
+    if (totalSavings > 0) {
+      lines.push(`  Potential total savings: ~${totalSavings.toLocaleString()} tokens/session`);
+      lines.push('');
+    }
+
+    for (let i = 0; i < report.proposals.length; i++) {
+      const prop = report.proposals[i];
+      const icon = prop.priority === 'HIGH' ? '🔴' : prop.priority === 'MEDIUM' ? '🟡' : '🟢';
+      const applyTag = prop.canAutoApply ? '  [auto-apply available]' : '  [manual]';
+
+      lines.push(`${icon} ${prop.priority} — ${prop.title}${applyTag}`);
+      lines.push('');
+      lines.push(`   Now:     ${prop.currentState}`);
+      lines.push(`   Change:  ${prop.proposedChange}`);
+      if (prop.estimatedSavingsTokensPerSession > 0) {
+        lines.push(`   Savings: ~${prop.estimatedSavingsTokensPerSession.toLocaleString()} tokens/session (${prop.estimatedSavingsPct}%)`);
+      }
+      lines.push(`   Apply:   ${prop.howToApply}`);
+      lines.push('');
+    }
+  }
+
+  // ── Hotspots ──────────────────────────────────────────────────────────────
+  if (report.hotspots.length > 0) {
+    lines.push('## Large Files (read hotspots)');
+    lines.push('');
+    lines.push('  These files are expensive to read in full. Claude should use Grep/Glob instead.');
+    for (const h of report.hotspots) {
+      lines.push(`    ${h.relPath.padEnd(50)} ~${h.tokens} tokens`);
     }
     lines.push('');
   }
 
   return lines.join('\n');
+}
+
+// ---------------------------------------------------------------------------
+// Apply
+// ---------------------------------------------------------------------------
+
+export interface ApplyOptions {
+  dryRun?: boolean;
+  proposals?: string[]; // specific proposal IDs, or undefined = all auto-applicable
+}
+
+export async function applyRecommendations(
+  report: StrategicReport,
+  opts: ApplyOptions = {},
+): Promise<void> {
+  const { dryRun = false } = opts;
+  const targets = opts.proposals?.length
+    ? report.proposals.filter(p => opts.proposals!.includes(p.id))
+    : report.proposals.filter(p => p.canAutoApply);
+
+  if (targets.length === 0) {
+    console.log('No auto-applicable proposals to apply.');
+    return;
+  }
+
+  const prefix = dryRun ? '[DRY RUN] ' : '';
+  console.log(`${prefix}Applying ${targets.length} proposal${targets.length === 1 ? '' : 's'}...\n`);
+
+  for (const proposal of targets) {
+    console.log(`▶ ${proposal.title}`);
+    try {
+      await applyProposal(proposal, report, dryRun);
+    } catch (err: any) {
+      console.log(`  ⚠ Failed: ${err.message}`);
+    }
+    console.log('');
+  }
+
+  if (dryRun) {
+    console.log('Run without --dry-run to apply these changes.');
+  } else {
+    const totalSaved = targets.reduce((s, p) => s + p.estimatedSavingsTokensPerSession, 0);
+    console.log(`Done. Estimated savings: ~${totalSaved.toLocaleString()} tokens/session.`);
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Individual proposal apply handlers
+// ---------------------------------------------------------------------------
+
+async function applyProposal(
+  proposal: Proposal,
+  report: StrategicReport,
+  dryRun: boolean,
+): Promise<void> {
+  switch (proposal.id) {
+    case 'model-routing':
+      return applyModelRouting(report.projectRoot, dryRun);
+    case 'context-file':
+      return applyContextFile(report.projectRoot, dryRun);
+    case 'readme-updates':
+      return applyReadmeUpdates(report.projectRoot, dryRun);
+    case 'lazy-reading':
+      return applyLazyReading(report.projectRoot, dryRun);
+    case 'memory-compact':
+      return applyMemoryCompact(report, dryRun);
+    default:
+      console.log(`  Proposal '${proposal.id}' has no auto-apply handler.`);
+  }
+}
+
+const SECTION_FENCE = '<!-- openeral-optimizer -->';
+
+function patchClaudeMd(projectRoot: string, sectionId: string, newBlock: string, dryRun: boolean): void {
+  const claudePath = join(projectRoot, 'CLAUDE.md');
+  let existing = existsSync(claudePath) ? readFileSync(claudePath, 'utf8') : '';
+
+  // Remove old block if present (idempotent)
+  const startTag = `${SECTION_FENCE}:${sectionId}:start`;
+  const endTag = `${SECTION_FENCE}:${sectionId}:end`;
+  const taggedRe = new RegExp(`\\n?${escapeRe(startTag)}[\\s\\S]*?${escapeRe(endTag)}\\n?`, 'g');
+  existing = existing.replace(taggedRe, '');
+
+  const block = `\n${startTag}\n${newBlock}\n${endTag}\n`;
+  const updated = existing.trimEnd() + '\n' + block;
+
+  console.log(`  → ${dryRun ? 'Would patch' : 'Patching'} ${claudePath}`);
+  if (!dryRun) writeFileSync(claudePath, updated, 'utf8');
+}
+
+function escapeRe(s: string): string {
+  return s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+}
+
+function applyModelRouting(projectRoot: string, dryRun: boolean): void {
+  const block = `## Model Selection
+
+To minimize token costs, pick the most efficient model for each task:
+
+- **Haiku** (\`claude-haiku-4-5\`): file reads, searches, grep, simple questions, bash one-liners
+- **Sonnet** (\`claude-sonnet-4-6\`): code edits, refactors, multi-file tasks, debugging
+- **Opus**: avoid unless the task requires complex multi-step reasoning with no clear approach
+
+Switch model with \`/model <model-id>\` at the start of a session, or set \`ANTHROPIC_MODEL\` env var.
+Analyze the user's request first — default to Haiku, upgrade only if the task genuinely needs it.`;
+
+  patchClaudeMd(projectRoot, 'model-routing', block, dryRun);
+  console.log('  → Model routing rules added. Haiku for simple tasks, Sonnet for coding.');
+}
+
+function applyContextFile(projectRoot: string, dryRun: boolean): void {
+  const dotClaudeDir = join(projectRoot, '.claude');
+  const contextPath = join(dotClaudeDir, 'CONTEXT.md');
+
+  if (!dryRun) {
+    mkdirSync(dotClaudeDir, { recursive: true });
+    if (!existsSync(contextPath)) {
+      writeFileSync(contextPath, `# Project Context
+
+> Claude: read this at the start of every session. Update it after completing significant tasks.
+
+## Current State
+<!-- What is currently working / in progress -->
+(not yet populated — Claude will update this after the first session)
+
+## Recent Changes
+<!-- What was last changed and why -->
+(none yet)
+
+## Active Files
+<!-- Most relevant files for current work -->
+(none yet)
+
+## Known Issues / Next Steps
+<!-- Blockers or planned work -->
+(none yet)
+`, 'utf8');
+      console.log(`  → Created ${contextPath}`);
+    } else {
+      console.log(`  → ${contextPath} already exists, skipping creation.`);
+    }
+  } else {
+    console.log(`  → Would create ${contextPath}`);
+  }
+
+  const block = `## Context File
+
+At the start of each session, read \`.claude/CONTEXT.md\` for current project state.
+After completing a significant task, update \`.claude/CONTEXT.md\`:
+- Update "Current State" with what is now working
+- Add a line to "Recent Changes" describing what you changed and why
+- Update "Active Files" if the relevant files changed
+
+This keeps future sessions efficient — read the context file instead of re-exploring source files.`;
+
+  patchClaudeMd(projectRoot, 'context-file', block, dryRun);
+  console.log('  → Context file instruction added to CLAUDE.md.');
+}
+
+function applyReadmeUpdates(projectRoot: string, dryRun: boolean): void {
+  const block = `## README Maintenance
+
+After completing a coding task that changes the project's behavior, API, or structure:
+1. Update the relevant section of \`README.md\` to reflect the change.
+2. Keep the README accurate so future sessions can read it for context instead of exploring source files.
+
+Do not update README for minor internal refactors — only for changes that affect how the project is used or understood.`;
+
+  patchClaudeMd(projectRoot, 'readme-updates', block, dryRun);
+  console.log('  → README maintenance instruction added to CLAUDE.md.');
+}
+
+function applyLazyReading(projectRoot: string, dryRun: boolean): void {
+  const block = `## File Reading Strategy
+
+To avoid wasting tokens on large files:
+- Before reading any file, check if the needed information is already in your context.
+- Use \`Grep\` to find the relevant section/function before doing a full \`Read\`.
+- Use \`Glob\` to identify which file to read rather than reading several candidates.
+- When using \`Read\`, specify \`offset\` and \`limit\` to read only the relevant lines.
+- Never read \`pnpm-lock.yaml\`, \`Cargo.lock\`, \`package-lock.json\`, or other lock files — they are never useful for coding tasks.`;
+
+  patchClaudeMd(projectRoot, 'lazy-reading', block, dryRun);
+  console.log('  → Lazy file-reading rules added to CLAUDE.md.');
+}
+
+function applyMemoryCompact(report: StrategicReport, dryRun: boolean): void {
+  if (!report.memoryDir) {
+    console.log('  No memory directory found — skipping.');
+    return;
+  }
+
+  // Load CLAUDE.md lines as the authority set
+  const claudeLines = new Set<string>();
+  for (const f of report.promptSurface.instructionFiles) {
+    const content = readFile(join(report.projectRoot, f.relPath));
+    for (const line of content.split('\n')) {
+      const t = line.trim();
+      if (t.length > 5) claudeLines.add(t);
+    }
+  }
+
+  const names = readdirSync(report.memoryDir)
+    .filter((n): n is string => typeof n === 'string' && n.endsWith('.md'))
+    .sort();
+
+  let totalRemoved = 0;
+  const seenLines = new Set<string>(claudeLines);
+
+  for (const name of names) {
+    const fullPath = join(report.memoryDir!, name);
+    let stat;
+    try { stat = statSync(fullPath); } catch { continue; }
+    if (!stat.isFile()) continue;
+
+    let content: string;
+    try { content = readFileSync(fullPath, 'utf8'); } catch { continue; }
+
+    const rawLines = content.split('\n');
+    const kept: string[] = [];
+    let removed = 0;
+    let inCodeBlock = false;
+
+    for (const line of rawLines) {
+      // Track code block fences
+      if (line.trim().startsWith('```')) {
+        inCodeBlock = !inCodeBlock;
+        // Skip both the fence and everything inside — code doesn't belong in memory
+        removed++;
+        continue;
+      }
+      if (inCodeBlock) { removed++; continue; }
+
+      const t = line.trim();
+      if (t.length > 5 && seenLines.has(t)) {
+        // Duplicate of CLAUDE.md or earlier memory file
+        removed++;
+      } else {
+        kept.push(line);
+        if (t.length > 5) seenLines.add(t);
+      }
+    }
+
+    if (removed === 0) {
+      console.log(`  ${name}: no changes`);
+      continue;
+    }
+
+    while (kept.length > 0 && kept[kept.length - 1].trim() === '') kept.pop();
+    const newContent = kept.join('\n') + '\n';
+    const savedTokens = estimateTokens(content) - estimateTokens(newContent);
+
+    totalRemoved += removed;
+    console.log(`  ${name}: removed ${removed} lines, saved ~${savedTokens} tokens`);
+
+    if (!dryRun) writeFileSync(fullPath, newContent, 'utf8');
+  }
+
+  console.log(`  Total: ${totalRemoved} lines removed across ${names.length} memory files.`);
 }
