@@ -3,8 +3,8 @@
  */
 
 import type { DbPool } from '../db/pool.js';
-import type { OptimizationMetrics } from './types.js';
-import { MODEL_PRICING, type ModelName } from './types.js';
+import type { OptimizationMetrics, ModelName } from './types.js';
+import { MODEL_PRICING } from './types.js';
 
 /**
  * Calculate estimated cost for a request

@@ -46,7 +46,11 @@ Then set in your environment:
   }
 
   try {
-    await startProxy({ port, optimizerEnabled });
+    const proxy = await startProxy({ port });
+    console.log(`Proxy listening on http://127.0.0.1:${proxy.port}`);
+    console.log('Set ANTHROPIC_BASE_URL=http://127.0.0.1:' + proxy.port);
+    // Keep running until killed
+    await new Promise(() => {});
   } catch (err: any) {
     console.error(`Error: ${err.message}`);
     process.exit(1);

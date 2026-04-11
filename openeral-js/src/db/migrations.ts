@@ -18,28 +18,19 @@ export async function runMigrations(pool: DbPool): Promise<void> {
     // Acquire an advisory lock (key 0x4F50454E = 'OPEN' in hex) to serialize
     // concurrent migration attempts. Without this, two shells hitting a fresh
     // database race on CREATE SCHEMA and one fails with duplicate key.
-    // Use try_advisory_lock with timeout instead of blocking lock
-    const lockResult = await client.query(`SELECT pg_try_advisory_lock(1330795854) as acquired`);
-    
-    if (!lockResult.rows[0].acquired) {
-      console.warn('⚠️  Another process is running migrations, waiting...');
-      // Wait a bit and try again
-      await new Promise(resolve => setTimeout(resolve, 2000));
-      const retryResult = await client.query(`SELECT pg_try_advisory_lock(1330795854) as acquired`);
-      if (!retryResult.rows[0].acquired) {
-        throw new Error('Could not acquire migration lock - another process may be stuck');
-      }
-    }
+    // pg_advisory_lock blocks until the lock is free; the 30-second
+    // statement_timeout set above caps the wait so we never hang forever.
+    await client.query(`SELECT pg_advisory_lock(1330795854)`);
 
     try {
       // V1: Create _openeral schema and schema_version table
+      await client.query(`CREATE SCHEMA IF NOT EXISTS _openeral`);
+      
       await client.query(`
-        CREATE SCHEMA IF NOT EXISTS _openeral;
-
         CREATE TABLE IF NOT EXISTS _openeral.schema_version (
             version INTEGER PRIMARY KEY,
             applied_at TIMESTAMPTZ DEFAULT NOW()
-        );
+        )
       `);
 
       // V2: Create mount_log table
@@ -51,7 +42,7 @@ export async function runMigrations(pool: DbPool): Promise<void> {
             schemas_filter TEXT[],
             page_size INTEGER,
             openeral_version TEXT
-        );
+        )
       `);
 
       // V3: Create cache_hints table
@@ -64,7 +55,7 @@ export async function runMigrations(pool: DbPool): Promise<void> {
             hint_value TEXT,
             created_at TIMESTAMPTZ DEFAULT NOW(),
             UNIQUE (schema_name, table_name, hint_type)
-        );
+        )
       `);
 
       // V4: Create workspace_config, workspace_files, and index
@@ -75,8 +66,10 @@ export async function runMigrations(pool: DbPool): Promise<void> {
             config JSONB NOT NULL DEFAULT '{}',
             created_at TIMESTAMPTZ DEFAULT NOW(),
             updated_at TIMESTAMPTZ DEFAULT NOW()
-        );
+        )
+      `);
 
+      await client.query(`
         CREATE TABLE IF NOT EXISTS _openeral.workspace_files (
             workspace_id TEXT NOT NULL REFERENCES _openeral.workspace_config(id) ON DELETE CASCADE,
             path TEXT NOT NULL,
@@ -93,10 +86,12 @@ export async function runMigrations(pool: DbPool): Promise<void> {
             uid INTEGER NOT NULL DEFAULT 1000,
             gid INTEGER NOT NULL DEFAULT 1000,
             PRIMARY KEY (workspace_id, path)
-        );
+        )
+      `);
 
+      await client.query(`
         CREATE INDEX IF NOT EXISTS idx_ws_files_parent
-            ON _openeral.workspace_files (workspace_id, parent_path);
+            ON _openeral.workspace_files (workspace_id, parent_path)
       `);
 
       // V5: Create optimization tables
@@ -118,22 +113,30 @@ export async function runMigrations(pool: DbPool): Promise<void> {
             cost_saved DECIMAL(10, 6) NOT NULL,
             savings_percentage DECIMAL(5, 2) NOT NULL,
             metadata JSONB
-        );
+        )
+      `);
 
+      await client.query(`
         CREATE INDEX IF NOT EXISTS idx_optimization_metrics_workspace
-            ON _openeral.optimization_metrics (workspace_id, timestamp DESC);
+            ON _openeral.optimization_metrics (workspace_id, timestamp DESC)
+      `);
 
+      await client.query(`
         CREATE INDEX IF NOT EXISTS idx_optimization_metrics_model
-            ON _openeral.optimization_metrics (optimized_model, timestamp DESC);
+            ON _openeral.optimization_metrics (optimized_model, timestamp DESC)
+      `);
 
+      await client.query(`
         CREATE TABLE IF NOT EXISTS _openeral.api_cache (
             key TEXT PRIMARY KEY,
             response JSONB NOT NULL,
             created_at TIMESTAMPTZ DEFAULT NOW()
-        );
+        )
+      `);
 
+      await client.query(`
         CREATE INDEX IF NOT EXISTS idx_api_cache_created
-            ON _openeral.api_cache (created_at);
+            ON _openeral.api_cache (created_at)
       `);
     } finally {
       await client.query(`SELECT pg_advisory_unlock(1330795854)`);

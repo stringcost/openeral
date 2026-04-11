@@ -10,16 +10,26 @@
  *   npx openeral optimize stats       # show optimization stats
  *
  * Required env:
- *   DATABASE_URL          PostgreSQL connection string
  *   ANTHROPIC_API_KEY     Claude API key
  *
  * Optional env:
- *   OPENERAL_WORKSPACE_ID   Workspace ID (default: hostname)
- *   OPENERAL_HOME           Home directory path (default: /tmp/openeral-<id>)
+ *   DATABASE_URL              PostgreSQL connection (default: localhost:5432)
+ *   OPENERAL_WORKSPACE_ID     Workspace ID (default: hostname)
+ *   OPENERAL_HOME             Home directory path (default: /tmp/openeral-<id>)
+ *
+ * Docker PostgreSQL:
+ *   docker run -d --name openeral-postgres \
+ *     -e POSTGRES_USER=openeral \
+ *     -e POSTGRES_PASSWORD=openeral \
+ *     -e POSTGRES_DB=openeral \
+ *     -p 5432:5432 \
+ *     -v openeral-data:/var/lib/postgresql/data \
+ *     postgres:16-alpine
  */
 
 import { spawn } from 'node:child_process';
 import { mkdirSync, writeFileSync, existsSync, chmodSync } from 'node:fs';
+import { randomUUID } from 'node:crypto';
 
 function writePgHelper(path: string): void {
   // pg helper reads DATABASE_URL from the environment at runtime.
@@ -120,10 +130,12 @@ Memory Refresh Options:
   --no-backup             Skip backup creation
 
 Environment Variables:
-  DATABASE_URL            PostgreSQL connection string (required for persistence)
   ANTHROPIC_API_KEY       Claude API key (required)
   OPENERAL_WORKSPACE_ID   Default workspace ID
   OPENERAL_HOME           Home directory path
+  OPENERAL_DATA_DIR       Embedded DB data path (default: ~/.openeral/data)
+  DATABASE_URL            Use external PostgreSQL instead of embedded DB
+  STRINGCOST_API_KEY      Track API costs via StringCost proxy
 `);
 }
 
@@ -133,8 +145,11 @@ export async function main() {
   // Check for optimize subcommand
   if (args[0] === 'optimize') {
     // Delegate to optimize CLI
+    const { fileURLToPath } = await import('node:url');
+    const optimizeCliPath = fileURLToPath(new URL('./optimize/cli.js', import.meta.url));
+    
     const child = spawn('node', [
-      new URL('./optimize/cli.js', import.meta.url).pathname,
+      optimizeCliPath,
       ...args.slice(1)
     ], { stdio: 'inherit' });
     
@@ -158,16 +173,6 @@ export async function main() {
   const { workspaceId, claudeArgs } = parsed;
 
   // --- Validate env ---
-  const databaseUrl = process.env.DATABASE_URL;
-  const persistenceEnabled = !!databaseUrl;
-
-  if (!persistenceEnabled) {
-    process.stderr.write(
-      '\x1b[33mopeneral: DATABASE_URL not set — running without persistence\x1b[0m\n' +
-      '\x1b[2m  Set DATABASE_URL to enable PostgreSQL-backed home directory\x1b[0m\n',
-    );
-  }
-
   if (!process.env.ANTHROPIC_API_KEY) {
     process.stderr.write(
       '\x1b[33mopeneral: ANTHROPIC_API_KEY not set — Claude Code may not work\x1b[0m\n',
@@ -180,32 +185,33 @@ export async function main() {
 
   process.stderr.write(`\x1b[2mopeneral: workspace  ${workspaceId}\x1b[0m\n`);
   process.stderr.write(`\x1b[2mopeneral: home       ${homeDir}\x1b[0m\n`);
-  process.stderr.write(`\x1b[2mopeneral: persist    ${persistenceEnabled ? 'PostgreSQL' : 'local only'}\x1b[0m\n`);
 
-  // --- Database setup (auto-start embedded if no DATABASE_URL) ---
+  // --- Database setup (embedded PGlite or external via DATABASE_URL) ---
   let pool: import('pg').Pool | null = null;
   let stopWatch: (() => void) | null = null;
   let dbConnectionString: string | undefined;
   let isEmbedded = false;
 
-  if (persistenceEnabled || true) { // Always try to get a database
-    try {
-      const { getDatabaseConnection } = await import('./db/embedded.js');
-      const dbConn = await getDatabaseConnection();
-      pool = dbConn.pool;
-      dbConnectionString = dbConn.connectionString;
-      isEmbedded = dbConn.isEmbedded;
+  try {
+    const { getDatabaseConnection } = await import('./db/embedded.js');
+    const dbConn = await getDatabaseConnection();
+    pool = dbConn.pool;
+    dbConnectionString = dbConn.connectionString;
+    isEmbedded = dbConn.isEmbedded;
 
-      if (isEmbedded) {
-        process.stderr.write('\x1b[2mopeneral: database   embedded PostgreSQL (auto-started)\x1b[0m\n');
-      }
-
-      process.stderr.write('\x1b[2mopeneral: running migrations...\x1b[0m\n');
-      await runMigrations(pool);
-    } catch (err: any) {
-      // Silently continue without database - it's optional
-      pool = null;
+    if (isEmbedded) {
+      const dataDir = process.env.OPENERAL_DATA_DIR
+        ?? `${process.env.HOME ?? '~'}/.openeral/data`;
+      process.stderr.write(`\x1b[2mopeneral: database   embedded PGlite (${dataDir})\x1b[0m\n`);
+    } else {
+      process.stderr.write('\x1b[2mopeneral: database   external PostgreSQL\x1b[0m\n');
     }
+
+    process.stderr.write('\x1b[2mopeneral: running migrations...\x1b[0m\n');
+    await runMigrations(pool);
+  } catch (err: any) {
+    process.stderr.write(`\x1b[31mopeneral: ${err.message}\x1b[0m\n`);
+    process.exit(1);
   }
 
   if (pool) {
@@ -247,12 +253,13 @@ The \`pg\` command uses psql if available, otherwise Node.js pg.
 
 ## Cost Analysis
 
-Openeral can analyze your API usage and provide optimization recommendations:
+With StringCost enabled, you can analyze your API usage:
 
-    npx openeral optimize sync      # Fetch usage data from Anthropic
+    npx openeral optimize sync      # Fetch data from StringCost
+    npx openeral optimize stats     # View statistics
     npx openeral optimize analyze   # Get recommendations
 
-This helps you understand your spending patterns and identify opportunities to reduce costs.
+StringCost tracks all API calls automatically.
 `);
     }
 
@@ -271,13 +278,17 @@ This helps you understand your spending patterns and identify opportunities to r
     OPENERAL_WORKSPACE_ID: workspaceId,
   };
 
-  // StringCost integration (if configured)
+  // --- Determine upstream Anthropic URL ---
+  // Default: direct Anthropic. If StringCost is configured, use its proxy URL
+  // so that both StringCost tracking and local DB tracking work together.
+  let upstreamBaseUrl = 'https://api.anthropic.com';
+
   if (process.env.STRINGCOST_API_KEY && process.env.ANTHROPIC_API_KEY) {
     process.stderr.write('\x1b[2mopeneral: presigning with StringCost...\x1b[0m\n');
     try {
       const controller = new AbortController();
       const timeoutId = setTimeout(() => controller.abort(), 10000);
-      
+
       const res = await fetch('https://app.stringcost.com/v1/presign', {
         method: 'POST',
         headers: {
@@ -296,16 +307,64 @@ This helps you understand your spending patterns and identify opportunities to r
         signal: controller.signal,
       });
       clearTimeout(timeoutId);
-      
+
       if (res.ok) {
         const data = await res.json() as { url?: string };
         if (data.url) {
-          claudeEnv.ANTHROPIC_BASE_URL = data.url.replace(/\/v1\/.*$/, '');
-          process.stderr.write('\x1b[2mopeneral: StringCost enabled — costs tracked automatically\x1b[0m\n');
+          upstreamBaseUrl = data.url.replace(/\/v1\/.*$/, '');
+          process.stderr.write('\x1b[2mopeneral: StringCost enabled — costs tracked via StringCost + local DB\x1b[0m\n');
+
+          // Save the presign session URL so `npx openeral optimize sync` can
+          // still decode the JWT and query token-usage data from StringCost.
+          if (pool) {
+            try {
+              await pool.query(
+                `UPDATE _openeral.workspace_config
+                 SET config = config || $2::jsonb, updated_at = NOW()
+                 WHERE id = $1`,
+                [
+                  workspaceId,
+                  JSON.stringify({
+                    stringcost_session_url: data.url,
+                    stringcost_session_started: new Date().toISOString(),
+                  }),
+                ],
+              );
+            } catch {
+              // Non-critical
+            }
+          }
         }
       }
     } catch (err: any) {
       process.stderr.write(`\x1b[33mopeneral: StringCost presign failed: ${err.message}\x1b[0m\n`);
+    }
+  }
+
+  // --- Start local optimizer proxy ---
+  // The proxy intercepts every /v1/messages call, saves token usage to the
+  // local DB immediately, then forwards to the upstream URL. This means
+  // `npx openeral optimize stats` always has live data — no API sync needed.
+  let proxyServer: import('./optimize/proxy.js').OptimizerProxy | null = null;
+  const sessionId = randomUUID();
+
+  if (pool && process.env.ANTHROPIC_API_KEY) {
+    try {
+      const { OptimizerProxy } = await import('./optimize/proxy.js');
+      proxyServer = new OptimizerProxy({
+        anthropicApiKey: process.env.ANTHROPIC_API_KEY,
+        anthropicBaseUrl: upstreamBaseUrl,
+        pool,
+        workspaceId,
+        sessionId,
+      });
+      await proxyServer.start();
+      // Route Claude Code through the local proxy
+      claudeEnv.ANTHROPIC_BASE_URL = `http://127.0.0.1:${proxyServer.port}`;
+      process.stderr.write(`\x1b[2mopeneral: optimizer proxy active (port ${proxyServer.port}) — usage saved to DB\x1b[0m\n`);
+    } catch (err: any) {
+      process.stderr.write(`\x1b[33mopeneral: proxy start failed (${err.message}) — usage tracking disabled\x1b[0m\n`);
+      proxyServer = null;
     }
   }
 
@@ -331,6 +390,9 @@ This helps you understand your spending patterns and identify opportunities to r
   });
 
   child.on('exit', async (code) => {
+    // Drain pending DB writes and close proxy BEFORE ending the pool.
+    // This prevents PGlite from aborting in-flight storeMetrics() calls.
+    if (proxyServer) await proxyServer.drain();
     if (pool && stopWatch) {
       stopWatch();
       process.stderr.write('\n\x1b[2mopeneral: saving workspace...\x1b[0m\n');

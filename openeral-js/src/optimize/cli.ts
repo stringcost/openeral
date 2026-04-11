@@ -23,8 +23,8 @@ Usage:
 
 Commands:
   stats                Show optimization statistics
-  analyze              Analyze usage and provide recommendations (like Clawptimizer)
-  sync                 Sync usage data from Anthropic API
+  analyze              Analyze usage and provide recommendations
+  sync                 Sync usage data from StringCost (requires STRINGCOST_API_KEY)
   test-db              Test database connection
   help                 Show this help message
 
@@ -40,6 +40,11 @@ Analyze Options:
 Sync Options:
   --workspace <id>     Workspace ID (default: hostname)
   --days <n>           Number of days to sync (default: 7)
+
+Note:
+  Database is embedded PGlite (auto-starts, no Docker needed).
+  Set DATABASE_URL to use an external PostgreSQL instead.
+  The 'sync' command requires STRINGCOST_API_KEY to fetch usage data.
 
 Examples:
   npx openeral optimize test-db
@@ -75,35 +80,29 @@ Examples:
 
   // Test database connection
   if (command === 'test-db') {
-    const databaseUrl = process.env.DATABASE_URL;
-    if (!databaseUrl) {
-      console.error('❌ DATABASE_URL environment variable is required');
-      console.error('\nSet it like this:');
-      console.error('  export DATABASE_URL="postgresql://user:pass@host:5432/dbname"');
-      process.exit(1);
-    }
-
-    const { testConnection } = await import('../db/test-connection.js');
+    const { getDatabaseConnection } = await import('../db/embedded.js');
     console.log('Testing database connection...');
-    console.log(`URL: ${databaseUrl.replace(/:[^:@]+@/, ':****@')}\n`); // Hide password
-    
-    const result = await testConnection(databaseUrl);
-    if (result.success) {
-      console.log(`✅ Connection successful (${result.latency}ms)`);
+
+    try {
+      const conn = await getDatabaseConnection();
+      const result = await conn.pool.query('SELECT version() AS v');
+      const version = (result.rows[0] as any)?.v ?? 'unknown';
+      console.log(`✅ Connected (${conn.isEmbedded ? 'embedded PGlite' : 'external PostgreSQL'})`);
+      console.log(`   ${String(version).split('\n')[0]}`);
+      await conn.pool.end();
       process.exit(0);
-    } else {
-      console.error(`❌ Connection failed: ${result.error}`);
-      console.error(`   Took ${result.latency}ms before timeout\n`);
-      console.error('Common issues:');
-      console.error('  - Database server not running');
-      console.error('  - Wrong host/port in DATABASE_URL');
-      console.error('  - Firewall blocking connection');
-      console.error('  - Wrong credentials');
+    } catch (err: any) {
+      console.error(`❌ Connection failed: ${err.message}`);
+      if (process.env.DATABASE_URL) {
+        console.error('   Check DATABASE_URL and ensure PostgreSQL is running.');
+      } else {
+        console.error('   Embedded PGlite failed to start. Try setting OPENERAL_DATA_DIR.');
+      }
       process.exit(1);
     }
   }
 
-  // Validate DATABASE_URL or use embedded for other commands
+  // Get database — embedded PGlite (default) or external via DATABASE_URL
   let pool: import('pg').Pool;
   let isEmbedded = false;
 
@@ -114,13 +113,15 @@ Examples:
     isEmbedded = dbConn.isEmbedded;
 
     if (isEmbedded) {
-      console.log('ℹ️  Using embedded PostgreSQL (auto-started)');
+      console.log('ℹ️  Using embedded PGlite (no server required)');
     }
   } catch (err: any) {
     console.error(`❌ Database connection failed: ${err.message}`);
-    console.error('\nTroubleshooting:');
-    console.error('  1. Set DATABASE_URL to use external PostgreSQL');
-    console.error('  2. Or let Openeral use embedded PostgreSQL (automatic)');
+    if (process.env.DATABASE_URL) {
+      console.error('   Check DATABASE_URL and ensure PostgreSQL is running.');
+    } else {
+      console.error('   Embedded PGlite failed. Try setting OPENERAL_DATA_DIR.');
+    }
     process.exit(1);
   }
 
@@ -139,20 +140,54 @@ Examples:
         console.log(formatAnalysisReport(report));
       }
     } else if (command === 'sync') {
-      const apiKey = process.env.ANTHROPIC_API_KEY;
+      const apiKey = process.env.STRINGCOST_API_KEY;
       if (!apiKey) {
-        console.error('❌ ANTHROPIC_API_KEY is required for sync');
-        console.error('   export ANTHROPIC_API_KEY="sk-ant-..."');
+        console.error('❌ STRINGCOST_API_KEY is required for sync');
+        console.error('   export STRINGCOST_API_KEY="sk-stringcost-..."');
+        console.error('\nStringCost tracks API usage and costs automatically.');
+        console.error('Get your API key at: https://stringcost.com');
         process.exit(1);
       }
 
-      const { syncUsageData } = await import('./anthropic-api.js');
-      const result = await syncUsageData(pool, workspaceId, apiKey, days);
-      
+      // Look up the session URL saved during the last `npx openeral` run.
+      // The JWT in the URL encodes the session ID so we can scope the query.
+      let sessionId: string | undefined;
+      let clientId: string | undefined;
+
+      try {
+        const { decodePresignUrl } = await import('./stringcost-api.js');
+        const configResult = await pool.query(
+          `SELECT config FROM _openeral.workspace_config WHERE id = $1`,
+          [workspaceId],
+        );
+        const config = configResult.rows[0]?.config as Record<string, string> | undefined;
+        if (config?.stringcost_session_url) {
+          const decoded = decodePresignUrl(config.stringcost_session_url);
+          sessionId = decoded.sessionId;
+          clientId = decoded.clientId;
+        }
+      } catch {
+        // No stored session — will fall back to account-wide event fetch
+      }
+
+      console.log(`📥 Fetching usage data from StringCost (last ${days} days)...`);
+      if (sessionId) {
+        console.log(`   Session ID: ${sessionId.slice(0, 8)}...`);
+      } else {
+        console.log(`   (no session ID stored — fetching all account events)`);
+      }
+
+      const { syncStringCostData } = await import('./stringcost-api.js');
+      const result = await syncStringCostData(pool, workspaceId, apiKey, {
+        sessionId,
+        clientId,
+        daysBack: days,
+      });
+
       console.log(`\n✅ Sync complete!`);
-      console.log(`   Fetched: ${result.fetched} records`);
+      console.log(`   Fetched: ${result.fetched} events`);
       console.log(`   Stored: ${result.stored} new records`);
-      console.log(`\nRun 'npx openeral optimize analyze' to see recommendations`);
+      console.log(`\nRun 'npx openeral optimize stats' to see your usage`);
     } else {
       console.error(`Unknown command: ${command}`);
       console.error('Run "npx openeral optimize help" for usage');
