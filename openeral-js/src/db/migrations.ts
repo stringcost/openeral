@@ -1,7 +1,7 @@
 import type { DbPool } from './pool.js';
 
 /**
- * Run all database migrations (V1-V4) in order.
+ * Run all database migrations (V1-V5) in order.
  *
  * Uses an advisory lock to serialize concurrent callers — two shells
  * starting at the same time on a fresh database won't race on CREATE SCHEMA.
@@ -12,10 +12,24 @@ import type { DbPool } from './pool.js';
 export async function runMigrations(pool: DbPool): Promise<void> {
   const client = await pool.connect();
   try {
+    // Set a statement timeout to prevent indefinite hangs
+    await client.query('SET statement_timeout = 30000'); // 30 seconds
+
     // Acquire an advisory lock (key 0x4F50454E = 'OPEN' in hex) to serialize
     // concurrent migration attempts. Without this, two shells hitting a fresh
     // database race on CREATE SCHEMA and one fails with duplicate key.
-    await client.query(`SELECT pg_advisory_lock(1330795854)`);
+    // Use try_advisory_lock with timeout instead of blocking lock
+    const lockResult = await client.query(`SELECT pg_try_advisory_lock(1330795854) as acquired`);
+    
+    if (!lockResult.rows[0].acquired) {
+      console.warn('⚠️  Another process is running migrations, waiting...');
+      // Wait a bit and try again
+      await new Promise(resolve => setTimeout(resolve, 2000));
+      const retryResult = await client.query(`SELECT pg_try_advisory_lock(1330795854) as acquired`);
+      if (!retryResult.rows[0].acquired) {
+        throw new Error('Could not acquire migration lock - another process may be stuck');
+      }
+    }
 
     try {
       // V1: Create _openeral schema and schema_version table
@@ -83,6 +97,43 @@ export async function runMigrations(pool: DbPool): Promise<void> {
 
         CREATE INDEX IF NOT EXISTS idx_ws_files_parent
             ON _openeral.workspace_files (workspace_id, parent_path);
+      `);
+
+      // V5: Create optimization tables
+      await client.query(`
+        CREATE TABLE IF NOT EXISTS _openeral.optimization_metrics (
+            id BIGSERIAL PRIMARY KEY,
+            workspace_id TEXT NOT NULL,
+            timestamp TIMESTAMPTZ DEFAULT NOW(),
+            original_model TEXT NOT NULL,
+            original_prompt_tokens INTEGER NOT NULL,
+            original_estimated_cost DECIMAL(10, 6) NOT NULL,
+            optimized_model TEXT NOT NULL,
+            optimized_prompt_tokens INTEGER NOT NULL,
+            optimized_actual_cost DECIMAL(10, 6) NOT NULL,
+            optimizations_applied TEXT[] NOT NULL,
+            task_type TEXT NOT NULL,
+            cache_hit BOOLEAN NOT NULL DEFAULT false,
+            tokens_saved INTEGER NOT NULL,
+            cost_saved DECIMAL(10, 6) NOT NULL,
+            savings_percentage DECIMAL(5, 2) NOT NULL,
+            metadata JSONB
+        );
+
+        CREATE INDEX IF NOT EXISTS idx_optimization_metrics_workspace
+            ON _openeral.optimization_metrics (workspace_id, timestamp DESC);
+
+        CREATE INDEX IF NOT EXISTS idx_optimization_metrics_model
+            ON _openeral.optimization_metrics (optimized_model, timestamp DESC);
+
+        CREATE TABLE IF NOT EXISTS _openeral.api_cache (
+            key TEXT PRIMARY KEY,
+            response JSONB NOT NULL,
+            created_at TIMESTAMPTZ DEFAULT NOW()
+        );
+
+        CREATE INDEX IF NOT EXISTS idx_api_cache_created
+            ON _openeral.api_cache (created_at);
       `);
     } finally {
       await client.query(`SELECT pg_advisory_unlock(1330795854)`);

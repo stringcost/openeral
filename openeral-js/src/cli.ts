@@ -7,6 +7,7 @@
  *   npx openeral                      # interactive Claude Code
  *   npx openeral -- -p 'hello'        # non-interactive
  *   npx openeral --workspace myid     # custom workspace ID
+ *   npx openeral optimize stats       # show optimization stats
  *
  * Required env:
  *   DATABASE_URL          PostgreSQL connection string
@@ -40,7 +41,6 @@ fi
 }
 import { hostname } from 'node:os';
 import { join } from 'node:path';
-import { createPool } from './db/pool.js';
 import { runMigrations } from './db/migrations.js';
 import { syncToFs, syncFromFs, watchAndSync } from './sync.js';
 
@@ -128,7 +128,21 @@ Environment Variables:
 }
 
 export async function main() {
-  const parsed = parseCliArgs(process.argv.slice(2));
+  const args = process.argv.slice(2);
+  
+  // Check for optimize subcommand
+  if (args[0] === 'optimize') {
+    // Delegate to optimize CLI
+    const child = spawn('node', [
+      new URL('./optimize/cli.js', import.meta.url).pathname,
+      ...args.slice(1)
+    ], { stdio: 'inherit' });
+    
+    child.on('exit', (code) => process.exit(code ?? 0));
+    return;
+  }
+  
+  const parsed = parseCliArgs(args);
 
   if (parsed.kind === 'help') {
     printHelp();
@@ -168,15 +182,33 @@ export async function main() {
   process.stderr.write(`\x1b[2mopeneral: home       ${homeDir}\x1b[0m\n`);
   process.stderr.write(`\x1b[2mopeneral: persist    ${persistenceEnabled ? 'PostgreSQL' : 'local only'}\x1b[0m\n`);
 
-  // --- Database setup (only if DATABASE_URL is set) ---
+  // --- Database setup (auto-start embedded if no DATABASE_URL) ---
   let pool: import('pg').Pool | null = null;
   let stopWatch: (() => void) | null = null;
+  let dbConnectionString: string | undefined;
+  let isEmbedded = false;
 
-  if (persistenceEnabled) {
-    pool = createPool(databaseUrl);
+  if (persistenceEnabled || true) { // Always try to get a database
+    try {
+      const { getDatabaseConnection } = await import('./db/embedded.js');
+      const dbConn = await getDatabaseConnection();
+      pool = dbConn.pool;
+      dbConnectionString = dbConn.connectionString;
+      isEmbedded = dbConn.isEmbedded;
 
-    process.stderr.write('\x1b[2mopeneral: running migrations...\x1b[0m\n');
-    await runMigrations(pool);
+      if (isEmbedded) {
+        process.stderr.write('\x1b[2mopeneral: database   embedded PostgreSQL (auto-started)\x1b[0m\n');
+      }
+
+      process.stderr.write('\x1b[2mopeneral: running migrations...\x1b[0m\n');
+      await runMigrations(pool);
+    } catch (err: any) {
+      // Silently continue without database - it's optional
+      pool = null;
+    }
+  }
+
+  if (pool) {
 
     // Ensure workspace config exists
     await pool.query(
@@ -212,6 +244,15 @@ Query the connected database:
     pg "\\d public.users"
 
 The \`pg\` command uses psql if available, otherwise Node.js pg.
+
+## Cost Analysis
+
+Openeral can analyze your API usage and provide optimization recommendations:
+
+    npx openeral optimize sync      # Fetch usage data from Anthropic
+    npx openeral optimize analyze   # Get recommendations
+
+This helps you understand your spending patterns and identify opportunities to reduce costs.
 `);
     }
 
@@ -220,20 +261,20 @@ The \`pg\` command uses psql if available, otherwise Node.js pg.
     stopWatch = watchAndSync(pool, workspaceId, homeDir);
   }
 
-  // --- StringCost auto-presign ---
   // Build Claude environment from allowlist to avoid exposing unnecessary secrets
   const claudeEnv: Record<string, string | undefined> = {
     HOME: homeDir,
     PATH: `${join(homeDir, '.local', 'bin')}:${process.env.PATH}`,
     // Include required ANTHROPIC_* variables for Claude Code
     ...(process.env.ANTHROPIC_API_KEY ? { ANTHROPIC_API_KEY: process.env.ANTHROPIC_API_KEY } : {}),
-    ...(process.env.ANTHROPIC_BASE_URL ? { ANTHROPIC_BASE_URL: process.env.ANTHROPIC_BASE_URL } : {}),
+    // Pass workspace ID
+    OPENERAL_WORKSPACE_ID: workspaceId,
   };
 
+  // StringCost integration (if configured)
   if (process.env.STRINGCOST_API_KEY && process.env.ANTHROPIC_API_KEY) {
     process.stderr.write('\x1b[2mopeneral: presigning with StringCost...\x1b[0m\n');
     try {
-      // Use a 10-second timeout to prevent indefinite hangs
       const controller = new AbortController();
       const timeoutId = setTimeout(() => controller.abort(), 10000);
       
@@ -256,14 +297,15 @@ The \`pg\` command uses psql if available, otherwise Node.js pg.
       });
       clearTimeout(timeoutId);
       
-      if (!res.ok) throw new Error(`HTTP ${res.status}`);
-      const data = await res.json() as { url?: string };
-      if (data.url) {
-        claudeEnv.ANTHROPIC_BASE_URL = data.url.replace(/\/v1\/.*$/, '');
-        process.stderr.write('\x1b[2mopeneral: StringCost enabled — costs tracked automatically\x1b[0m\n');
+      if (res.ok) {
+        const data = await res.json() as { url?: string };
+        if (data.url) {
+          claudeEnv.ANTHROPIC_BASE_URL = data.url.replace(/\/v1\/.*$/, '');
+          process.stderr.write('\x1b[2mopeneral: StringCost enabled — costs tracked automatically\x1b[0m\n');
+        }
       }
     } catch (err: any) {
-      process.stderr.write(`\x1b[33mopeneral: StringCost presign failed: ${err.message} — continuing without cost tracking\x1b[0m\n`);
+      process.stderr.write(`\x1b[33mopeneral: StringCost presign failed: ${err.message}\x1b[0m\n`);
     }
   }
 
@@ -307,12 +349,4 @@ The \`pg\` command uses psql if available, otherwise Node.js pg.
   for (const sig of ['SIGTERM', 'SIGINT', 'SIGHUP'] as const) {
     process.on(sig, () => child.kill(sig));
   }
-}
-
-// Only run main if this is the entry point (not imported by tests)
-if (import.meta.url === `file://${process.argv[1]}`) {
-  main().catch((err) => {
-    process.stderr.write(`\x1b[31mopeneral: ${err.message}\x1b[0m\n`);
-    process.exit(1);
-  });
 }
