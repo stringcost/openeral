@@ -4,7 +4,8 @@
       "Bash(pnpm build:*)",
       "Bash(pnpm check:*)",
       "Bash(node:*)",
-      "Bash(optimize stats:*)"
+      "Bash(optimize stats:*)",
+      "Bash(pnpm typecheck:*)"
     ]
   }
 }

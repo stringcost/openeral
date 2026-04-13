@@ -13,21 +13,24 @@ set -euo pipefail
 
 OPENERAL_DIR=/opt/openeral
 
-# Resolve database connection string (OpenShell provider injects DATABASE_URL)
-export DATABASE_URL="${DATABASE_URL:-${OPENERAL_DATABASE_URL:-}}"
-if [ -z "$DATABASE_URL" ]; then
-  echo "setup.sh: DATABASE_URL or OPENERAL_DATABASE_URL required" >&2
-  exit 1
-fi
-
 # Workspace ID defaults to sandbox ID (set by OpenShell supervisor)
 export WORKSPACE_ID="${OPENSHELL_SANDBOX_ID:-default}"
 
+# Fix the PGlite data directory to a stable path so every Node.js process
+# in this script uses the same embedded database.  /home/agent is a real
+# directory in the container (created in the Dockerfile).
+export OPENERAL_DATA_DIR="${OPENERAL_DATA_DIR:-/home/agent/.openeral/data}"
+mkdir -p "$OPENERAL_DATA_DIR"
+
+# If DATABASE_URL is provided (external PostgreSQL), propagate it so
+# getDatabaseConnection() picks it up over PGlite.
+export DATABASE_URL="${DATABASE_URL:-${OPENERAL_DATABASE_URL:-}}"
+
 echo "setup.sh: running migrations..."
 node -e "
-  import('$OPENERAL_DIR/dist/db/pool.js').then(async ({ createPool }) => {
+  import('$OPENERAL_DIR/dist/db/embedded.js').then(async ({ getDatabaseConnection }) => {
     const { runMigrations } = await import('$OPENERAL_DIR/dist/db/migrations.js');
-    const pool = createPool(process.env.DATABASE_URL);
+    const { pool } = await getDatabaseConnection();
     await runMigrations(pool);
     await pool.end();
     console.log('setup.sh: migrations complete');
@@ -39,12 +42,10 @@ node -e "
 
 echo "setup.sh: seeding workspace $WORKSPACE_ID..."
 node -e "
-  import('$OPENERAL_DIR/dist/db/pool.js').then(async ({ createPool }) => {
-    const { runMigrations } = await import('$OPENERAL_DIR/dist/db/migrations.js');
+  import('$OPENERAL_DIR/dist/db/embedded.js').then(async ({ getDatabaseConnection }) => {
     const ws = await import('$OPENERAL_DIR/dist/db/workspace-queries.js');
-    const pool = createPool(process.env.DATABASE_URL);
+    const { pool } = await getDatabaseConnection();
 
-    // Ensure workspace config exists
     try {
       await pool.query(
         \"INSERT INTO _openeral.workspace_config (id, display_name, config) VALUES (\\\$1, \\\$2, '{}'::jsonb) ON CONFLICT (id) DO NOTHING\",
@@ -52,7 +53,6 @@ node -e "
       );
     } catch {}
 
-    // Seed root and .claude dirs
     await ws.seedFromConfig(pool, process.env.WORKSPACE_ID, {
       autoDirs: ['/', '/.claude', '/.claude/projects'],
       seedFiles: {},
