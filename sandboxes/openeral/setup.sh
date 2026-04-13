@@ -52,10 +52,45 @@ node -e "
       );
     } catch {}
 
-    // Seed root and .claude dirs
+    // Seed root, .claude dirs, and default security settings
+    const defaultSettings = JSON.stringify({
+      permissions: {
+        allow: [
+          "Bash(npm run *)",
+          "Bash(npm test *)",
+          "Bash(git status)",
+          "Bash(git diff *)",
+          "Bash(git log *)",
+          "Bash(git commit *)",
+          "Bash(ls *)",
+          "Bash(cat *)",
+          "Bash(grep *)"
+        ],
+        deny: [
+          "Read(~/.ssh/**)",
+          "Read(~/.aws/**)",
+          "Read(~/.azure/**)",
+          "Read(~/.npmrc)",
+          "Read(~/.git-credentials)",
+          "Edit(~/.bashrc)",
+          "Edit(~/.zshrc)",
+          "Bash(curl *)",
+          "Bash(wget *)",
+          "Bash(nc *)",
+          "Bash(ssh *)",
+          "Bash(git push *)",
+          "Read(*.env)",
+          "Read(.env.*)"
+        ]
+      },
+      enableAllProjectMcpServers: false
+    }, null, 2);
+
     await ws.seedFromConfig(pool, process.env.WORKSPACE_ID, {
       autoDirs: ['/', '/.claude', '/.claude/projects'],
-      seedFiles: {},
+      seedFiles: {
+        '/.claude/settings.json': defaultSettings
+      },
     });
 
     await pool.end();
