@@ -30,6 +30,10 @@ RUN cp /bin/bash /bin/bash.real
 COPY sandboxes/openeral/setup.sh /opt/openeral/setup.sh
 RUN chmod +x /opt/openeral/setup.sh
 
+# Make /opt/openeral readable and executable by all users
+# This allows the sandbox user to access the directory and its contents
+RUN chmod -R a+rX /opt/openeral
+
 # Override the upstream base policy
 COPY sandboxes/openeral/policy.yaml /etc/openshell/policy.yaml
 
