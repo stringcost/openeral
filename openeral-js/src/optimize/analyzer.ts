@@ -362,41 +362,64 @@ function analyzePromptSurfaceFiles(
 }
 
 // ---------------------------------------------------------------------------
-// Hotspot detection
+// Hotspot detection - files actually read during sessions
 // ---------------------------------------------------------------------------
 
-function findHotspots(projectRoot: string, topN = 5): Array<{ relPath: string; tokens: number }> {
-  const extensions = new Set(['.ts', '.js', '.mjs', '.rs', '.go', '.py', '.md', '.yaml', '.yml', '.lock', '.json', '.toml']);
-  const ignoreDirs = new Set(['node_modules', '.git', 'dist', 'build', 'target', '.pnpm', '__pycache__', '.next', 'coverage']);
-  const results: Array<{ relPath: string; tokens: number }> = [];
-
-  function walk(dir: string, depth: number) {
-    if (depth > 6) return;
-    let names: string[];
-    try { names = readdirSync(dir).filter((n): n is string => typeof n === 'string'); }
-    catch { return; }
-
-    for (const name of names) {
-      if (ignoreDirs.has(name)) continue;
-      const fullPath = join(dir, name);
-      let s;
-      try { s = statSync(fullPath); } catch { continue; }
-
-      if (s.isDirectory()) {
-        walk(fullPath, depth + 1);
-      } else if (s.isFile()) {
-        const ext = name.includes('.') ? `.${name.split('.').pop()!}` : '';
-        if (!extensions.has(ext) || s.size < 2048) continue;
-        try {
-          const tokens = estimateTokens(readFileSync(fullPath, 'utf8'));
-          if (tokens >= 1000) results.push({ relPath: relative(projectRoot, fullPath), tokens });
-        } catch { /* skip */ }
-      }
-    }
+async function findActualHotspots(
+  pool: DbPool | null | undefined,
+  workspaceId: string,
+  daysBack: number,
+  projectRoot: string,
+  topN = 5
+): Promise<Array<{ relPath: string; tokens: number }>> {
+  if (!pool) {
+    // No session data - return empty array instead of guessing
+    return [];
   }
 
-  walk(projectRoot, 0);
-  return results.sort((a, b) => b.tokens - a.tokens).slice(0, topN);
+  try {
+    // Query for files that were actually read (from metadata)
+    const result = await pool.query<{ file_path: string; read_count: string }>(
+      `SELECT 
+         metadata->>'file_path' AS file_path,
+         COUNT(*)::text AS read_count
+       FROM _openeral.optimization_metrics
+       WHERE workspace_id = $1
+         AND timestamp > NOW() - INTERVAL '1 day' * $2
+         AND metadata->>'file_path' IS NOT NULL
+       GROUP BY metadata->>'file_path'
+       ORDER BY COUNT(*) DESC
+       LIMIT $3`,
+      [workspaceId, daysBack, topN * 2] // Get more than needed, filter below
+    );
+
+    const hotspots: Array<{ relPath: string; tokens: number }> = [];
+    
+    for (const row of result.rows) {
+      const filePath = row.file_path;
+      if (!filePath) continue;
+      
+      // Try to read the file to estimate tokens
+      const fullPath = join(projectRoot, filePath);
+      try {
+        const content = readFileSync(fullPath, 'utf8');
+        const tokens = estimateTokens(content);
+        
+        // Only include if it's actually large (>1000 tokens)
+        if (tokens >= 1000) {
+          hotspots.push({ relPath: filePath, tokens });
+        }
+      } catch {
+        // File doesn't exist or can't be read - skip it
+        continue;
+      }
+    }
+
+    return hotspots.sort((a, b) => b.tokens - a.tokens).slice(0, topN);
+  } catch {
+    // Query failed - return empty array
+    return [];
+  }
 }
 
 // ---------------------------------------------------------------------------
@@ -414,78 +437,85 @@ function buildProposals(
   const hasReadme = existsSync(join(projectRoot, 'README.md'));
 
   // ── 1. Model routing ──────────────────────────────────────────────────────
-  if (!surface.hasModelRouting) {
-    // Figure out how many calls used expensive models for simple tasks
+  if (!surface.hasModelRouting && stats.hasData) {
+    // Only recommend if there's actual waste - expensive models used for simple tasks
     const wastedCalls = stats.tasks.reduce((s, t) => s + t.wastedOnExpensiveModel, 0);
     const expensiveModels = stats.models.filter(m => m.displayName !== 'Haiku');
     const expensivePct = expensiveModels.reduce((s, m) => s + m.pct, 0);
-    const current = stats.hasData
-      ? `${expensivePct}% of tokens spent on Sonnet/Opus (${wastedCalls} simple-task calls used expensive models)`
-      : 'No model routing rules in CLAUDE.md — Claude uses the default model for every call';
-    const savings = stats.hasData ? Math.round(avgTokens * 0.35) : 0;
+    
+    // Only recommend if >20% of tokens went to expensive models OR there were wasted calls
+    if (expensivePct > 20 || wastedCalls > 0) {
+      const current = `${expensivePct}% of tokens spent on Sonnet/Opus (${wastedCalls} simple-task calls used expensive models)`;
+      const savings = Math.round(avgTokens * 0.35);
 
-    proposals.push({
-      id: 'model-routing',
-      priority: 'HIGH',
-      category: 'model-routing',
-      title: 'Add model routing rules to CLAUDE.md',
-      currentState: current,
-      proposedChange:
-        'Claude selects Haiku for file reads / searches / simple edits, Sonnet for coding tasks, ' +
-        'Opus only for complex multi-step reasoning. Routing is enforced via instructions in CLAUDE.md.',
-      estimatedSavingsPct: 35,
-      estimatedSavingsTokensPerSession: savings,
-      howToApply: 'Run: npx openeral optimize apply --proposal model-routing',
-      canAutoApply: true,
-    });
+      proposals.push({
+        id: 'model-routing',
+        priority: 'HIGH',
+        category: 'model-routing',
+        title: 'Add model routing rules to CLAUDE.md',
+        currentState: current,
+        proposedChange:
+          'Claude selects Haiku for file reads / searches / simple edits, Sonnet for coding tasks, ' +
+          'Opus only for complex multi-step reasoning. Routing is enforced via instructions in CLAUDE.md.',
+        estimatedSavingsPct: 35,
+        estimatedSavingsTokensPerSession: savings,
+        howToApply: 'Run: npx openeral optimize apply --proposal model-routing',
+        canAutoApply: true,
+      });
+    }
   }
 
   // ── 2. Compact context file ────────────────────────────────────────────────
-  if (!surface.hasContextFile && !surface.hasContextFileInstruction) {
-    const current = stats.hasData
-      ? `Each session averages ${stats.avgTokensPerSession.toLocaleString()} tokens. ` +
-        `Claude re-explores project files every session instead of reading a compact state file.`
-      : 'No .claude/CONTEXT.md found. Claude starts each session with no compact project state.';
-    const savings = stats.hasData ? Math.round(avgTokens * 0.28) : 0;
+  if (!surface.hasContextFile && !surface.hasContextFileInstruction && stats.hasData) {
+    // Only recommend if sessions are actually expensive (>2000 tokens avg)
+    // Simple Q&A sessions don't need CONTEXT.md
+    if (stats.avgTokensPerSession > 2000) {
+      const current = `Each session averages ${stats.avgTokensPerSession.toLocaleString()} tokens. ` +
+        `Claude re-explores project files every session instead of reading a compact state file.`;
+      const savings = Math.round(avgTokens * 0.28);
 
-    proposals.push({
-      id: 'context-file',
-      priority: 'HIGH',
-      category: 'context-efficiency',
-      title: 'Create a living CONTEXT.md Claude reads and updates each session',
-      currentState: current,
-      proposedChange:
-        'Create .claude/CONTEXT.md as a compact project state file. ' +
-        'Claude reads it first (instead of re-exploring), then updates it after each task. ' +
-        'Next session starts with fresh context in ~200 tokens instead of reading 5-10 files.',
-      estimatedSavingsPct: 28,
-      estimatedSavingsTokensPerSession: savings,
-      howToApply: 'Run: npx openeral optimize apply --proposal context-file',
-      canAutoApply: true,
-    });
+      proposals.push({
+        id: 'context-file',
+        priority: 'HIGH',
+        category: 'context-efficiency',
+        title: 'Create a living CONTEXT.md Claude reads and updates each session',
+        currentState: current,
+        proposedChange:
+          'Create .claude/CONTEXT.md as a compact project state file. ' +
+          'Claude reads it first (instead of re-exploring), then updates it after each task. ' +
+          'Next session starts with fresh context in ~200 tokens instead of reading 5-10 files.',
+        estimatedSavingsPct: 28,
+        estimatedSavingsTokensPerSession: savings,
+        howToApply: 'Run: npx openeral optimize apply --proposal context-file',
+        canAutoApply: true,
+      });
+    }
   }
 
   // ── 3. README auto-update instruction ─────────────────────────────────────
-  if (hasReadme && !surface.hasReadmeUpdateInstruction) {
-    const savings = stats.hasData ? Math.round(avgTokens * 0.15) : 0;
+  if (hasReadme && !surface.hasReadmeUpdateInstruction && stats.hasData) {
+    // Only recommend if sessions are doing actual coding work (>3000 tokens avg)
+    if (avgTokens > 3000) {
+      const savings = Math.round(avgTokens * 0.15);
 
-    proposals.push({
-      id: 'readme-updates',
-      priority: stats.hasData && avgTokens > 3000 ? 'HIGH' : 'MEDIUM',
-      category: 'workflow',
-      title: 'Instruct Claude to keep README current after each task',
-      currentState:
-        'Claude re-reads source files for context in each session. ' +
-        'README is not used as a live state document.',
-      proposedChange:
-        'Add a workflow rule to CLAUDE.md: after completing a coding task, Claude updates the ' +
-        'relevant section of README.md. Future sessions read README for context instead of ' +
-        'exploring source files from scratch — saves 1-3 file reads per session.',
-      estimatedSavingsPct: 15,
-      estimatedSavingsTokensPerSession: savings,
-      howToApply: 'Run: npx openeral optimize apply --proposal readme-updates',
-      canAutoApply: true,
-    });
+      proposals.push({
+        id: 'readme-updates',
+        priority: 'HIGH',
+        category: 'workflow',
+        title: 'Instruct Claude to keep README current after each task',
+        currentState:
+          'Claude re-reads source files for context in each session. ' +
+          'README is not used as a live state document.',
+        proposedChange:
+          'Add a workflow rule to CLAUDE.md: after completing a coding task, Claude updates the ' +
+          'relevant section of README.md. Future sessions read README for context instead of ' +
+          'exploring source files from scratch — saves 1-3 file reads per session.',
+        estimatedSavingsPct: 15,
+        estimatedSavingsTokensPerSession: savings,
+        howToApply: 'Run: npx openeral optimize apply --proposal readme-updates',
+        canAutoApply: true,
+      });
+    }
   }
 
   // ── 4. Lazy file reading rule ─────────────────────────────────────────────
@@ -583,7 +613,7 @@ export async function analyzePromptSurface(opts: AnalyzeOptions = {}): Promise<S
       ? querySessionStats(opts.pool, workspaceId, daysBack)
       : Promise.resolve(emptySessionStats(daysBack)),
     Promise.resolve(analyzePromptSurfaceFiles(projectRoot, memoryDir)),
-    Promise.resolve(findHotspots(projectRoot)),
+    findActualHotspots(opts.pool, workspaceId, daysBack, projectRoot),
   ]);
 
   const proposals = buildProposals(sessionStats, promptSurface, projectRoot);
@@ -675,7 +705,13 @@ export function formatPromptSurfaceReport(report: StrategicReport): string {
   lines.push('');
 
   if (report.proposals.length === 0) {
-    lines.push('  All major optimizations are already in place.');
+    if (s.hasData && s.avgTokensPerSession < 2000) {
+      lines.push('  ✓ Your sessions are already efficient!');
+      lines.push(`  ✓ Average ${s.avgTokensPerSession} tokens/session is excellent for your workload.`);
+      lines.push('  ✓ No optimizations needed at this time.');
+    } else {
+      lines.push('  ✓ All major optimizations are already in place.');
+    }
   } else {
     const totalSavings = report.proposals.reduce((s, p) => s + p.estimatedSavingsTokensPerSession, 0);
     if (totalSavings > 0) {
@@ -702,12 +738,18 @@ export function formatPromptSurfaceReport(report: StrategicReport): string {
 
   // ── Hotspots ──────────────────────────────────────────────────────────────
   if (report.hotspots.length > 0) {
-    lines.push('## Large Files (read hotspots)');
+    lines.push('## Large Files Actually Read');
     lines.push('');
-    lines.push('  These files are expensive to read in full. Claude should use Grep/Glob instead.');
+    lines.push('  These files were read during your sessions and are expensive (>1000 tokens each).');
+    lines.push('  Consider using Grep to find specific sections instead of reading the full file.');
     for (const h of report.hotspots) {
       lines.push(`    ${h.relPath.padEnd(50)} ~${h.tokens} tokens`);
     }
+    lines.push('');
+  } else if (s.hasData) {
+    lines.push('## Large Files Actually Read');
+    lines.push('');
+    lines.push('  ✓ No large files were read during your sessions. Good job keeping reads targeted!');
     lines.push('');
   }
 
