@@ -609,8 +609,90 @@ async function launchViaSandbox(workspaceId: string, claudeArgs: string[]): Prom
   }
 
   sandboxArgs.push('--auto-providers');
-  // Run setup.sh with sh (doesn't require execute permission)
-  sandboxArgs.push('--', 'sh', '/opt/openeral/setup.sh', ...claudeArgs);
+  
+  // Run setup commands inline instead of via script file to avoid permission issues
+  // This replicates the functionality of /opt/openeral/setup.sh
+  const setupCommands = `
+set -eu
+OPENERAL_DIR=/opt/openeral
+export WORKSPACE_ID="\${OPENSHELL_SANDBOX_ID:-default}"
+export OPENERAL_DATA_DIR="\${OPENERAL_DATA_DIR:-/home/agent/.openeral/data}"
+mkdir -p "$OPENERAL_DATA_DIR"
+export DATABASE_URL="\${DATABASE_URL:-\${OPENERAL_DATABASE_URL:-}}"
+
+echo "setup: running migrations..."
+node -e "
+  import('$OPENERAL_DIR/dist/db/embedded.js').then(async ({ getDatabaseConnection }) => {
+    const { runMigrations } = await import('$OPENERAL_DIR/dist/db/migrations.js');
+    const { pool } = await getDatabaseConnection();
+    await runMigrations(pool);
+    await pool.end();
+    console.log('setup: migrations complete');
+  }).catch(err => {
+    console.error('setup: migration failed:', err.message);
+    process.exit(1);
+  });
+"
+
+echo "setup: seeding workspace $WORKSPACE_ID..."
+node -e "
+  import('$OPENERAL_DIR/dist/db/embedded.js').then(async ({ getDatabaseConnection }) => {
+    const ws = await import('$OPENERAL_DIR/dist/db/workspace-queries.js');
+    const { pool } = await getDatabaseConnection();
+
+    try {
+      await pool.query(
+        \\"INSERT INTO _openeral.workspace_config (id, display_name, config) VALUES (\\\\$1, \\\\$2, '{}'::jsonb) ON CONFLICT (id) DO NOTHING\\",
+        [process.env.WORKSPACE_ID, 'sandbox']
+      );
+    } catch {}
+
+    await ws.seedFromConfig(pool, process.env.WORKSPACE_ID, {
+      autoDirs: ['/', '/.claude', '/.claude/projects'],
+      seedFiles: {},
+    });
+
+    await pool.end();
+    console.log('setup: workspace seeded');
+  }).catch(err => {
+    console.error('setup: seed failed:', err.message);
+    process.exit(1);
+  });
+"
+
+OPENERAL_NPMRC=/tmp/openeral-npmrc
+rm -f "$OPENERAL_NPMRC"
+if [ -n "\${SOCKET_TOKEN:-}" ]; then
+  echo "setup: configuring npm to use Socket.dev registry..."
+  cat > "$OPENERAL_NPMRC" <<NPMRC
+registry=https://registry.socket.dev/npm/
+//registry.socket.dev/npm/:_authToken=\${SOCKET_TOKEN}
+NPMRC
+  export NPM_CONFIG_USERCONFIG="$OPENERAL_NPMRC"
+fi
+
+echo "setup: starting openeral-bash daemon..."
+node "$OPENERAL_DIR/openeral-bash.mjs" --daemon &
+DAEMON_PID=$!
+
+for i in $(seq 1 30); do
+  [ -S /tmp/openeral-bash.sock ] && break
+  sleep 0.1
+done
+
+if [ ! -S /tmp/openeral-bash.sock ]; then
+  echo "setup: daemon failed to start" >&2
+  exit 1
+fi
+
+echo "setup: daemon ready (pid $DAEMON_PID)"
+trap "kill $DAEMON_PID 2>/dev/null; rm -f /tmp/openeral-bash.sock" EXIT
+
+echo "setup: launching Claude Code..."
+exec env HOME=/home/agent SHELL=/usr/local/bin/openeral-bash claude ${claudeArgs.join(' ')}
+`;
+
+  sandboxArgs.push('--', 'sh', '-c', setupCommands);
 
   process.stderr.write(
     `\x1b[2mopeneral: launching Claude Code in OpenShell sandbox (${workspaceId})...\x1b[0m\n\n`,
