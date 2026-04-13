@@ -39,6 +39,16 @@ export { runMigrations } from './db/migrations.js';
 export { analyzeCommand, analyzeCommandSync } from './safety.js';
 export type { AnalysisResult, BashInvocation } from './safety.js';
 
+// Optimizer
+export { createOptimizer, Optimizer } from './optimize/index.js';
+export type { 
+  APIRequest, 
+  APIResponse, 
+  OptimizerConfig, 
+  OptimizationMetrics 
+} from './optimize/index.js';
+export { DEFAULT_OPTIMIZER_CONFIG } from './optimize/index.js';
+
 // Types
 export type {
   SchemaInfo,
