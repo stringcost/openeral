@@ -18,13 +18,10 @@ Claude will handle the rest — it clones the repo, builds, and launches.
 git clone https://github.com/sandys/openeral.git
 cd openeral/openeral-js
 pnpm install && pnpm build
-
-export ANTHROPIC_API_KEY='sk-ant-...'
-
 npx openeral
 ```
 
-That's it. Claude Code launches with an isolated home directory.
+That's it. OpenEral starts the OpenShell gateway, creates the sandbox, and Claude Code launches inside it.
 
 **Add cost tracking** with [StringCost](https://github.com/arakoodev/stringcost) — just set your StringCost API key:
 

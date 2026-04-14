@@ -11,7 +11,22 @@ set -euo pipefail
 #   3. Start openeral-bash daemon
 #   4. Exec Claude Code
 
-OPENERAL_DIR=/opt/openeral
+# Use /opt/openeral directly if accessible, otherwise copy to /home/agent
+if [ -r /opt/openeral/dist/db/embedded.js ]; then
+  OPENERAL_DIR=/opt/openeral
+  echo "setup: using /opt/openeral directly"
+else
+  echo "setup: copying openeral to writable location..."
+  # Use cp instead of tar to avoid permission issues
+  mkdir -p /home/agent/openeral
+  cp -r /opt/openeral/* /home/agent/openeral/ 2>/dev/null || {
+    echo "setup: copy failed, trying with sudo..."
+    # If copy fails, try to make /opt/openeral readable
+    chmod -R a+rX /opt/openeral 2>/dev/null || true
+    cp -r /opt/openeral/* /home/agent/openeral/
+  }
+  OPENERAL_DIR=/home/agent/openeral
+fi
 
 # Workspace ID defaults to sandbox ID (set by OpenShell supervisor)
 export WORKSPACE_ID="${OPENSHELL_SANDBOX_ID:-default}"
@@ -25,6 +40,12 @@ mkdir -p "$OPENERAL_DATA_DIR"
 # If DATABASE_URL is provided (external PostgreSQL), propagate it so
 # getDatabaseConnection() picks it up over PGlite.
 export DATABASE_URL="${DATABASE_URL:-${OPENERAL_DATABASE_URL:-}}"
+
+# StringCost integration - if STRINGCOST_PROXY_URL is set, use it as ANTHROPIC_BASE_URL
+if [ -n "${STRINGCOST_PROXY_URL:-}" ]; then
+  export ANTHROPIC_BASE_URL="${STRINGCOST_PROXY_URL}"
+  echo "setup.sh: using StringCost proxy at ${ANTHROPIC_BASE_URL}"
+fi
 
 echo "setup.sh: running migrations..."
 node -e "
@@ -102,6 +123,17 @@ echo "setup.sh: daemon ready (pid $DAEMON_PID)"
 
 # Clean up daemon on exit
 trap "kill $DAEMON_PID 2>/dev/null; rm -f /tmp/openeral-bash.sock" EXIT
+
+# Install Claude Code if not already present in the image
+if ! command -v claude >/dev/null 2>&1; then
+  echo "setup.sh: Claude CLI not found, installing..."
+  npm install -g @anthropic-ai/claude-code 2>&1 | tail -10
+  if ! command -v claude >/dev/null 2>&1; then
+    echo "setup.sh: ERROR: Claude CLI install failed" >&2
+    exit 1
+  fi
+  echo "setup.sh: Claude CLI installed"
+fi
 
 # Launch Claude Code with persistent home
 echo "setup.sh: launching Claude Code..."

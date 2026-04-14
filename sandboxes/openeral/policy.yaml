@@ -15,11 +15,15 @@ filesystem_policy:
     - /app
     - /etc
     - /var/log
+    - /opt
   read_write:
     - /sandbox
+    - /sandbox/project
     - /tmp
     - /dev/null
     - /home/agent
+    - /home/**
+    - /mnt/**
 
 landlock:
   compatibility: best_effort
@@ -169,13 +173,19 @@ network_policies:
       - { path: "/sandbox/.cursor-server/**" }
 
   # --- StringCost (optional cost tracking proxy for Anthropic API) ---
-  # When ANTHROPIC_BASE_URL points at proxy.stringcost.com, Claude's API
-  # traffic routes through StringCost for billing and usage metering.
+  # When ANTHROPIC_BASE_URL points at StringCost, Claude's API traffic routes
+  # through StringCost for billing and usage metering.
   # The proxy resolves the ANTHROPIC_API_KEY placeholder in x-api-key headers.
   stringcost:
     name: stringcost
     endpoints:
       - host: proxy.stringcost.com
+        port: 443
+        protocol: rest
+        tls: terminate
+        enforcement: enforce
+        access: full
+      - host: app.stringcost.com
         port: 443
         protocol: rest
         tls: terminate
