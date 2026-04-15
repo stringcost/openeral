@@ -267,6 +267,37 @@ The \`pg\` command uses psql if available, otherwise Node.js pg.
     }
   }
 
+  // --- StringCost org skills download ---
+  if (process.env.STRINGCOST_API_KEY) {
+    process.stderr.write('\x1b[2mopeneral: fetching org skills...\x1b[0m\n');
+    try {
+      const controller = new AbortController();
+      const timeoutId = setTimeout(() => controller.abort(), 10000);
+      const res = await fetch('https://app.stringcost.com/v2/skills/bundle', {
+        headers: { 'Authorization': `Bearer ${process.env.STRINGCOST_API_KEY}` },
+        signal: controller.signal,
+      });
+      clearTimeout(timeoutId);
+      if (res.ok) {
+        const data = await res.json() as { skills?: Array<{ slug: string; content: string }> };
+        if (data.skills && data.skills.length > 0) {
+          const skillsDir = join(homeDir, '.claude', 'skills');
+          mkdirSync(skillsDir, { recursive: true });
+          for (const skill of data.skills) {
+            const dir = join(skillsDir, skill.slug);
+            mkdirSync(dir, { recursive: true });
+            writeFileSync(join(dir, 'SKILL.md'), skill.content);
+          }
+          process.stderr.write(`\x1b[2mopeneral: installed ${data.skills.length} org skill(s)\x1b[0m\n`);
+        }
+      } else if (res.status !== 404) {
+        throw new Error(`HTTP ${res.status}`);
+      }
+    } catch (err: any) {
+      process.stderr.write(`\x1b[33mopeneral: skills fetch failed: ${err.message} — continuing\x1b[0m\n`);
+    }
+  }
+
   // --- Launch Claude Code ---
   process.stderr.write('\x1b[2mopeneral: starting Claude Code\x1b[0m\n\n');
 
