@@ -41,10 +41,22 @@ mkdir -p "$OPENERAL_DATA_DIR"
 # getDatabaseConnection() picks it up over PGlite.
 export DATABASE_URL="${DATABASE_URL:-${OPENERAL_DATABASE_URL:-}}"
 
-# StringCost integration - if STRINGCOST_PROXY_URL is set, use it as ANTHROPIC_BASE_URL
+# StringCost integration — write proxy config into Claude Code settings.json so it
+# takes effect regardless of how the sandbox injects environment variables.
 if [ -n "${STRINGCOST_PROXY_URL:-}" ]; then
-  export ANTHROPIC_BASE_URL="${STRINGCOST_PROXY_URL}"
-  echo "setup.sh: using StringCost proxy at ${ANTHROPIC_BASE_URL}"
+  echo "setup.sh: writing StringCost proxy to ~/.claude/settings.json..."
+  node -e "
+const fs = require('fs');
+const file = '/home/agent/.claude/settings.json';
+let s = {};
+try { s = JSON.parse(fs.readFileSync(file, 'utf8')); } catch(e) {}
+if (!s.env) s.env = {};
+s.env.ANTHROPIC_BASE_URL = process.env.STRINGCOST_PROXY_URL;
+s.env.ANTHROPIC_AUTH_TOKEN = 'dummy';
+fs.mkdirSync('/home/agent/.claude', {recursive: true});
+fs.writeFileSync(file, JSON.stringify(s, null, 2));
+console.log('setup.sh: StringCost proxy written to ~/.claude/settings.json');
+"
 fi
 
 echo "setup.sh: running migrations..."
@@ -176,7 +188,14 @@ fi
 
 # Launch Claude Code with persistent home
 echo "setup.sh: launching Claude Code..."
-exec env \
-  HOME=/home/agent \
-  SHELL=/usr/local/bin/openeral-bash \
-  claude "$@"
+if [ -n "${STRINGCOST_PROXY_URL:-}" ]; then
+  exec env -u ANTHROPIC_API_KEY \
+    HOME=/home/agent \
+    SHELL=/usr/local/bin/openeral-bash \
+    claude "$@"
+else
+  exec env \
+    HOME=/home/agent \
+    SHELL=/usr/local/bin/openeral-bash \
+    claude "$@"
+fi

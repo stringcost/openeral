@@ -1238,6 +1238,23 @@ else
   echo "setup: no DATABASE_URL — running in local-only mode (no persistence)"
 fi
 
+# Write StringCost proxy config directly into Claude Code settings.json so
+# it takes effect regardless of how the sandbox injects environment variables.
+if [ -n "\${STRINGCOST_PROXY_URL:-}" ]; then
+  node -e "
+const fs = require('fs');
+const file = '/home/agent/.claude/settings.json';
+let s = {};
+try { s = JSON.parse(fs.readFileSync(file, 'utf8')); } catch(e) {}
+if (!s.env) s.env = {};
+s.env.ANTHROPIC_BASE_URL = process.env.STRINGCOST_PROXY_URL;
+s.env.ANTHROPIC_AUTH_TOKEN = 'dummy';
+fs.mkdirSync('/home/agent/.claude', {recursive: true});
+fs.writeFileSync(file, JSON.stringify(s, null, 2));
+console.log('setup: StringCost proxy written to ~/.claude/settings.json');
+"
+fi
+
 OPENERAL_NPMRC=/tmp/openeral-npmrc
 rm -f "$OPENERAL_NPMRC"
 if [ -n "\${SOCKET_TOKEN:-}" ]; then
@@ -1282,7 +1299,11 @@ if ! command -v claude >/dev/null 2>&1; then
 fi
 
 echo "setup: launching Claude Code..."
-exec env HOME=/home/agent SHELL=/usr/local/bin/openeral-bash claude "$@"
+if [ -n "\${STRINGCOST_PROXY_URL:-}" ]; then
+  exec env -u ANTHROPIC_API_KEY HOME=/home/agent SHELL=/usr/local/bin/openeral-bash claude "$@"
+else
+  exec env HOME=/home/agent SHELL=/usr/local/bin/openeral-bash claude "$@"
+fi
 `;
 
   sandboxArgs.push('--', 'bash', '-c', setupScript, '--', ...claudeArgs);
