@@ -20,6 +20,44 @@
 import { spawn } from 'node:child_process';
 import { mkdirSync, writeFileSync, existsSync, chmodSync } from 'node:fs';
 
+function writeClaudeSettings(path: string): void {
+  // Default security settings for Claude Code (Level 1 sandbox)
+  // Protects SSH keys, AWS credentials, .env files, and prevents unauthorized network/code actions
+  const settings = {
+    permissions: {
+      allow: [
+        "Bash(npm run *)",
+        "Bash(npm test *)",
+        "Bash(git status)",
+        "Bash(git diff *)",
+        "Bash(git log *)",
+        "Bash(git commit *)",
+        "Bash(ls *)",
+        "Bash(cat *)",
+        "Bash(grep *)"
+      ],
+      deny: [
+        "Read(~/.ssh/**)",
+        "Read(~/.aws/**)",
+        "Read(~/.azure/**)",
+        "Read(~/.npmrc)",
+        "Read(~/.git-credentials)",
+        "Edit(~/.bashrc)",
+        "Edit(~/.zshrc)",
+        "Bash(curl *)",
+        "Bash(wget *)",
+        "Bash(nc *)",
+        "Bash(ssh *)",
+        "Bash(git push *)",
+        "Read(*.env)",
+        "Read(.env.*)"
+      ]
+    },
+    enableAllProjectMcpServers: false
+  };
+  writeFileSync(path, JSON.stringify(settings, null, 2));
+}
+
 function writePgHelper(path: string): void {
   // pg helper reads DATABASE_URL from the environment at runtime.
   // Never hardcode credentials — rely on env propagation from OpenShell providers.
@@ -38,7 +76,7 @@ fi
   writeFileSync(path, script);
   chmodSync(path, 0o755);
 }
-import { hostname } from 'node:os';
+import { hostname, homedir } from 'node:os';
 import { join } from 'node:path';
 import { createPool } from './db/pool.js';
 import { runMigrations } from './db/migrations.js';
@@ -196,6 +234,15 @@ export async function main() {
     mkdirSync(join(homeDir, '.local', 'bin'), { recursive: true });
     writePgHelper(pgHelper);
 
+    // Write default Claude security settings (if not exists)
+    const claudeSettingsDir = join(homeDir, '.claude');
+    const claudeSettingsPath = join(claudeSettingsDir, 'settings.json');
+    if (!existsSync(claudeSettingsPath)) {
+      mkdirSync(claudeSettingsDir, { recursive: true });
+      writeClaudeSettings(claudeSettingsPath);
+      process.stderr.write('\x1b[2mopeneral: wrote default ~/.claude/settings.json (security sandbox)\x1b[0m\n');
+    }
+
     // Write CLAUDE.md
     const claudeMdPath = join(homeDir, 'CLAUDE.md');
     if (!existsSync(claudeMdPath)) {
@@ -212,6 +259,29 @@ Query the connected database:
     pg "\\d public.users"
 
 The \`pg\` command uses psql if available, otherwise Node.js pg.
+
+## Security Settings
+
+OpenEral configures Claude Code with default security sandboxing via \`~/.claude/settings.json\`:
+
+**Protected credentials:**
+- SSH keys (\`~/.ssh/**\`)
+- AWS credentials (\`~/.aws/**\`)
+- Azure credentials (\`~/.azure/**\`)
+- npm auth (\`~/.npmrc\`, \`~/.git-credentials\`)
+- Shell configs (\`~/.bashrc\`, \`~/.zshrc\`)
+- Environment files (\`*.env\`, \`.env.*\`)
+
+**Restricted network commands:**
+- \`curl\`, \`wget\`, \`nc\`, \`ssh\` blocked
+- \`git push\` requires manual approval
+
+**Auto-approved safe commands:**
+- \`npm run *\`, \`npm test *\`
+- \`git status\`, \`git diff *\`, \`git log *\`, \`git commit *\`
+- \`ls *\`, \`cat *\`, \`grep *\`
+
+Edit \`~/.claude/settings.json\` to customize permissions.
 `);
     }
 
@@ -296,6 +366,18 @@ The \`pg\` command uses psql if available, otherwise Node.js pg.
     } catch (err: any) {
       process.stderr.write(`\x1b[33mopeneral: skills fetch failed: ${err.message} — continuing\x1b[0m\n`);
     }
+  }
+
+  // --- Ensure Claude security settings exist in OS home ---
+  // Claude Code reads ~/.claude/settings.json from OS home (not env HOME).
+  // Create default security settings once if they don't exist.
+  const osHomeDir = homedir();
+  const osClaudeDir = join(osHomeDir, '.claude');
+  const osSettingsPath = join(osClaudeDir, 'settings.json');
+  if (!existsSync(osSettingsPath)) {
+    mkdirSync(osClaudeDir, { recursive: true });
+    writeClaudeSettings(osSettingsPath);
+    process.stderr.write('\x1b[2mopeneral: created default ~/.claude/settings.json (security sandbox)\x1b[0m\n');
   }
 
   // --- Launch Claude Code ---
