@@ -677,9 +677,9 @@ async function cleanupExistingSandbox(workspaceId: string): Promise<void> {
  *   - /mnt accessible (ensured by ensureGatewayHasMntMount which runs first)
  */
 async function injectMntIntoSandbox(workspaceId: string): Promise<void> {
-  // Poll until the sandbox pod is Running (up to 60 s at 500 ms intervals)
+  // Poll until the sandbox pod is Running (up to 300 s at 500 ms intervals)
   let podName = '';
-  for (let i = 0; i < 120; i++) {
+  for (let i = 0; i < 600; i++) {
     await new Promise(resolve => setTimeout(resolve, 500));
     const r = spawnSync('docker', [
       'exec', 'openshell-cluster-openshell',
@@ -699,7 +699,28 @@ async function injectMntIntoSandbox(workspaceId: string): Promise<void> {
   }
 
   if (!podName) {
-    process.stderr.write('\x1b[33mwarning: sandbox pod not ready after 60s — /mnt injection skipped\x1b[0m\n');
+    process.stderr.write('\x1b[33mwarning: sandbox pod not ready after 300s — /mnt injection skipped\x1b[0m\n');
+
+    // Emit k8s events so the user can see exactly why the pod is Pending.
+    // Common causes: missing provider secret, image pull failure, resource limits.
+    const eventsResult = spawnSync('docker', [
+      'exec', 'openshell-cluster-openshell',
+      'kubectl', '--insecure-skip-tls-verify',
+      'get', 'events', '-n', 'openshell',
+      '--sort-by=.lastTimestamp',
+      '-o', 'wide',
+    ], { stdio: 'pipe', timeout: 10000 });
+
+    if (eventsResult.status === 0) {
+      const allEvents = eventsResult.stdout.toString();
+      const relevant = allEvents.split('\n')
+        .filter(line => !line.startsWith('LAST SEEN') && line.trim() !== '')
+        .join('\n');
+      if (relevant) {
+        process.stderr.write(`\x1b[2m  sandbox pod events (for diagnosis):\n${relevant}\x1b[0m\n`);
+      }
+    }
+
     return;
   }
 
@@ -1112,7 +1133,12 @@ if [ -n "\${STRINGCOST_PROXY_URL:-}" ]; then
   echo "setup: using StringCost proxy at \${ANTHROPIC_BASE_URL}"
 fi
 
-mkdir -p /home/agent/.claude /home/agent/.claude/projects
+mkdir -p /home/agent/.claude /home/agent/.claude/projects /home/agent/.openeral/data
+
+# Stable PGlite data directory — must be set before starting the daemon so that
+# getDatabaseConnection() in embedded.js uses /home/agent regardless of what HOME
+# is set to in the sandbox process at daemon startup time.
+export OPENERAL_DATA_DIR="/home/agent/.openeral/data"
 
 if [ -n "\${DATABASE_URL:-}" ]; then
   echo "setup: running migrations..."
@@ -1170,18 +1196,22 @@ echo "setup: starting openeral-bash daemon..."
 node "$OPENERAL_DIR/openeral-bash.mjs" --daemon &
 DAEMON_PID=$!
 
-for i in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20 21 22 23 24 25 26 27 28 29 30; do
+_d=0
+while [ $_d -lt 300 ]; do
   [ -S /tmp/openeral-bash.sock ] && break
+  [ $_d -eq 50 ] && echo "setup: waiting for daemon to initialize (PGlite WASM)..." >&2
   sleep 0.1
+  _d=$((_d+1))
 done
 
-if [ ! -S /tmp/openeral-bash.sock ]; then
-  echo "setup: daemon failed to start" >&2
-  exit 1
+if [ -S /tmp/openeral-bash.sock ]; then
+  echo "setup: daemon ready (pid $DAEMON_PID)"
+  trap "kill $DAEMON_PID 2>/dev/null; rm -f /tmp/openeral-bash.sock" EXIT
+else
+  echo "setup: warning: daemon not ready after 30s — using standalone mode" >&2
+  unset DAEMON_PID
+  trap "rm -f /tmp/openeral-bash.sock" EXIT
 fi
-
-echo "setup: daemon ready (pid $DAEMON_PID)"
-trap "kill $DAEMON_PID 2>/dev/null; rm -f /tmp/openeral-bash.sock" EXIT
 
 # Install Claude Code if not already present in the image
 if ! command -v claude >/dev/null 2>&1; then
@@ -1200,14 +1230,33 @@ exec env HOME=/home/agent SHELL=/usr/local/bin/openeral-bash claude "$@"
 
   sandboxArgs.push('--', 'bash', '-c', setupScript, '--', ...claudeArgs);
 
-  // Pre-create the db provider so its secret exists in k3s before the sandbox pod
-  // is scheduled.  Matching the pattern from the openeral-shell skill (SKILL.md).
-  // The claude provider is handled by --auto-providers; the db provider needs an
-  // explicit --type generic registration.
-  // Errors are silently ignored (provider may already exist or DATABASE_URL may be absent).
+  // Pre-create providers so their k8s Secrets exist BEFORE the sandbox pod is scheduled.
+  //
+  // When `openshell sandbox create --auto-providers` is used, the operator creates
+  // provider secrets asynchronously — the pod template references secrets that may
+  // not exist yet when Kubernetes schedules the pod, causing it to stay in Pending
+  // until those secrets appear (which can take 60-300+ seconds or never complete).
+  //
+  // By creating providers HERE (synchronously, before sandbox create), we guarantee
+  // the secrets exist when the pod is scheduled.  Errors are silently ignored because
+  // the provider may already exist from a previous run — the existing secret is reused.
+  process.stderr.write('\x1b[2mopeneral: registering providers...\x1b[0m\n');
+
+  // claude provider — injects ANTHROPIC_API_KEY into the sandbox
+  if (process.env.ANTHROPIC_API_KEY) {
+    const claudeProvider = spawnSync('openshell', [
+      'provider', 'create', '--name', 'claude', '--type', 'generic', '--credential', 'ANTHROPIC_API_KEY',
+    ], { stdio: 'pipe', timeout: 30000 });
+    if (claudeProvider.status === 0) {
+      process.stderr.write('\x1b[32m✓ Claude provider registered\x1b[0m\n');
+    }
+    // Non-zero exit is expected when the provider already exists — that's fine.
+  }
+
+  // db provider — injects DATABASE_URL into the sandbox (optional)
   if (process.env.DATABASE_URL) {
     spawnSync('openshell', [
-      'provider', 'create', '--name', 'db', '--type', 'generic', '--credential', 'DATABASE_URL'
+      'provider', 'create', '--name', 'db', '--type', 'generic', '--credential', 'DATABASE_URL',
     ], { stdio: 'pipe', timeout: 30000 });
   }
 

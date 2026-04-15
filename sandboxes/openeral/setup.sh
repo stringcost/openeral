@@ -108,21 +108,24 @@ echo "setup.sh: starting openeral-bash daemon..."
 node "$OPENERAL_DIR/openeral-bash.mjs" --daemon &
 DAEMON_PID=$!
 
-# Wait for socket to appear
-for i in $(seq 1 30); do
+# Wait for socket to appear — PGlite WASM can take 5-15s to initialize
+_d=0
+while [ $_d -lt 300 ]; do
   [ -S /tmp/openeral-bash.sock ] && break
+  [ $_d -eq 50 ] && echo "setup.sh: waiting for daemon to initialize (PGlite WASM)..." >&2
   sleep 0.1
+  _d=$((_d+1))
 done
 
-if [ ! -S /tmp/openeral-bash.sock ]; then
-  echo "setup.sh: daemon failed to start" >&2
-  exit 1
+if [ -S /tmp/openeral-bash.sock ]; then
+  echo "setup.sh: daemon ready (pid $DAEMON_PID)"
+  # Clean up daemon on exit
+  trap "kill $DAEMON_PID 2>/dev/null; rm -f /tmp/openeral-bash.sock" EXIT
+else
+  echo "setup.sh: warning: daemon not ready after 30s — using standalone mode" >&2
+  unset DAEMON_PID
+  trap "rm -f /tmp/openeral-bash.sock" EXIT
 fi
-
-echo "setup.sh: daemon ready (pid $DAEMON_PID)"
-
-# Clean up daemon on exit
-trap "kill $DAEMON_PID 2>/dev/null; rm -f /tmp/openeral-bash.sock" EXIT
 
 # Install Claude Code if not already present in the image
 if ! command -v claude >/dev/null 2>&1; then
