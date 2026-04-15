@@ -72,6 +72,44 @@ function writeClaudeSettings(path: string): void {
   writeFileSync(path, JSON.stringify(settings, null, 2));
 }
 
+function writeClaudeSettings(path: string): void {
+  // Default security settings for Claude Code (Level 1 sandbox)
+  // Protects SSH keys, AWS credentials, .env files, and prevents unauthorized network/code actions
+  const settings = {
+    permissions: {
+      allow: [
+        "Bash(npm run *)",
+        "Bash(npm test *)",
+        "Bash(git status)",
+        "Bash(git diff *)",
+        "Bash(git log *)",
+        "Bash(git commit *)",
+        "Bash(ls *)",
+        "Bash(cat *)",
+        "Bash(grep *)"
+      ],
+      deny: [
+        "Read(~/.ssh/**)",
+        "Read(~/.aws/**)",
+        "Read(~/.azure/**)",
+        "Read(~/.npmrc)",
+        "Read(~/.git-credentials)",
+        "Edit(~/.bashrc)",
+        "Edit(~/.zshrc)",
+        "Bash(curl *)",
+        "Bash(wget *)",
+        "Bash(nc *)",
+        "Bash(ssh *)",
+        "Bash(git push *)",
+        "Read(*.env)",
+        "Read(.env.*)"
+      ]
+    },
+    enableAllProjectMcpServers: false
+  };
+  writeFileSync(path, JSON.stringify(settings, null, 2));
+}
+
 function writePgHelper(path: string): void {
   // pg helper reads DATABASE_URL from the environment at runtime.
   // Never hardcode credentials — rely on env propagation from OpenShell providers.
