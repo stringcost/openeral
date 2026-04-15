@@ -56,7 +56,13 @@
       "Bash(pkill -f \"openshell sandbox\")",
       "Bash(pkill -f \"dist/bin/openeral.js\")",
       "Bash(openssl ecparam:*)",
-      "Bash(openssl req:*)"
+      "Bash(openssl req:*)",
+      "Bash(bash build-image.sh)",
+      "Bash(docker run:*)",
+      "Bash(timeout 120 npx openeral --print \"say hello world\")",
+      "Bash(docker info:*)",
+      "Bash(npx openeral:*)",
+      "Bash(npm run *)"
     ]
   }
 }

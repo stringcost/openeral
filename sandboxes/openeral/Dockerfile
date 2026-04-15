@@ -21,8 +21,8 @@ RUN cd /opt/openeral && npm install && npm run build && npm prune --omit=dev \
     && chown -R sandbox:sandbox /opt/openeral
 
 # openeral-bash: drop-in bash replacement routed through just-bash
-COPY sandboxes/openeral/openeral-bash.mjs /opt/openeral/openeral-bash.mjs
-RUN chmod +x /opt/openeral/openeral-bash.mjs \
+COPY --chown=sandbox:sandbox sandboxes/openeral/openeral-bash.mjs /opt/openeral/openeral-bash.mjs
+RUN chmod a+rx /opt/openeral/openeral-bash.mjs \
     && ln -sf /opt/openeral/openeral-bash.mjs /usr/local/bin/openeral-bash
 
 # Rename real bash so openeral-bash can fall back to it for interactive use

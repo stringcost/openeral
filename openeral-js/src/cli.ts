@@ -409,8 +409,61 @@ async function fixBrokenTls(): Promise<boolean> {
   process.stderr.write('\x1b[2mopeneral: waiting for pod to restart with new certs...\x1b[0m\n');
   await waitForOpenshellPod();
 
+  // Verify the openshell API is truly accepting connections — pod Ready ≠ operator ready.
+  // Without this, sandbox create races against operator initialisation and fails with
+  // DependenciesNotReady because the provider secret isn't created in time.
+  process.stderr.write('\x1b[2mopeneral: verifying TLS connection...\x1b[0m\n');
+  const apiReady = await waitForOpenshellApiReady(120);
+  if (!apiReady) {
+    process.stderr.write('\x1b[33mwarning: openshell API not reachable after TLS fix — proceeding anyway\x1b[0m\n');
+  }
+
   process.stderr.write('\x1b[32m✓ TLS certs regenerated and applied\x1b[0m\n');
   return true;
+}
+
+/**
+ * Wait until the openshell CLI can successfully talk to the gateway API.
+ *
+ * "Pod ready" (Kubernetes condition) only means containers are running — it does NOT
+ * mean the openshell operator inside the pod has finished initialising, loaded its
+ * CRD state, or is accepting requests.  Trying to create a sandbox while the operator
+ * is still warming up causes DependenciesNotReady because the operator races with pod
+ * scheduling when trying to create provider secrets via --auto-providers.
+ *
+ * This function polls `openshell sandbox list` until it exits 0 (operator ready) or
+ * returns a non-connection error (operator up, different problem — still usable).
+ */
+async function waitForOpenshellApiReady(maxSeconds = 120): Promise<boolean> {
+  const deadline = Date.now() + maxSeconds * 1000;
+  const startMs = Date.now();
+  let lastProgressS = -1;
+
+  while (Date.now() < deadline) {
+    const r = spawnSync('openshell', ['sandbox', 'list'], { stdio: 'pipe', timeout: 10000 });
+    if (r.status === 0) return true;
+
+    const stderr = (r.stderr ?? Buffer.from('')).toString();
+    // Only keep retrying for transient connection/TLS errors.
+    // Any other non-zero exit (e.g., empty list, unknown flag) means the API is up.
+    const isConnectionError =
+      stderr.includes('transport error') ||
+      stderr.includes('tls handshake') ||
+      stderr.includes('connection refused') ||
+      stderr.includes('connection reset') ||
+      stderr.includes('broken pipe');
+
+    if (!isConnectionError) return true;
+
+    const elapsedS = Math.floor((Date.now() - startMs) / 1000);
+    if (elapsedS >= lastProgressS + 30) {
+      process.stderr.write(`\x1b[2m  waiting for openshell API to be ready... (${elapsedS}s)\x1b[0m\n`);
+      lastProgressS = elapsedS;
+    }
+
+    await new Promise(resolve => setTimeout(resolve, 3000));
+  }
+  return false;
 }
 
 /**
@@ -462,9 +515,7 @@ async function ensureSandboxImage(sandboxImage: string): Promise<void> {
     'exec', 'openshell-cluster-openshell',
     'ctr', '--address', '/run/k3s/containerd/containerd.sock', '-n', 'k8s.io',
   ];
-  // --no-unpack: skip layer extraction during import; containerd unpacks on first container
-  // start using the configured native snapshotter (overlayfs fails in WSL2).
-  const K3S_CTR_IMPORT = [...K3S_CTR, 'images', 'import', '--no-unpack'];
+  const K3S_CTR_IMPORT = [...K3S_CTR, 'images', 'import'];
 
   function imageExistsInCluster(): boolean {
     // Use ctr with the correct k3s socket — more reliable than crictl for checking refs
@@ -502,15 +553,39 @@ async function ensureSandboxImage(sandboxImage: string): Promise<void> {
     return;
   }
 
-  // Import into k3s via ctr — use file-based approach to avoid pipe corruption
-  // Pipe through `docker exec -i` corrupts the tar stream → "unrecognized image format"
-  const tmpTar = '/tmp/openeral-sandbox-image.tar';
+  // Flatten the image to a single layer before importing into k3s.
+  //
+  // Docker images built on top of a base that replaces system packages (e.g. apt
+  // installing nodejs over an existing npm) contain opaque whiteout files
+  // (.wh..wh..opq).  k3s's containerd extracts these by calling mknod to create
+  // whiteout char devices in the overlayfs upper dir — but mknod is restricted
+  // inside a Docker container (seccomp/AppArmor).  The result: the pod is stuck
+  // in Pending forever.
+  //
+  // Fix: docker export produces a flat filesystem tarball with no whiteouts
+  // (just the final merged file tree).  docker import turns that into a
+  // single-layer Docker image.  A single-layer image with no whiteout entries
+  // extracts cleanly on any Linux system regardless of mknod restrictions.
+  const fsTar    = '/tmp/openeral-sandbox-fs.tar';
+  const tmpTar   = '/tmp/openeral-sandbox-image.tar';
   const containerTar = '/tmp/openeral-sandbox-image.tar';
+  const flatTag  = `${sandboxImage}-openeral-flat`;
+  const flatContainer = `openeral-flatten-${Date.now()}`;
 
-  process.stderr.write('\x1b[2m  saving image to temp file...\x1b[0m\n');
-  const saveResult = spawnSync('docker', ['save', sandboxImage, '-o', tmpTar], { stdio: 'pipe', timeout: 300000 });
+  process.stderr.write('\x1b[2m  flattening image (squashing layers to remove whiteouts)...\x1b[0m\n');
+  spawnSync('docker', ['rm', '-f', flatContainer], { stdio: 'pipe' });
+  spawnSync('docker', ['create', '--name', flatContainer, sandboxImage], { stdio: 'pipe', timeout: 30000 });
+  spawnSync('docker', ['export', flatContainer, '-o', fsTar], { stdio: 'pipe', timeout: 300000 });
+  spawnSync('docker', ['rm', flatContainer], { stdio: 'pipe' });
+  spawnSync('docker', ['rmi', '-f', flatTag], { stdio: 'pipe' });
+  spawnSync('docker', ['import', fsTar, flatTag], { stdio: 'pipe', timeout: 120000 });
+  spawnSync('rm', ['-f', fsTar], { stdio: 'pipe' });
+
+  process.stderr.write('\x1b[2m  saving flattened image...\x1b[0m\n');
+  const saveResult = spawnSync('docker', ['save', flatTag, '-o', tmpTar], { stdio: 'pipe', timeout: 300000 });
+  spawnSync('docker', ['rmi', '-f', flatTag], { stdio: 'pipe' });
   if (saveResult.status !== 0) {
-    process.stderr.write(`\x1b[33mwarning: failed to save image to temp file: ${(saveResult.stderr ?? '').toString().trim()}\x1b[0m\n`);
+    process.stderr.write(`\x1b[33mwarning: failed to save flattened image: ${(saveResult.stderr ?? '').toString().trim()}\x1b[0m\n`);
     return;
   }
 
@@ -532,11 +607,14 @@ async function ensureSandboxImage(sandboxImage: string): Promise<void> {
       `\x1b[33mwarning: image import failed (exit ${importResult.status})\x1b[0m\n` +
       (errMsg ? `  ${errMsg}\n` : '')
     );
-  } else {
-    process.stderr.write('\x1b[32m✓ Sandbox image imported to cluster\x1b[0m\n');
+    return;
   }
 
-  // Final check
+  // The flat image was imported under flatTag — retag it as the original image
+  // name so the OpenShell operator can find it when creating the sandbox pod.
+  spawnSync('docker', [...K3S_CTR, 'images', 'tag', flatTag, sandboxImage], { stdio: 'pipe', timeout: 10000 });
+  process.stderr.write('\x1b[32m✓ Sandbox image imported to cluster\x1b[0m\n');
+
   if (imageExistsInCluster()) {
     process.stderr.write('\x1b[32m✓ Image verified in cluster\x1b[0m\n');
   } else {
@@ -586,81 +664,82 @@ async function cleanupExistingSandbox(workspaceId: string): Promise<void> {
 }
 
 /**
- * Background task: patch the Sandbox CRD to inject /mnt as a hostPath volume,
- * then delete the pod if it already exists so it restarts with the volume.
+ * Background task: inject /mnt into the running sandbox container via nsenter.
+ *
+ * Strategy: wait for the pod to reach Running state, then use `crictl` inside
+ * the k3s node container to find the container PID and `nsenter` into its mount
+ * namespace to bind-mount /mnt.  No pod restart is performed, so the setup
+ * script continues uninterrupted and Claude Code launches normally.
+ *
+ * Works on any Linux-based system where the k3s node container has:
+ *   - crictl (standard in k3s distributions)
+ *   - nsenter (part of util-linux, available on all modern Linux distros)
+ *   - /mnt accessible (ensured by ensureGatewayHasMntMount which runs first)
  */
-async function injectHostPathIntoSandbox(workspaceId: string): Promise<void> {
-  // Poll for the Sandbox CRD to appear (up to 20 seconds)
-  let sandboxFound = false;
-  for (let i = 0; i < 67; i++) { // ~20 seconds at 300 ms intervals
-    const getResult = spawnSync('docker', [
+async function injectMntIntoSandbox(workspaceId: string): Promise<void> {
+  // Poll until the sandbox pod is Running (up to 60 s at 500 ms intervals)
+  let podName = '';
+  for (let i = 0; i < 120; i++) {
+    await new Promise(resolve => setTimeout(resolve, 500));
+    const r = spawnSync('docker', [
       'exec', 'openshell-cluster-openshell',
       'kubectl', '--insecure-skip-tls-verify',
-      'get', 'sandbox', workspaceId,
-      '-n', 'openshell', '--ignore-not-found'
-    ], { stdio: 'pipe', timeout: 10000 });
-
-    if (getResult.status === 0 && getResult.stdout.toString().trim() !== '') {
-      sandboxFound = true;
-      break;
-    }
-    await new Promise(resolve => setTimeout(resolve, 300));
-  }
-
-  if (!sandboxFound) {
-    process.stderr.write(`\x1b[33mwarning: sandbox CRD '${workspaceId}' not found after 20s — skipping hostPath injection\x1b[0m\n`);
-    return;
-  }
-
-  // Patch the Sandbox CRD with hostPath volume
-  const patch = JSON.stringify({
-    spec: {
-      podTemplate: {
-        spec: {
-          volumes: [
-            { name: 'host-mnt', hostPath: { path: '/mnt', type: '' } }
-          ],
-          containers: [
-            { name: 'sandbox', volumeMounts: [{ name: 'host-mnt', mountPath: '/mnt' }] }
-          ],
-        },
-      },
-    },
-  });
-
-  const patchResult = spawnSync('docker', [
-    'exec', 'openshell-cluster-openshell',
-    'kubectl', '--insecure-skip-tls-verify',
-    'patch', 'sandbox', workspaceId,
-    '-n', 'openshell',
-    '--type=merge', '-p', patch
-  ], { stdio: 'pipe', timeout: 15000 });
-
-  if (patchResult.status !== 0) {
-    process.stderr.write(`\x1b[33mwarning: failed to patch sandbox with hostPath: ${(patchResult.stderr ?? '').toString().trim()}\x1b[0m\n`);
-    return;
-  }
-
-  // Check if a pod already exists for this sandbox and delete it so it restarts with volumes
-  const podListResult = spawnSync('docker', [
-    'exec', 'openshell-cluster-openshell',
-    'kubectl', '--insecure-skip-tls-verify',
-    'get', 'pods', '-n', 'openshell',
-    '-l', `agents.x-k8s.io/sandbox-name=${workspaceId}`,
-    '--no-headers'
-  ], { stdio: 'pipe', timeout: 10000 });
-
-  if (podListResult.status === 0 && podListResult.stdout.toString().trim() !== '') {
-    spawnSync('docker', [
-      'exec', 'openshell-cluster-openshell',
-      'kubectl', '--insecure-skip-tls-verify',
-      'delete', 'pods', '-n', 'openshell',
+      'get', 'pods', '-n', 'openshell',
       '-l', `agents.x-k8s.io/sandbox-name=${workspaceId}`,
-      '--ignore-not-found=true'
-    ], { stdio: 'pipe', timeout: 15000 });
+      '-o', 'jsonpath={.items[0].metadata.name}/{.items[0].status.phase}',
+    ], { stdio: 'pipe', timeout: 10000 });
+    if (r.status === 0) {
+      const out = (r.stdout ?? Buffer.from('')).toString().trim();
+      const slash = out.indexOf('/');
+      if (slash > 0 && out.slice(slash + 1) === 'Running') {
+        podName = out.slice(0, slash);
+        break;
+      }
+    }
   }
 
-  process.stderr.write('\x1b[32m✓ Host filesystem injected into sandbox\x1b[0m\n');
+  if (!podName) {
+    process.stderr.write('\x1b[33mwarning: sandbox pod not ready after 60s — /mnt injection skipped\x1b[0m\n');
+    return;
+  }
+
+  // Use crictl inside the k3s node to find the container PID, then nsenter
+  // into its mount namespace and bind-mount /mnt (no-op if already mounted).
+  //
+  // grep -Eo '"pid": *[1-9][0-9]*' matches the first non-zero pid field in the
+  // crictl inspect JSON output, working across both compact and pretty-printed
+  // JSON and across all Linux grep variants (GNU and BSD).
+  const injectScript =
+    `CONTAINER_ID=$(crictl ps ` +
+      `--label 'io.kubernetes.pod.name=${podName}' ` +
+      `--label 'io.kubernetes.pod.namespace=openshell' ` +
+      `-q 2>/dev/null | head -1); ` +
+    `if [ -z "$CONTAINER_ID" ]; then ` +
+      `echo "crictl: no container for pod ${podName}" >&2; exit 1; ` +
+    `fi; ` +
+    `PID=$(crictl inspect "$CONTAINER_ID" 2>/dev/null ` +
+      `| grep -Eo '"pid": *[1-9][0-9]*' ` +
+      `| grep -Eo '[1-9][0-9]*' | head -1); ` +
+    `if [ -z "$PID" ]; then ` +
+      `echo "crictl: could not get container PID for $CONTAINER_ID" >&2; exit 1; ` +
+    `fi; ` +
+    `nsenter -t "$PID" --mount -- ` +
+      `sh -c 'mountpoint -q /mnt 2>/dev/null && exit 0; mount --rbind /mnt /mnt'`;
+
+  const injectResult = spawnSync('docker', [
+    'exec', 'openshell-cluster-openshell',
+    'sh', '-c', injectScript,
+  ], { stdio: 'pipe', timeout: 30000 });
+
+  if (injectResult.status === 0) {
+    process.stderr.write('\x1b[32m✓ Host filesystem injected into sandbox\x1b[0m\n');
+  } else {
+    const stderr = (injectResult.stderr ?? Buffer.from('')).toString().trim();
+    process.stderr.write(
+      `\x1b[33mwarning: /mnt injection failed${stderr ? ': ' + stderr : ' (crictl/nsenter unavailable?)'}\x1b[0m\n` +
+      `\x1b[2m  Sandbox will run without host filesystem access\x1b[0m\n`,
+    );
+  }
 }
 
 /**
@@ -862,6 +941,8 @@ async function launchViaSandbox(workspaceId: string, claudeArgs: string[]): Prom
       );
       process.exit(1);
     }
+    // First-run: also wait for the openshell API to be fully ready
+    await waitForOpenshellApiReady(120);
   } else if (!isRunning) {
     // Container exists but is stopped — just start it
     process.stderr.write('\x1b[2mopeneral: gateway container is stopped, starting it...\x1b[0m\n');
@@ -877,7 +958,25 @@ async function launchViaSandbox(workspaceId: string, claudeArgs: string[]): Prom
       );
       process.exit(1);
     }
-    await new Promise(resolve => setTimeout(resolve, 5000));
+    // After docker start, k3s needs time to restart its API server and resume pods.
+    // A bare 5-second sleep is far too short — wait for the openshell namespace to
+    // reappear (proves the k3s API is up) before continuing.
+    process.stderr.write('\x1b[2mopeneral: waiting for gateway to resume...\x1b[0m\n');
+    let resumeNsReady = false;
+    for (let i = 0; i < 120; i++) { // up to 4 minutes
+      const checkNs = spawnSync('docker', [
+        'exec', 'openshell-cluster-openshell',
+        'kubectl', '--insecure-skip-tls-verify', 'get', 'namespace', 'openshell',
+      ], { stdio: 'pipe', timeout: 5000 });
+      if (checkNs.status === 0) { resumeNsReady = true; break; }
+      if (i > 0 && i % 15 === 0) {
+        process.stderr.write(`\x1b[2m  still waiting for k3s to resume... (${Math.floor(i * 2 / 60)}m ${(i * 2) % 60}s)\x1b[0m\n`);
+      }
+      await new Promise(resolve => setTimeout(resolve, 2000));
+    }
+    if (!resumeNsReady) {
+      process.stderr.write('\x1b[33mwarning: k3s namespace not ready after restart — continuing anyway\x1b[0m\n');
+    }
   } else {
     process.stderr.write('\x1b[2mopeneral: gateway is already running\x1b[0m\n');
   }
@@ -894,6 +993,22 @@ async function launchViaSandbox(workspaceId: string, claudeArgs: string[]): Prom
     process.stderr.write(
       '\x1b[31merror: gateway pod not ready.\x1b[0m\n' +
       'Check: docker exec openshell-cluster-openshell kubectl get pods -n openshell\n'
+    );
+    process.exit(1);
+  }
+
+  // Verify the openshell API is accepting connections.
+  // "Pod ready" (Kubernetes) ≠ "operator ready" — the openshell operator inside the
+  // pod needs additional time to initialise after container start.  If we create a
+  // sandbox before it's ready, --auto-providers races with pod scheduling and the
+  // sandbox pod gets stuck in DependenciesNotReady because its provider secret doesn't
+  // exist yet when Kubernetes schedules it.
+  const apiReady = await waitForOpenshellApiReady(120);
+  if (!apiReady) {
+    process.stderr.write(
+      '\x1b[31merror: openshell API not available after 2 minutes.\x1b[0m\n' +
+      '  openshell sandbox list\n' +
+      '  docker logs openshell-cluster-openshell\n'
     );
     process.exit(1);
   }
@@ -1068,11 +1183,33 @@ fi
 echo "setup: daemon ready (pid $DAEMON_PID)"
 trap "kill $DAEMON_PID 2>/dev/null; rm -f /tmp/openeral-bash.sock" EXIT
 
+# Install Claude Code if not already present in the image
+if ! command -v claude >/dev/null 2>&1; then
+  echo "setup: Claude CLI not found, installing..."
+  npm install -g @anthropic-ai/claude-code 2>&1 | tail -20
+  if ! command -v claude >/dev/null 2>&1; then
+    echo "setup: ERROR: Claude CLI install failed" >&2
+    exit 1
+  fi
+  echo "setup: Claude CLI installed"
+fi
+
 echo "setup: launching Claude Code..."
 exec env HOME=/home/agent SHELL=/usr/local/bin/openeral-bash claude "$@"
 `;
 
   sandboxArgs.push('--', 'bash', '-c', setupScript, '--', ...claudeArgs);
+
+  // Pre-create the db provider so its secret exists in k3s before the sandbox pod
+  // is scheduled.  Matching the pattern from the openeral-shell skill (SKILL.md).
+  // The claude provider is handled by --auto-providers; the db provider needs an
+  // explicit --type generic registration.
+  // Errors are silently ignored (provider may already exist or DATABASE_URL may be absent).
+  if (process.env.DATABASE_URL) {
+    spawnSync('openshell', [
+      'provider', 'create', '--name', 'db', '--type', 'generic', '--credential', 'DATABASE_URL'
+    ], { stdio: 'pipe', timeout: 30000 });
+  }
 
   process.stderr.write(
     `\x1b[2mopeneral: launching Claude Code in OpenShell sandbox (${workspaceId})...\x1b[0m\n\n`,
@@ -1080,9 +1217,9 @@ exec env HOME=/home/agent SHELL=/usr/local/bin/openeral-bash claude "$@"
 
   const child = spawn('openshell', sandboxArgs, { stdio: 'inherit' });
 
-  // Background: inject /mnt hostPath into the sandbox pod once the CRD appears
-  injectHostPathIntoSandbox(workspaceId).catch((err: unknown) => {
-    process.stderr.write(`\x1b[33mwarning: hostPath injection failed: ${(err instanceof Error ? err.message : String(err))}\x1b[0m\n`);
+  // Background: inject /mnt into the running sandbox container via nsenter
+  injectMntIntoSandbox(workspaceId).catch((err: unknown) => {
+    process.stderr.write(`\x1b[33mwarning: /mnt injection failed: ${(err instanceof Error ? err.message : String(err))}\x1b[0m\n`);
   });
 
   child.on('error', (err: NodeJS.ErrnoException) => {

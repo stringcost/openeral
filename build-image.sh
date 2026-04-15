@@ -62,15 +62,61 @@ fi
 echo "✓ k3s cluster is running"
 echo ""
 
-echo "Step 5: Removing old image from k3s..."
-docker exec openshell-cluster-openshell ctr -n k8s.io images rm ghcr.io/sandys/openeral/sandbox:just-bash 2>/dev/null || true
-echo "✓ Old image removed"
+echo "Step 5: Removing old images from k3s..."
+K3S_CTR="ctr --address /run/k3s/containerd/containerd.sock -n k8s.io"
+docker exec openshell-cluster-openshell sh -c "
+  $K3S_CTR images rm ghcr.io/sandys/openeral/sandbox:just-bash 2>/dev/null || true
+  $K3S_CTR images rm ghcr.io/sandys/openeral/sandbox:just-bash-openeral-flat 2>/dev/null || true
+"
+echo "✓ Old images removed (or were not present)"
 echo ""
 
-echo "Step 6: Importing to k3s (this takes 8-10 minutes, please be patient)..."
-docker save ghcr.io/sandys/openeral/sandbox:just-bash | \
-  docker exec -i openshell-cluster-openshell ctr -n k8s.io images import -
-echo "✓ Image imported to k3s"
+echo "Step 6: Flattening and importing image into k3s..."
+# Docker images built on top of a base that replaces system packages (e.g. apt
+# installing nodejs over an existing npm) contain opaque whiteout files
+# (.wh..wh..opq).  k3s's containerd extracts these by calling mknod to create
+# whiteout char devices in the overlayfs upper dir — but mknod is restricted
+# inside a Docker container (seccomp/AppArmor), so the pod is stuck Pending.
+#
+# Fix: docker export produces a flat filesystem tarball with no whiteouts.
+# docker import turns that into a single-layer image.  This extracts cleanly
+# on any Linux system regardless of mknod restrictions.
+
+FLAT_IMAGE="ghcr.io/sandys/openeral/sandbox:just-bash-openeral-flat"
+FSTAR="$(mktemp /tmp/openeral-fs-XXXXXX.tar)"
+IMGTAR="$(mktemp /tmp/openeral-img-XXXXXX.tar)"
+
+echo "  Step 6a: Flattening image layers..."
+docker rm -f openeral-flatten-tmp 2>/dev/null || true
+docker create --name openeral-flatten-tmp ghcr.io/sandys/openeral/sandbox:just-bash >/dev/null
+docker export openeral-flatten-tmp -o "$FSTAR"
+docker rm openeral-flatten-tmp >/dev/null
+docker rmi -f "$FLAT_IMAGE" 2>/dev/null || true
+docker import "$FSTAR" "$FLAT_IMAGE" >/dev/null
+rm -f "$FSTAR"
+echo "  ✓ Image flattened (single layer, no whiteouts)"
+
+echo "  Step 6b: Saving and copying to k3s container..."
+docker save "$FLAT_IMAGE" -o "$IMGTAR"
+docker cp "$IMGTAR" openshell-cluster-openshell:/tmp/openeral-sandbox-import.tar
+rm -f "$IMGTAR"
+
+echo "  Step 6c: Importing into k3s..."
+if docker exec openshell-cluster-openshell \
+    $K3S_CTR images import /tmp/openeral-sandbox-import.tar; then
+  # Retag the flat image as the expected sandbox image name
+  docker exec openshell-cluster-openshell \
+    $K3S_CTR images tag "$FLAT_IMAGE" ghcr.io/sandys/openeral/sandbox:just-bash 2>/dev/null || true
+  docker exec openshell-cluster-openshell rm -f /tmp/openeral-sandbox-import.tar
+  echo "✓ Image imported to k3s"
+else
+  docker exec openshell-cluster-openshell rm -f /tmp/openeral-sandbox-import.tar
+  echo ""
+  echo "✗ Image import failed. Try:"
+  echo "  docker restart openshell-cluster-openshell"
+  echo "  bash build-image.sh"
+  exit 1
+fi
 echo ""
 
 echo "=== Build Complete! ==="
