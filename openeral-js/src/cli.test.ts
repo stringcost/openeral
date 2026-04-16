@@ -5,7 +5,7 @@ import { join } from 'node:path';
 import { execFileSync, execSync } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
 import { dirname } from 'node:path';
-import { parseCliArgs } from './cli.js';
+import { parseCliArgs, findRepoRoot } from './cli.js';
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 
@@ -187,5 +187,20 @@ describe('built CLI entrypoint', () => {
     } finally {
       rmSync(tmpDir, { recursive: true, force: true });
     }
+  });
+});
+
+describe('findRepoRoot', () => {
+  it('finds the repo root containing sandboxes/openeral/Dockerfile', () => {
+    const root = findRepoRoot();
+    expect(root).not.toBeNull();
+    // The discovered root must contain the Dockerfile landmark
+    const { existsSync } = require('node:fs');
+    expect(existsSync(join(root!, 'sandboxes', 'openeral', 'Dockerfile'))).toBe(true);
+  });
+
+  it('returns null when the landmark is not found within maxLevels', () => {
+    // Pass maxLevels=0 so the walk never starts — always null
+    expect(findRepoRoot(0)).toBeNull();
   });
 });

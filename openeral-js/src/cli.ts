@@ -38,7 +38,8 @@
 import { spawn, spawnSync } from 'node:child_process';
 import { homedir } from 'node:os';
 import { mkdirSync, writeFileSync, readFileSync, existsSync, chmodSync, copyFileSync } from 'node:fs';
-import { join } from 'node:path';
+import { join, dirname } from 'node:path';
+import { fileURLToPath } from 'node:url';
 
 // ---------------------------------------------------------------------------
 // Presign persistence — store one permanent presign in ~/.config/openeral/
@@ -274,14 +275,14 @@ Notes:
 // ---------------------------------------------------------------------------
 
 /**
- * Download org skills from StringCost and write them into `homeDir/.claude/skills/`.
+ * Fetch the org skills bundle from StringCost and return only the validated entries.
  *
- * Each skill is a directory named by its slug with a `SKILL.md` file inside.
+ * Handles timeout, HTTP errors, and slug validation.
  * Slugs are validated against `[a-z0-9][a-z0-9-]*` to prevent path traversal.
  *
- * Returns the number of skills written.
+ * Throws on network/HTTP failure — callers decide whether to propagate or warn.
  */
-export async function downloadOrgSkills(homeDir: string, apiKey: string): Promise<number> {
+export async function fetchOrgSkills(apiKey: string): Promise<Array<{ slug: string; content: string }>> {
   const controller = new AbortController();
   const timeoutId = setTimeout(() => controller.abort(), 10000);
 
@@ -298,20 +299,29 @@ export async function downloadOrgSkills(homeDir: string, apiKey: string): Promis
   if (!res.ok) throw new Error(`HTTP ${res.status}`);
   const data = (await res.json()) as { skills: Array<{ slug: string; content: string }> };
 
+  return (data.skills ?? []).filter(s => /^[a-z0-9][a-z0-9-]*$/.test(s.slug));
+}
+
+/**
+ * Download org skills from StringCost and write them into `homeDir/.claude/skills/`.
+ *
+ * Each skill is a directory named by its slug with a `SKILL.md` file inside.
+ *
+ * Returns the number of skills written.
+ */
+export async function downloadOrgSkills(homeDir: string, apiKey: string): Promise<number> {
+  const skills = await fetchOrgSkills(apiKey);
+
   const skillsDir = join(homeDir, '.claude', 'skills');
   mkdirSync(skillsDir, { recursive: true });
 
-  let written = 0;
-  for (const skill of data.skills) {
-    // Guard against path traversal via malformed slugs
-    if (!/^[a-z0-9][a-z0-9-]*$/.test(skill.slug)) continue;
+  for (const skill of skills) {
     const skillDir = join(skillsDir, skill.slug);
     mkdirSync(skillDir, { recursive: true });
     writeFileSync(join(skillDir, 'SKILL.md'), skill.content);
-    written++;
   }
 
-  return written;
+  return skills.length;
 }
 
 // ---------------------------------------------------------------------------
@@ -762,6 +772,26 @@ function expandImageRef(ref: string): string {
 }
 
 /**
+ * Walk up from the compiled file's directory to find the repository root.
+ *
+ * Looks for `sandboxes/openeral/Dockerfile` as a landmark file so the
+ * result is correct regardless of where in the build output the CLI ends up.
+ * Returns `null` if the root cannot be found within `maxLevels` of traversal.
+ */
+export function findRepoRoot(maxLevels = 6): string | null {
+  let dir = dirname(fileURLToPath(import.meta.url));
+  for (let i = 0; i < maxLevels; i++) {
+    if (existsSync(join(dir, 'sandboxes', 'openeral', 'Dockerfile'))) {
+      return dir;
+    }
+    const parent = dirname(dir);
+    if (parent === dir) break; // filesystem root
+    dir = parent;
+  }
+  return null;
+}
+
+/**
  * Ensure the sandbox image is available in the k3s cluster.
  * Pre-pulls the image on the host and imports it into k3s to avoid DNS issues.
  */
@@ -817,15 +847,16 @@ async function ensureSandboxImage(sandboxImage: string): Promise<void> {
 
     if (isDevImage) {
       // Dev image not found locally — auto-build from the repo Dockerfile.
-      // The CLI compiles to openeral-js/dist/cli.js so two levels up is the repo root.
-      const { fileURLToPath } = await import('node:url');
-      const repoRoot = fileURLToPath(new URL('../..', import.meta.url));
-      const dockerfile = join(repoRoot, 'sandboxes', 'openeral', 'Dockerfile');
+      // Walk up from the compiled file's location to find the repo root
+      // (avoids fragile assumptions about the exact build output path).
+      const repoRoot = findRepoRoot();
+      const dockerfile = repoRoot ? join(repoRoot, 'sandboxes', 'openeral', 'Dockerfile') : null;
 
-      if (!existsSync(dockerfile)) {
+      if (!dockerfile || !existsSync(dockerfile)) {
+        const location = dockerfile ?? '(repo root not found)';
         process.stderr.write(
           `\x1b[31merror: dev image "${sandboxImage}" not found and Dockerfile not found at:\n` +
-          `  ${dockerfile}\n` +
+          `  ${location}\n` +
           'Run from inside the openeral repo, or build the image manually:\n' +
           `  docker build -f sandboxes/openeral/Dockerfile -t ${sandboxImage} <repo-root>\n`
         );
@@ -843,7 +874,7 @@ async function ensureSandboxImage(sandboxImage: string): Promise<void> {
       mkdirSync(dockerCfgDir, { recursive: true });
       writeFileSync(join(dockerCfgDir, 'config.json'), JSON.stringify({ auths: {} }));
 
-      const buildResult = spawnSync('docker', ['build', '-f', dockerfile, '-t', sandboxImage, repoRoot], {
+      const buildResult = spawnSync('docker', ['build', '-f', dockerfile, '-t', sandboxImage, repoRoot!], {
         stdio: 'inherit',
         timeout: 900000, // 15 minutes
         env: { ...process.env, DOCKER_CONFIG: dockerCfgDir },
@@ -1582,25 +1613,9 @@ async function launchViaSandbox(workspaceId: string, claudeArgs: string[], devMo
   if (stringcostKeyForSkills) {
     process.stderr.write('\x1b[2mopeneral: downloading org skills...\x1b[0m\n');
     try {
-      const skillsController = new AbortController();
-      const skillsTimeout = setTimeout(() => skillsController.abort(), 10000);
-      let skillsRes: Response;
-      try {
-        skillsRes = await fetch('https://app.stringcost.com/v2/skills/bundle', {
-          headers: { Authorization: `Bearer ${stringcostKeyForSkills}` },
-          signal: skillsController.signal,
-        });
-      } finally {
-        clearTimeout(skillsTimeout);
-      }
-      if (skillsRes.ok) {
-        const bundle = await skillsRes.json() as { skills: Array<{ slug: string; content: string }> };
-        const valid = (bundle.skills ?? []).filter(s => /^[a-z0-9][a-z0-9-]*$/.test(s.slug));
-        skillsBase64 = Buffer.from(JSON.stringify(valid)).toString('base64');
-        process.stderr.write(`\x1b[32m✓ Downloaded ${valid.length} org skill${valid.length !== 1 ? 's' : ''}\x1b[0m\n`);
-      } else {
-        process.stderr.write(`\x1b[33mwarn: skills bundle returned HTTP ${skillsRes.status} — continuing without org skills\x1b[0m\n`);
-      }
+      const skills = await fetchOrgSkills(stringcostKeyForSkills);
+      skillsBase64 = Buffer.from(JSON.stringify(skills)).toString('base64');
+      process.stderr.write(`\x1b[32m✓ Downloaded ${skills.length} org skill${skills.length !== 1 ? 's' : ''}\x1b[0m\n`);
     } catch (err: unknown) {
       const msg = err instanceof Error ? err.message : String(err);
       process.stderr.write(`\x1b[33mwarn: org skills download failed: ${msg} — continuing without org skills\x1b[0m\n`);
