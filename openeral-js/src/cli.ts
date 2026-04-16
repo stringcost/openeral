@@ -49,6 +49,8 @@ interface StoredPresign {
   /** Full URL as returned by StringCost (e.g. .../t/{JWT}/v1/messages) */
   url: string;
   createdAt: string;
+  /** StringCost API key stored so skill downloads work without the env var */
+  stringcostApiKey?: string;
 }
 
 function getPresignConfigPath(): string {
@@ -67,15 +69,13 @@ function loadStoredPresign(): StoredPresign | null {
   }
 }
 
-function saveStoredPresign(url: string): void {
+function saveStoredPresign(url: string, apiKey?: string): void {
   const configDir = join(homedir(), '.config', 'openeral');
   mkdirSync(configDir, { recursive: true, mode: 0o700 });
   const presignPath = getPresignConfigPath();
-  writeFileSync(
-    presignPath,
-    JSON.stringify({ url, createdAt: new Date().toISOString() }, null, 2),
-    { mode: 0o600 }
-  );
+  const data: StoredPresign = { url, createdAt: new Date().toISOString() };
+  if (apiKey) data.stringcostApiKey = apiKey;
+  writeFileSync(presignPath, JSON.stringify(data, null, 2), { mode: 0o600 });
   // Ensure restrictive permissions (covers cases where mode is ignored)
   try {
     chmodSync(presignPath, 0o600);
@@ -1209,6 +1209,13 @@ async function cmdPresignShow(): Promise<void> {
   console.log(`  Full URL:   ${stored.url}`);
   console.log(`  Created:    ${new Date(stored.createdAt).toLocaleString()}`);
   if (decoded.sessionId) console.log(`  Session ID: ${decoded.sessionId}`);
+  if (stored.stringcostApiKey) {
+    const k = stored.stringcostApiKey;
+    const masked = k.length > 8 ? `${k.slice(0, 4)}...${k.slice(-4)}` : '****';
+    console.log(`  StringCost API Key: ${masked}  (stored — used for automatic skill downloads)`);
+  } else {
+    console.log(`  StringCost API Key: not stored — run \`npx openeral presign renew\` to save it`);
+  }
   console.log('');
   console.log('Settings: expires_in=-1  max_uses=-1  cost_limit=10$  (all infinite, never exhausts)');
 }
@@ -1261,8 +1268,9 @@ async function cmdPresignRenew(): Promise<void> {
     const fullUrl = await createPresignUrl(anthropicKey, stringcostKey);
     const baseUrl = fullUrl.replace(/\/v1\/.*$/, '');
 
-    // 1. Store in openeral's own config
-    saveStoredPresign(fullUrl);
+    // 1. Store in openeral's own config (include the API key so skill downloads
+    //    work automatically on future runs without the env var being set)
+    saveStoredPresign(fullUrl, stringcostKey);
     console.log(`\x1b[32m✓ Stored in ${getPresignConfigPath()}\x1b[0m`);
 
     // 2. Write into host Claude Code settings so Claude picks it up automatically
@@ -1570,7 +1578,7 @@ async function launchViaSandbox(workspaceId: string, claudeArgs: string[], devMo
     process.stderr.write('\x1b[2mopeneral: no stored presign — creating permanent presign...\x1b[0m\n');
     try {
       const fullUrl = await createPresignUrl(anthropicKey, stringcostKey);
-      saveStoredPresign(fullUrl);
+      saveStoredPresign(fullUrl, stringcostKey);
       stringcostUrl = fullUrl.replace(/\/v1\/.*$/, '');
       process.stderr.write('\x1b[32m✓ StringCost presign created and stored (expires_in=-1, max_uses=-1, cost_limit=$10)\x1b[0m\n');
     } catch (err) {
@@ -1605,11 +1613,23 @@ async function launchViaSandbox(workspaceId: string, claudeArgs: string[], devMo
 
   sandboxArgs.push('--auto-providers');
 
-  // Fetch org skills on the host using STRINGCOST_API_KEY and embed them as a
-  // base64 payload in the setup script.  The sandbox never sees the API key —
-  // only the already-downloaded bundle (base64-encoded JSON) is passed in.
+  // Resolve the StringCost API key for org skills download.
+  // Priority: env var > key stored alongside presign.
+  // If the env var is set and differs from the stored key, update the stored copy
+  // so future launches download skills automatically without the env var.
+  const envSkillsKey = (process.env.STRINGCOST_API_KEY ?? '').replace('@stringcost_api_key', '').trim();
+  const storedSkillsKey = storedPresign?.stringcostApiKey?.trim() ?? '';
+  const stringcostKeyForSkills = envSkillsKey || storedSkillsKey;
+
+  if (envSkillsKey && storedPresign && envSkillsKey !== storedSkillsKey) {
+    saveStoredPresign(storedPresign.url, envSkillsKey);
+    process.stderr.write('\x1b[2mopeneral: stored StringCost API key updated from env\x1b[0m\n');
+  }
+
+  // Fetch org skills on the host and embed them as a base64 payload in the
+  // setup script.  The sandbox never sees the API key — only the already-
+  // downloaded bundle (base64-encoded JSON) is passed in.
   let skillsBase64 = '';
-  const stringcostKeyForSkills = (process.env.STRINGCOST_API_KEY ?? '').trim();
   if (stringcostKeyForSkills) {
     process.stderr.write('\x1b[2mopeneral: downloading org skills...\x1b[0m\n');
     try {
