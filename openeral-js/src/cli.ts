@@ -13,8 +13,10 @@
  *   npx openeral --workspace myid     # custom workspace ID
  *   npx openeral optimize stats       # show optimization stats
  *
- * Required env:
- *   ANTHROPIC_API_KEY       Claude API key
+ * Auth (presign-first):
+ *   If ~/.config/openeral/presign.json exists → no env vars required.
+ *   If not → set ANTHROPIC_API_KEY + STRINGCOST_API_KEY to create one on first run.
+ *   Run `npx openeral presign renew` to replace the stored presign.
  *
  * Optional env:
  *   DATABASE_URL            Database connection string (uses PGlite if not provided)
@@ -125,75 +127,6 @@ async function createPresignUrl(anthropicKey: string, stringcostKey: string): Pr
   }
 }
 
-function writeClaudeSettings(path: string): void {
-  // Default security settings for Claude Code (Level 1 sandbox)
-  // Protects SSH keys, AWS credentials, .env files, and prevents unauthorized network/code actions
-  const settings = {
-    permissions: {
-      allow: [
-        "Bash(npm run *)",
-        "Bash(npm test *)",
-        "Bash(git status)",
-        "Bash(git diff *)",
-        "Bash(git log *)",
-        "Bash(git commit *)",
-        "Bash(ls *)",
-        "Bash(cat *)",
-        "Bash(grep *)"
-      ],
-      deny: [
-        "Read(~/.ssh/**)",
-        "Read(~/.aws/**)",
-        "Read(~/.azure/**)",
-        "Read(~/.npmrc)",
-        "Read(~/.git-credentials)",
-        "Edit(~/.bashrc)",
-        "Edit(~/.zshrc)",
-        "Bash(curl *)",
-        "Bash(wget *)",
-        "Bash(nc *)",
-        "Bash(ssh *)",
-        "Bash(git push *)",
-        "Read(*.env)",
-        "Read(.env.*)"
-      ]
-    },
-    enableAllProjectMcpServers: false
-  };
-  
-  // Ensure parent directory exists with restrictive permissions
-  const dir = path.substring(0, path.lastIndexOf('/'));
-  mkdirSync(dir, { recursive: true, mode: 0o700 });
-  
-  // Write with restrictive permissions (contains presign URL with JWT)
-  writeFileSync(path, JSON.stringify(settings, null, 2), { mode: 0o600 });
-  
-  // Ensure restrictive permissions (covers cases where mode is ignored)
-  try {
-    chmodSync(path, 0o600);
-  } catch {
-    // Ignore chmod errors on platforms that don't support it
-  }
-}
-
-function writePgHelper(path: string): void {
-  // pg helper reads DATABASE_URL from the environment at runtime.
-  // Never hardcode credentials — rely on env propagation from OpenShell providers.
-  const script = `#!/bin/bash
-# pg — query the database from Claude Code
-# Usage: pg "SELECT * FROM public.users LIMIT 5"
-if [ -z "$DATABASE_URL" ]; then
-  echo "pg: DATABASE_URL is not set" >&2; exit 1
-fi
-if command -v psql >/dev/null 2>&1; then
-  exec psql "$DATABASE_URL" -c "$*"
-else
-  exec node -e 'const p=require("pg"),o=new p.Pool({connectionString:process.env.DATABASE_URL});o.query(process.argv[1]).then(r=>{console.log(JSON.stringify(r.rows,null,2));o.end()}).catch(e=>{console.error(e.message);process.exit(1)})' "$*"
-fi
-`;
-  writeFileSync(path, script);
-  chmodSync(path, 0o755);
-}
 
 type ParsedArgs = 
   | { kind: 'launch'; workspaceId: string; claudeArgs: string[] }
@@ -301,21 +234,28 @@ Memory Refresh Options:
   --dry-run               Preview changes without applying
   --no-backup             Skip backup creation
 
-Environment Variables:
-  ANTHROPIC_API_KEY        Claude API key (required)
-  STRINGCOST_API_KEY       StringCost API key (optional, enables cost tracking)
-  DATABASE_URL             Database connection string (optional, uses PGlite if not provided)
+Auth (presign-first model):
+  If ~/.config/openeral/presign.json exists, no env vars are required.
+  If the presign file is absent, both of these are required on first run:
+    ANTHROPIC_API_KEY        Your Anthropic API key (sk-ant-...)
+    STRINGCOST_API_KEY       Your StringCost API key
+  The presign is created once and stored permanently — subsequent runs need no keys.
+  Run \`npx openeral presign renew\` to replace the stored presign at any time.
+
+Optional env:
+  DATABASE_URL             Database connection string (uses PGlite if not provided)
   OPENERAL_WORKSPACE_ID    Default workspace ID (will be normalized to lowercase)
   OPENERAL_SANDBOX_IMAGE   Override sandbox image (default: ghcr.io/sandys/openeral/sandbox:just-bash)
+  OPENERAL_AUTO_FIX_TLS    Set to 1 to suppress the TLS regeneration confirmation delay
 
 Features:
-  - Persistent StringCost presign — one presign stored forever, reused across all sessions
+  - Presign-first auth — no env vars needed once the presign is stored
   - Claude has automatic access to your home directory and mounted drives
   - Database persistence with PGlite (or external PostgreSQL)
   - API usage statistics and optimization suggestions
 
 Notes:
-  - Presign is stored in ~/.config/openeral/presign.json (expires_in=-1, max_uses=-1, cost_limit=$10)
+  - Presign stored in ~/.config/openeral/presign.json (mode 600, expires_in=-1, max_uses=-1, cost_limit=$10)
   - Workspace IDs are automatically normalized to be Kubernetes-compliant
   - Claude CLI will be automatically installed in the sandbox if not present
   - Existing sandboxes with the same name will be cleaned up automatically
