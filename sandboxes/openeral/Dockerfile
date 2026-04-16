@@ -16,11 +16,13 @@ RUN apt-get update \
 
 # Install openeral-js: install all deps (including devDeps for tsc), build, then prune
 COPY openeral-js/ /opt/openeral/
-RUN cd /opt/openeral && npm install && npm run build && npm prune --omit=dev
+RUN cd /opt/openeral && npm install && npm run build && npm prune --omit=dev \
+    && chmod -R a+rX /opt/openeral \
+    && chown -R sandbox:sandbox /opt/openeral
 
 # openeral-bash: drop-in bash replacement routed through just-bash
-COPY sandboxes/openeral/openeral-bash.mjs /opt/openeral/openeral-bash.mjs
-RUN chmod +x /opt/openeral/openeral-bash.mjs \
+COPY --chown=sandbox:sandbox sandboxes/openeral/openeral-bash.mjs /opt/openeral/openeral-bash.mjs
+RUN chmod a+rx /opt/openeral/openeral-bash.mjs \
     && ln -sf /opt/openeral/openeral-bash.mjs /usr/local/bin/openeral-bash
 
 # Rename real bash so openeral-bash can fall back to it for interactive use
@@ -28,7 +30,8 @@ RUN cp /bin/bash /bin/bash.real
 
 # Setup script (entry point for sandbox create)
 COPY sandboxes/openeral/setup.sh /opt/openeral/setup.sh
-RUN chmod +x /opt/openeral/setup.sh
+RUN chmod 755 /opt/openeral/setup.sh \
+    && chown sandbox:sandbox /opt/openeral/setup.sh
 
 # Override the upstream base policy
 COPY sandboxes/openeral/policy.yaml /etc/openshell/policy.yaml

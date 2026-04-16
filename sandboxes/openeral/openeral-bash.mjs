@@ -15,6 +15,9 @@
  *                a fresh shell, runs the command, exits).
  *
  * Claude Code calls `bash -c '<command>'` — this script intercepts that.
+ *
+ * Database: uses getDatabaseConnection() which picks up external PostgreSQL
+ * when DATABASE_URL is set, or starts embedded PGlite otherwise.
  */
 
 import { createServer, createConnection } from 'node:net';
@@ -28,19 +31,17 @@ const SOCKET_PATH = '/tmp/openeral-bash.sock';
 
 async function startDaemon() {
   const { createOpeneralShell } = await import('/opt/openeral/dist/shell.js');
-
-  const connectionString = process.env.DATABASE_URL || process.env.OPENERAL_DATABASE_URL;
-  if (!connectionString) {
-    process.stderr.write('openeral-bash: DATABASE_URL or OPENERAL_DATABASE_URL required\n');
-    process.exit(1);
-  }
+  const { getDatabaseConnection } = await import('/opt/openeral/dist/db/embedded.js');
 
   const workspaceId = process.env.OPENSHELL_SANDBOX_ID || process.env.WORKSPACE_ID || 'default';
+
+  const { pool, connectionString } = await getDatabaseConnection();
 
   const shell = await createOpeneralShell({
     connectionString,
     workspaceId,
     migrate: false, // setup.sh already ran migrations
+    pool,
   });
 
   // Clean up stale socket
@@ -146,18 +147,17 @@ function execViaDaemon(command) {
 
 async function execStandalone(command) {
   const { createOpeneralShell } = await import('/opt/openeral/dist/shell.js');
-
-  const connectionString = process.env.DATABASE_URL || process.env.OPENERAL_DATABASE_URL;
-  if (!connectionString) {
-    return { stdout: '', stderr: 'openeral-bash: DATABASE_URL required\n', exitCode: 1 };
-  }
+  const { getDatabaseConnection } = await import('/opt/openeral/dist/db/embedded.js');
 
   const workspaceId = process.env.OPENSHELL_SANDBOX_ID || process.env.WORKSPACE_ID || 'default';
+
+  const { pool, connectionString } = await getDatabaseConnection();
 
   const shell = await createOpeneralShell({
     connectionString,
     workspaceId,
     migrate: false,
+    pool,
   });
 
   return shell.exec(command);

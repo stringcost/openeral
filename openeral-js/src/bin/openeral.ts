@@ -7,3 +7,4 @@ void main().catch((err: unknown) => {
   process.stderr.write(`\x1b[31mopeneral: ${e.message}\x1b[0m\n`);
   process.exit(1);
 });
+

@@ -148,7 +148,7 @@ describe('CLI argument parsing', () => {
 
     expect(parsed).toEqual({
       kind: 'launch',
-      workspaceId: hostname(),
+      workspaceId: 'openeral-claude',
       claudeArgs: ['--help'],
     });
   });

@@ -11,23 +11,59 @@ set -euo pipefail
 #   3. Start openeral-bash daemon
 #   4. Exec Claude Code
 
-OPENERAL_DIR=/opt/openeral
-
-# Resolve database connection string (OpenShell provider injects DATABASE_URL)
-export DATABASE_URL="${DATABASE_URL:-${OPENERAL_DATABASE_URL:-}}"
-if [ -z "$DATABASE_URL" ]; then
-  echo "setup.sh: DATABASE_URL or OPENERAL_DATABASE_URL required" >&2
-  exit 1
+# Use /opt/openeral directly if accessible, otherwise copy to /home/agent
+if [ -r /opt/openeral/dist/db/embedded.js ]; then
+  OPENERAL_DIR=/opt/openeral
+  echo "setup: using /opt/openeral directly"
+else
+  echo "setup: copying openeral to writable location..."
+  # Use cp instead of tar to avoid permission issues
+  mkdir -p /home/agent/openeral
+  cp -r /opt/openeral/* /home/agent/openeral/ 2>/dev/null || {
+    echo "setup: copy failed, trying with sudo..."
+    # If copy fails, try to make /opt/openeral readable
+    chmod -R a+rX /opt/openeral 2>/dev/null || true
+    cp -r /opt/openeral/* /home/agent/openeral/
+  }
+  OPENERAL_DIR=/home/agent/openeral
 fi
 
 # Workspace ID defaults to sandbox ID (set by OpenShell supervisor)
 export WORKSPACE_ID="${OPENSHELL_SANDBOX_ID:-default}"
 
+# Fix the PGlite data directory to a stable path so every Node.js process
+# in this script uses the same embedded database.  /home/agent is a real
+# directory in the container (created in the Dockerfile).
+export OPENERAL_DATA_DIR="${OPENERAL_DATA_DIR:-/home/agent/.openeral/data}"
+mkdir -p "$OPENERAL_DATA_DIR"
+
+# If DATABASE_URL is provided (external PostgreSQL), propagate it so
+# getDatabaseConnection() picks it up over PGlite.
+export DATABASE_URL="${DATABASE_URL:-${OPENERAL_DATABASE_URL:-}}"
+
+# StringCost integration — write proxy config into Claude Code settings.json so it
+# takes effect regardless of how the sandbox injects environment variables.
+if [ -n "${STRINGCOST_PROXY_URL:-}" ]; then
+  echo "setup.sh: writing StringCost proxy to ~/.claude/settings.json..."
+  node -e "
+const fs = require('fs');
+const file = '/home/agent/.claude/settings.json';
+let s = {};
+try { s = JSON.parse(fs.readFileSync(file, 'utf8')); } catch(e) {}
+if (!s.env) s.env = {};
+s.env.ANTHROPIC_BASE_URL = process.env.STRINGCOST_PROXY_URL;
+s.env.ANTHROPIC_AUTH_TOKEN = 'dummy';
+fs.mkdirSync('/home/agent/.claude', {recursive: true});
+fs.writeFileSync(file, JSON.stringify(s, null, 2));
+console.log('setup.sh: StringCost proxy written to ~/.claude/settings.json');
+"
+fi
+
 echo "setup.sh: running migrations..."
 node -e "
-  import('$OPENERAL_DIR/dist/db/pool.js').then(async ({ createPool }) => {
+  import('$OPENERAL_DIR/dist/db/embedded.js').then(async ({ getDatabaseConnection }) => {
     const { runMigrations } = await import('$OPENERAL_DIR/dist/db/migrations.js');
-    const pool = createPool(process.env.DATABASE_URL);
+    const { pool } = await getDatabaseConnection();
     await runMigrations(pool);
     await pool.end();
     console.log('setup.sh: migrations complete');
@@ -39,12 +75,10 @@ node -e "
 
 echo "setup.sh: seeding workspace $WORKSPACE_ID..."
 node -e "
-  import('$OPENERAL_DIR/dist/db/pool.js').then(async ({ createPool }) => {
-    const { runMigrations } = await import('$OPENERAL_DIR/dist/db/migrations.js');
+  import('$OPENERAL_DIR/dist/db/embedded.js').then(async ({ getDatabaseConnection }) => {
     const ws = await import('$OPENERAL_DIR/dist/db/workspace-queries.js');
-    const pool = createPool(process.env.DATABASE_URL);
+    const { pool } = await getDatabaseConnection();
 
-    // Ensure workspace config exists
     try {
       await pool.query(
         \"INSERT INTO _openeral.workspace_config (id, display_name, config) VALUES (\\\$1, \\\$2, '{}'::jsonb) ON CONFLICT (id) DO NOTHING\",
@@ -52,10 +86,45 @@ node -e "
       );
     } catch {}
 
-    // Seed root and .claude dirs
+    // Seed root, .claude dirs, and default security settings
+    const defaultSettings = JSON.stringify({
+      permissions: {
+        allow: [
+          \"Bash(npm run *)\",
+          \"Bash(npm test *)\",
+          \"Bash(git status)\",
+          \"Bash(git diff *)\",
+          \"Bash(git log *)\",
+          \"Bash(git commit *)\",
+          \"Bash(ls *)\",
+          \"Bash(cat *)\",
+          \"Bash(grep *)\"
+        ],
+        deny: [
+          \"Read(~/.ssh/**)\",
+          \"Read(~/.aws/**)\",
+          \"Read(~/.azure/**)\",
+          \"Read(~/.npmrc)\",
+          \"Read(~/.git-credentials)\",
+          \"Edit(~/.bashrc)\",
+          \"Edit(~/.zshrc)\",
+          \"Bash(curl *)\",
+          \"Bash(wget *)\",
+          \"Bash(nc *)\",
+          \"Bash(ssh *)\",
+          \"Bash(git push *)\",
+          \"Read(*.env)\",
+          \"Read(.env.*)\"
+        ]
+      },
+      enableAllProjectMcpServers: false
+    }, null, 2);
+
     await ws.seedFromConfig(pool, process.env.WORKSPACE_ID, {
       autoDirs: ['/', '/.claude', '/.claude/projects'],
-      seedFiles: {},
+      seedFiles: {
+        '/.claude/settings.json': defaultSettings
+      },
     });
 
     await pool.end();
@@ -87,25 +156,46 @@ echo "setup.sh: starting openeral-bash daemon..."
 node "$OPENERAL_DIR/openeral-bash.mjs" --daemon &
 DAEMON_PID=$!
 
-# Wait for socket to appear
-for i in $(seq 1 30); do
+# Wait for socket to appear — PGlite WASM can take 5-15s to initialize
+_d=0
+while [ $_d -lt 300 ]; do
   [ -S /tmp/openeral-bash.sock ] && break
+  [ $_d -eq 50 ] && echo "setup.sh: waiting for daemon to initialize (PGlite WASM)..." >&2
   sleep 0.1
+  _d=$((_d+1))
 done
 
-if [ ! -S /tmp/openeral-bash.sock ]; then
-  echo "setup.sh: daemon failed to start" >&2
-  exit 1
+if [ -S /tmp/openeral-bash.sock ]; then
+  echo "setup.sh: daemon ready (pid $DAEMON_PID)"
+  # Clean up daemon on exit
+  trap "kill $DAEMON_PID 2>/dev/null; rm -f /tmp/openeral-bash.sock" EXIT
+else
+  echo "setup.sh: warning: daemon not ready after 30s — using standalone mode" >&2
+  unset DAEMON_PID
+  trap "rm -f /tmp/openeral-bash.sock" EXIT
 fi
 
-echo "setup.sh: daemon ready (pid $DAEMON_PID)"
-
-# Clean up daemon on exit
-trap "kill $DAEMON_PID 2>/dev/null; rm -f /tmp/openeral-bash.sock" EXIT
+# Install Claude Code if not already present in the image
+if ! command -v claude >/dev/null 2>&1; then
+  echo "setup.sh: Claude CLI not found, installing..."
+  npm install -g @anthropic-ai/claude-code 2>&1 | tail -10
+  if ! command -v claude >/dev/null 2>&1; then
+    echo "setup.sh: ERROR: Claude CLI install failed" >&2
+    exit 1
+  fi
+  echo "setup.sh: Claude CLI installed"
+fi
 
 # Launch Claude Code with persistent home
 echo "setup.sh: launching Claude Code..."
-exec env \
-  HOME=/home/agent \
-  SHELL=/usr/local/bin/openeral-bash \
-  claude "$@"
+if [ -n "${STRINGCOST_PROXY_URL:-}" ]; then
+  exec env -u ANTHROPIC_API_KEY \
+    HOME=/home/agent \
+    SHELL=/usr/local/bin/openeral-bash \
+    claude "$@"
+else
+  exec env \
+    HOME=/home/agent \
+    SHELL=/usr/local/bin/openeral-bash \
+    claude "$@"
+fi

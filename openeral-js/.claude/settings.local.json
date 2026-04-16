@@ -1,0 +1,28 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(pnpm build:*)",
+      "Bash(pnpm check:*)",
+      "Bash(node:*)",
+      "Bash(optimize stats:*)",
+      "Bash(pnpm typecheck:*)",
+      "Bash(docker exec openshell-cluster-openshell:*)",
+      "Bash(docker restart openshell-cluster-openshell:*)",
+      "Bash(docker commit:*)",
+      "Bash(openshell gateway:*)",
+      "Read(//home/linux/.config/openshell/**)",
+      "Read(//home/linux/**)",
+      "Bash(docker stop:*)",
+      "Bash(docker rm:*)",
+      "Bash(docker run:*)",
+      "Bash(docker save:*)",
+      "Bash(docker exec:*)",
+      "Bash(openssl x509:*)",
+      "Bash(awk 'NR>1 {split\\($2, a, \":\"\\); port=strtonum\\(\"0x\" a[2]\\); if \\(port != 0\\) printf \"port=%d state=%s\\\\n\", port, $4}')",
+      "Bash(python3 -c ':*)",
+      "Bash(grep -v \"^\\\\s*$\")",
+      "Bash(openshell --help)",
+      "Bash(/home/linux/.local/bin/openshell --help)"
+    ]
+  }
+}
