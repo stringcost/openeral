@@ -8,7 +8,9 @@
  * starts the openeral-bash daemon, then execs `claude`.
  *
  * Usage:
- *   npx openeral                      # interactive Claude Code
+ *   npx openeral                      # interactive Claude Code (published image)
+ *   npx openeral --dev                # interactive Claude Code (local dev image)
+ *   npx openeral -d                   # same as --dev (short flag)
  *   npx openeral -- -p 'hello'        # non-interactive
  *   npx openeral --workspace myid     # custom workspace ID
  *   npx openeral optimize stats       # show optimization stats
@@ -22,6 +24,7 @@
  *   DATABASE_URL            Database connection string (uses PGlite if not provided)
  *   OPENERAL_WORKSPACE_ID   Workspace ID (default: openeral-claude, normalized to lowercase)
  *   OPENERAL_SANDBOX_IMAGE  Override sandbox image (default: ghcr.io/sandys/openeral/sandbox:just-bash)
+ *   OPENERAL_DEV_IMAGE      Override dev sandbox image (default: openeral-sandbox:dev, used with --dev)
  *
  * Features:
  *   - Automatic TLS certificate generation for OpenShell gateway
@@ -207,7 +210,8 @@ export function parseCliArgs(args: string[]): ParsedArgs {
 
 function printHelp(): void {
   console.log(`Usage:
-  openeral [options] [-- claude-args]    Launch Claude Code in an OpenShell sandbox
+  openeral [options] [-- claude-args]    Launch Claude Code (published image)
+  openeral --dev [options] [-- args]     Launch Claude Code (local dev image)
   openeral presign                        Show the current StringCost presign
   openeral presign renew                  Create and store a new StringCost presign
   openeral stats [options]                Show API usage statistics
@@ -217,6 +221,7 @@ function printHelp(): void {
 
 Launch Options:
   --workspace, -w <id>    Workspace ID (default: openeral-claude)
+  --dev, -d               Use local dev image instead of published image
   --help, -h              Show this help
 
 Stats / Analyze / Apply Options:
@@ -245,7 +250,8 @@ Auth (presign-first model):
 Optional env:
   DATABASE_URL             Database connection string (uses PGlite if not provided)
   OPENERAL_WORKSPACE_ID    Default workspace ID (will be normalized to lowercase)
-  OPENERAL_SANDBOX_IMAGE   Override sandbox image (default: ghcr.io/sandys/openeral/sandbox:just-bash)
+  OPENERAL_SANDBOX_IMAGE   Override prod sandbox image (default: ghcr.io/sandys/openeral/sandbox:just-bash)
+  OPENERAL_DEV_IMAGE       Override dev sandbox image (default: openeral-sandbox:dev, used with --dev/-d)
   OPENERAL_AUTO_FIX_TLS    Set to 1 to suppress the TLS regeneration confirmation delay
 
 Features:
@@ -699,19 +705,64 @@ async function ensureSandboxImage(sandboxImage: string): Promise<void> {
 
   process.stderr.write('\x1b[2m  image not found in cluster, importing...\x1b[0m\n');
 
-  // Pull on host first
-  process.stderr.write('\x1b[2m  pulling image on host (this may take a few minutes)...\x1b[0m\n');
-  const pullResult = spawnSync('docker', ['pull', sandboxImage], {
-    stdio: 'inherit',
-    timeout: 600000,
+  // Check if the image already exists in the local Docker daemon.
+  // Local-only images (e.g. openeral-sandbox:dev built with `docker build`)
+  // are never in a registry, so `docker pull` would always fail for them.
+  const localCheck = spawnSync('docker', ['image', 'inspect', sandboxImage, '--format', '{{.Id}}'], {
+    stdio: 'pipe',
+    timeout: 10000,
   });
+  const imageExistsLocally = localCheck.status === 0 && localCheck.stdout.toString().trim().length > 0;
 
-  if (pullResult.status !== 0) {
-    process.stderr.write(
-      '\x1b[33mwarning: failed to pull image on host\x1b[0m\n' +
-      `  docker pull ${sandboxImage}\n`
-    );
-    return;
+  if (!imageExistsLocally) {
+    const devImageName = process.env.OPENERAL_DEV_IMAGE ?? 'openeral-sandbox:dev';
+    const isDevImage = sandboxImage === devImageName;
+
+    if (isDevImage) {
+      // Dev image not found locally — auto-build from the repo Dockerfile.
+      // The CLI lives at openeral-js/dist/bin/openeral.js so three levels up is the repo root.
+      const { fileURLToPath } = await import('node:url');
+      const repoRoot = fileURLToPath(new URL('../../..', import.meta.url));
+      const dockerfile = join(repoRoot, 'sandboxes', 'openeral', 'Dockerfile');
+
+      if (!existsSync(dockerfile)) {
+        process.stderr.write(
+          `\x1b[31merror: dev image "${sandboxImage}" not found and Dockerfile not found at:\n` +
+          `  ${dockerfile}\n` +
+          'Run from inside the openeral repo, or build the image manually:\n' +
+          `  docker build -f sandboxes/openeral/Dockerfile -t ${sandboxImage} <repo-root>\n`
+        );
+        process.exit(1);
+      }
+
+      process.stderr.write(`\x1b[2m  dev image not found — building from ${dockerfile}...\x1b[0m\n`);
+      const buildResult = spawnSync('docker', ['build', '-f', dockerfile, '-t', sandboxImage, repoRoot], {
+        stdio: 'inherit',
+        timeout: 900000, // 15 minutes
+      });
+
+      if (buildResult.status !== 0) {
+        process.stderr.write(`\x1b[31merror: failed to build dev image "${sandboxImage}"\x1b[0m\n`);
+        process.exit(1);
+      }
+      process.stderr.write(`\x1b[32m✓ Dev image built: ${sandboxImage}\x1b[0m\n`);
+    } else {
+      // Registry image — pull from remote
+      process.stderr.write('\x1b[2m  pulling image on host (this may take a few minutes)...\x1b[0m\n');
+      const pullResult = spawnSync('docker', ['pull', sandboxImage], {
+        stdio: 'inherit',
+        timeout: 600000,
+      });
+
+      if (pullResult.status !== 0) {
+        process.stderr.write(
+          `\x1b[31merror: image "${sandboxImage}" could not be pulled from registry.\x1b[0m\n`
+        );
+        process.exit(1);
+      }
+    }
+  } else {
+    process.stderr.write('\x1b[32m✓ Image found in local Docker daemon\x1b[0m\n');
   }
 
   // Flatten the image to a single layer before importing into k3s.
@@ -1112,9 +1163,10 @@ async function cmdPresignRenew(): Promise<void> {
  *      setup.sh runs migrations, seeds the workspace, starts the
  *      openeral-bash daemon, then execs `claude`.
  */
-async function launchViaSandbox(workspaceId: string, claudeArgs: string[]): Promise<void> {
-  const sandboxImage =
-    process.env.OPENERAL_SANDBOX_IMAGE ?? 'ghcr.io/sandys/openeral/sandbox:just-bash';
+async function launchViaSandbox(workspaceId: string, claudeArgs: string[], devMode = false): Promise<void> {
+  const sandboxImage = devMode
+    ? (process.env.OPENERAL_DEV_IMAGE ?? 'openeral-sandbox:dev')
+    : (process.env.OPENERAL_SANDBOX_IMAGE ?? 'ghcr.io/sandys/openeral/sandbox:just-bash');
 
   // Check if openshell is installed
   const checkResult = spawnSync('openshell', ['--version'], { stdio: 'pipe' });
@@ -1579,11 +1631,22 @@ exec env -u ANTHROPIC_API_KEY HOME=/home/agent SHELL=/usr/local/bin/openeral-bas
 }
 
 export async function main() {
-  const args = process.argv.slice(2);
+  const rawArgs = process.argv.slice(2);
+
+  // Separate openeral's own args from claude passthrough args (after --)
+  const dashIdx = rawArgs.indexOf('--');
+  const ownRawArgs = dashIdx >= 0 ? rawArgs.slice(0, dashIdx) : rawArgs;
+  const passthroughPart = dashIdx >= 0 ? rawArgs.slice(dashIdx) : [];
+
+  // Extract --dev/-d flag (must happen before subcommand dispatch so
+  // `npx openeral --dev presign` works — the flag can appear anywhere before --)
+  const devMode = ownRawArgs.some(a => a === '--dev' || a === '-d' || a === '-dev');
+  const ownArgs = ownRawArgs.filter(a => a !== '--dev' && a !== '-d' && a !== '-dev');
+  const args = [...ownArgs, ...passthroughPart];
 
   // presign show / renew
-  if (args[0] === 'presign') {
-    if (args[1] === 'renew') {
+  if (ownArgs[0] === 'presign') {
+    if (ownArgs[1] === 'renew') {
       await cmdPresignRenew();
     } else {
       await cmdPresignShow();
@@ -1592,25 +1655,25 @@ export async function main() {
   }
 
   // stats / analyze / apply — forward to optimize CLI, passing stored presign URL via env
-  if (args[0] === 'stats' || args[0] === 'analyze' || args[0] === 'apply') {
+  if (ownArgs[0] === 'stats' || ownArgs[0] === 'analyze' || ownArgs[0] === 'apply') {
     const { fileURLToPath } = await import('node:url');
     const optimizeCliPath = fileURLToPath(new URL('./optimize/cli.js', import.meta.url));
     const env: NodeJS.ProcessEnv = { ...process.env };
     const stored = loadStoredPresign();
     if (stored) env['OPENERAL_PRESIGN_URL'] = stored.url;
-    const child = spawn('node', [optimizeCliPath, ...args], { stdio: 'inherit', env });
+    const child = spawn('node', [optimizeCliPath, ...ownArgs], { stdio: 'inherit', env });
     child.on('exit', (code) => process.exit(code ?? 0));
     return;
   }
 
   // optimize <subcommand> — backwards compatibility alias
-  if (args[0] === 'optimize') {
+  if (ownArgs[0] === 'optimize') {
     const { fileURLToPath } = await import('node:url');
     const optimizeCliPath = fileURLToPath(new URL('./optimize/cli.js', import.meta.url));
     const env: NodeJS.ProcessEnv = { ...process.env };
     const stored = loadStoredPresign();
     if (stored) env['OPENERAL_PRESIGN_URL'] = stored.url;
-    const child = spawn('node', [optimizeCliPath, ...args.slice(1)], { stdio: 'inherit', env });
+    const child = spawn('node', [optimizeCliPath, ...ownArgs.slice(1)], { stdio: 'inherit', env });
     child.on('exit', (code) => process.exit(code ?? 0));
     return;
   }
@@ -1630,5 +1693,9 @@ export async function main() {
   const { workspaceId, claudeArgs } = parsed;
 
   process.stderr.write(`\x1b[2mopeneral: workspace  ${workspaceId}\x1b[0m\n`);
-  await launchViaSandbox(workspaceId, claudeArgs);
+  if (devMode) {
+    const devImage = process.env.OPENERAL_DEV_IMAGE ?? 'openeral-sandbox:dev';
+    process.stderr.write(`\x1b[2mopeneral: mode       dev (${devImage})\x1b[0m\n`);
+  }
+  await launchViaSandbox(workspaceId, claudeArgs, devMode);
 }

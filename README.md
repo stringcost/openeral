@@ -4,24 +4,16 @@ Isolated home directory and optional database access for AI agents. Runs on embe
 
 ## Run Claude Code with OpenEral
 
-### Quickest: inside Claude Code
-
-If you're already in Claude Code, just say:
-
-> I want to run Claude Code using openeral-shell
-
-Claude will handle the rest — it clones the repo, builds, and launches.
-
 ### From your terminal
 
 ```bash
 git clone https://github.com/sandys/openeral.git
 cd openeral/openeral-js
-pnpm install && pnpm build
+npm install && npm run build
 npx openeral
 ```
 
-That's it. OpenEral starts the OpenShell gateway, creates the sandbox, and Claude Code launches inside it.
+`npx openeral` uses the published Docker image `ghcr.io/sandys/openeral/sandbox:just-bash` — no local Docker build required. OpenEral starts the OpenShell gateway, pulls the published image, creates the sandbox, and Claude Code launches inside it.
 
 **Add cost tracking** with [StringCost](https://stringcost.com):
 
@@ -128,9 +120,12 @@ Claude's API traffic routes through StringCost for cost tracking.
 
 ## Commands
 
+All commands work with the published image by default. Add `--dev` (or `-d`) to use your locally-built image instead.
+
 | Command | Description |
 |---|---|
-| `npx openeral` | Launch Claude Code in an OpenShell sandbox |
+| `npx openeral` | Launch Claude Code (published image `ghcr.io/sandys/openeral/sandbox:just-bash`) |
+| `npx openeral --dev` | Launch Claude Code (local dev image `openeral-sandbox:dev`) |
 | `npx openeral presign` | Show the currently stored StringCost presign (URL, session ID, created date) |
 | `npx openeral presign renew` | Create a new permanent presign and store it — prompts for API keys if not in env |
 | `npx openeral stats` | Show API usage statistics (cost, tokens, model distribution, cache hit rate) |
@@ -264,6 +259,8 @@ The `pg` command is automatically available — OpenEral writes a `CLAUDE.md` th
 | `DATABASE_URL` | (optional) | PostgreSQL connection string — enables persistence and `pg` |
 | `OPENERAL_WORKSPACE_ID` | hostname | Workspace identifier |
 | `OPENERAL_HOME` | `/tmp/openeral-<id>` | Local workspace directory |
+| `OPENERAL_SANDBOX_IMAGE` | `ghcr.io/sandys/openeral/sandbox:just-bash` | Override the production sandbox image |
+| `OPENERAL_DEV_IMAGE` | `openeral-sandbox:dev` | Override the dev sandbox image (used with `--dev`/`-d`) |
 
 ## How it works
 
@@ -296,6 +293,39 @@ await shell.exec('echo hello > /home/agent/notes.txt') // persisted
 ```
 
 This path uses [just-bash](https://github.com/vercel-labs/just-bash) with PostgreSQL-backed virtual mounts at `/db` (read-only) and `/home/agent` (read-write).
+
+## Development
+
+For contributors who want to test local changes to the sandbox image.
+
+**Build the dev image:**
+
+```bash
+# From the repo root
+docker build -f sandboxes/openeral/Dockerfile -t openeral-sandbox:dev .
+```
+
+**Launch with the local dev image:**
+
+```bash
+npx openeral --dev                  # launch (local image)
+npx openeral -d                     # same, short flag
+
+# All subcommands accept --dev/-d
+npx openeral --dev presign
+npx openeral --dev presign renew
+npx openeral --dev stats
+npx openeral --dev analyze
+npx openeral --dev apply
+npx openeral --dev apply --dry-run
+npx openeral --dev -- -p 'hello'
+```
+
+Override the dev image name via env var (if you tagged it differently):
+
+```bash
+OPENERAL_DEV_IMAGE=my-image:tag npx openeral --dev
+```
 
 ## Build & test
 
