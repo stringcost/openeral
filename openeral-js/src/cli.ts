@@ -32,7 +32,76 @@
 
 import { spawn, spawnSync } from 'node:child_process';
 import { homedir } from 'node:os';
-import { mkdirSync, writeFileSync, existsSync, chmodSync,copyFileSync } from 'node:fs';
+import { mkdirSync, writeFileSync, readFileSync, existsSync, chmodSync, copyFileSync } from 'node:fs';
+import { join } from 'node:path';
+
+// ---------------------------------------------------------------------------
+// Presign persistence — store one permanent presign in ~/.config/openeral/
+// ---------------------------------------------------------------------------
+
+interface StoredPresign {
+  /** Full URL as returned by StringCost (e.g. .../t/{JWT}/v1/messages) */
+  url: string;
+  createdAt: string;
+}
+
+function getPresignConfigPath(): string {
+  return join(homedir(), '.config', 'openeral', 'presign.json');
+}
+
+function loadStoredPresign(): StoredPresign | null {
+  const path = getPresignConfigPath();
+  if (!existsSync(path)) return null;
+  try {
+    const data = JSON.parse(readFileSync(path, 'utf8')) as StoredPresign;
+    if (data?.url) return data;
+    return null;
+  } catch {
+    return null;
+  }
+}
+
+function saveStoredPresign(url: string): void {
+  const configDir = join(homedir(), '.config', 'openeral');
+  mkdirSync(configDir, { recursive: true });
+  writeFileSync(
+    getPresignConfigPath(),
+    JSON.stringify({ url, createdAt: new Date().toISOString() }, null, 2),
+  );
+}
+
+/**
+ * Create a new StringCost presign with infinite expire_time, max_uses, and cost_limit.
+ * Returns the full presign URL as returned by StringCost.
+ */
+async function createPresignUrl(anthropicKey: string, stringcostKey: string): Promise<string> {
+  const response = await fetch('https://app.stringcost.com/v1/presign', {
+    method: 'POST',
+    headers: {
+      'Authorization': `Bearer ${stringcostKey}`,
+      'Content-Type': 'application/json',
+    },
+    body: JSON.stringify({
+      provider: 'anthropic',
+      client_api_key: anthropicKey,
+      path: ['/v1/messages'],
+      expires_in: -1,
+      max_uses: -1,
+      cost_limit: 10000000,
+      tags: ['openeral'],
+      metadata: { source: 'openeral' },
+    }),
+  });
+
+  if (!response.ok) {
+    const text = await response.text();
+    throw new Error(`StringCost presign failed (${response.status}): ${text}`);
+  }
+
+  const data = await response.json() as { url: string };
+  if (!data?.url) throw new Error('StringCost presign returned no URL');
+  return data.url;
+}
 
 function writeClaudeSettings(path: string): void {
   // Default security settings for Claude Code (Level 1 sandbox)
@@ -157,11 +226,24 @@ export function parseCliArgs(args: string[]): ParsedArgs {
 function printHelp(): void {
   console.log(`Usage:
   openeral [options] [-- claude-args]    Launch Claude Code in an OpenShell sandbox
-  openeral memory refresh [options]      Refresh memory system
+  openeral presign                        Show the current StringCost presign
+  openeral presign renew                  Create and store a new StringCost presign
+  openeral stats [options]                Show API usage statistics
+  openeral analyze [options]              Analyze session history and suggest optimizations
+  openeral apply [options]                Apply optimization suggestions to project files
+  openeral memory refresh [options]       Refresh memory system
 
 Launch Options:
   --workspace, -w <id>    Workspace ID (default: openeral-claude)
   --help, -h              Show this help
+
+Stats / Analyze / Apply Options:
+  --workspace, -w <id>    Workspace ID (default: hostname)
+  --days <n>              Number of days to look back (default: 7)
+  --project-root <p>      Project root directory (analyze/apply only)
+  --dry-run               Preview changes without applying (apply only)
+  --proposal <id>         Apply a specific proposal by ID (apply only)
+  --json                  Output as JSON (analyze only)
 
 Memory Refresh Options:
   --workspace, -w <id>    Workspace ID
@@ -178,13 +260,14 @@ Environment Variables:
   OPENERAL_SANDBOX_IMAGE   Override sandbox image (default: ghcr.io/sandys/openeral/sandbox:just-bash)
 
 Features:
+  - Persistent StringCost presign — one presign stored forever, reused across all sessions
   - Claude has automatic access to your home directory and mounted drives
-  - StringCost cost tracking (when STRINGCOST_API_KEY is set)
   - Database persistence with PGlite (or external PostgreSQL)
-  - Token usage monitoring and optimization commands
+  - API usage statistics and optimization suggestions
 
 Notes:
-  - Workspace IDs are automatically normalized to be Kubernetes-compliant (lowercase, alphanumeric + hyphens)
+  - Presign is stored in ~/.config/openeral/presign.json (expires_in=-1, max_uses=-1, cost_limit=-1)
+  - Workspace IDs are automatically normalized to be Kubernetes-compliant
   - Claude CLI will be automatically installed in the sandbox if not present
   - Existing sandboxes with the same name will be cleaned up automatically
   - On first run, the gateway will be configured to access your filesystem
@@ -884,6 +967,121 @@ async function ensurePortRoutingInContainer(): Promise<void> {
   process.stderr.write(`\x1b[32m✓ Port routing: container:8080 → pod ${podIp}:8080\x1b[0m\n`);
 }
 
+// ---------------------------------------------------------------------------
+// presign commands
+// ---------------------------------------------------------------------------
+
+/**
+ * `npx openeral presign` — show the currently stored StringCost presign.
+ */
+async function cmdPresignShow(): Promise<void> {
+  const stored = loadStoredPresign();
+  if (!stored) {
+    console.log('No presign stored.');
+    console.log('');
+    console.log('Set STRINGCOST_API_KEY and ANTHROPIC_API_KEY, then run:');
+    console.log('  npx openeral presign renew');
+    return;
+  }
+
+  const { decodePresignUrl } = await import('./optimize/stringcost-api.js');
+  const decoded = decodePresignUrl(stored.url);
+
+  console.log('StringCost presign (currently in use):');
+  console.log(`  Proxy URL:  ${stored.url.replace(/\/v1\/.*$/, '')}`);
+  console.log(`  Full URL:   ${stored.url}`);
+  console.log(`  Created:    ${new Date(stored.createdAt).toLocaleString()}`);
+  if (decoded.sessionId) console.log(`  Session ID: ${decoded.sessionId}`);
+  console.log('');
+  console.log('Settings: expires_in=-1  max_uses=-1  cost_limit=10$  (all infinite, never exhausts)');
+}
+
+/**
+ * `npx openeral presign renew` — create a new StringCost presign and persist it.
+ *
+ * Prompts for ANTHROPIC_API_KEY and STRINGCOST_API_KEY if not set in env.
+ * Writes the new presign to:
+ *   - ~/.config/openeral/presign.json  (openeral's own cache)
+ *   - ~/.claude/settings.json          (Claude Code picks this up automatically)
+ */
+async function cmdPresignRenew(): Promise<void> {
+  let anthropicKey = (process.env.ANTHROPIC_API_KEY ?? '').replace('@anthropic_api_key', '').trim();
+  let stringcostKey = (process.env.STRINGCOST_API_KEY ?? '').replace('@stringcost_api_key', '').trim();
+
+  if (!anthropicKey || !stringcostKey) {
+    if (!process.stdin.isTTY) {
+      process.stderr.write(
+        '\x1b[31merror: ANTHROPIC_API_KEY and STRINGCOST_API_KEY must be set\x1b[0m\n',
+      );
+      process.exit(1);
+    }
+
+    const { createInterface } = await import('node:readline');
+    const rl = createInterface({ input: process.stdin, output: process.stdout });
+    const question = (prompt: string): Promise<string> =>
+      new Promise(resolve => rl.question(prompt, resolve));
+
+    try {
+      if (!anthropicKey) {
+        anthropicKey = (await question('Anthropic API key: ')).trim();
+      }
+      if (!stringcostKey) {
+        stringcostKey = (await question('StringCost API key: ')).trim();
+      }
+    } finally {
+      rl.close();
+    }
+  }
+
+  if (!anthropicKey || !stringcostKey) {
+    process.stderr.write('\x1b[31merror: both API keys are required\x1b[0m\n');
+    process.exit(1);
+  }
+
+  console.log('Creating new presign (expires_in=-1, max_uses=-1, cost_limit=10$)...');
+
+  try {
+    const fullUrl = await createPresignUrl(anthropicKey, stringcostKey);
+    const baseUrl = fullUrl.replace(/\/v1\/.*$/, '');
+
+    // 1. Store in openeral's own config
+    saveStoredPresign(fullUrl);
+    console.log(`\x1b[32m✓ Stored in ${getPresignConfigPath()}\x1b[0m`);
+
+    // 2. Write into host Claude Code settings so Claude picks it up automatically
+    const settingsPath = join(homedir(), '.claude', 'settings.json');
+    try {
+      mkdirSync(join(homedir(), '.claude'), { recursive: true });
+      let settings: Record<string, unknown> = {};
+      if (existsSync(settingsPath)) {
+        try {
+          settings = JSON.parse(readFileSync(settingsPath, 'utf8')) as Record<string, unknown>;
+        } catch { /* corrupt/empty — start fresh */ }
+      }
+      const env = (settings.env ?? {}) as Record<string, string>;
+      env.ANTHROPIC_BASE_URL = baseUrl;
+      env.ANTHROPIC_AUTH_TOKEN = 'dummy';
+      settings.env = env;
+      writeFileSync(settingsPath, JSON.stringify(settings, null, 2));
+      console.log(`\x1b[32m✓ Written to ${settingsPath}\x1b[0m`);
+    } catch (err) {
+      process.stderr.write(
+        `\x1b[33mwarning: could not write to ~/.claude/settings.json: ${(err as Error).message}\x1b[0m\n`,
+      );
+    }
+
+    console.log('');
+    console.log(`\x1b[32m✓ Presign created and stored\x1b[0m`);
+    console.log(`  Proxy URL: ${baseUrl}`);
+    console.log('');
+    console.log('This presign will be reused for all future sessions (never expires).');
+    console.log('Run "npx openeral presign" to view it, or "npx openeral presign renew" to replace it.');
+  } catch (err) {
+    process.stderr.write(`\x1b[31merror: ${(err as Error).message}\x1b[0m\n`);
+    process.exit(1);
+  }
+}
+
 /**
  * Launch Claude Code inside an OpenShell sandbox.
  *
@@ -1105,52 +1303,36 @@ async function launchViaSandbox(workspaceId: string, claudeArgs: string[]): Prom
   // Check if sandbox already exists and delete it
   await cleanupExistingSandbox(workspaceId);
 
-  // StringCost presign integration
+  // StringCost presign integration — reuse a stored permanent presign, or create one.
+  // The presign has expires_in=-1, max_uses=-1, cost_limit=-1 so it never exhausts.
+  // Run `npx openeral presign renew` to replace it.
   let stringcostUrl: string | undefined;
   if (process.env.STRINGCOST_API_KEY && process.env.ANTHROPIC_API_KEY) {
-    process.stderr.write('\x1b[2mopeneral: presigning with StringCost...\x1b[0m\n');
-    
     const anthropicKey = process.env.ANTHROPIC_API_KEY.replace('@anthropic_api_key', '').trim();
     const stringcostKey = process.env.STRINGCOST_API_KEY.replace('@stringcost_api_key', '').trim();
-    
-    try {
-      const presignResponse = await fetch('https://app.stringcost.com/v1/presign', {
-        method: 'POST',
-        headers: {
-          'Authorization': `Bearer ${stringcostKey}`,
-          'Content-Type': 'application/json',
-        },
-        body: JSON.stringify({
-          provider: 'anthropic',
-          client_api_key: anthropicKey,
-          path: ['/v1/messages'],
-          expires_in: -1,
-          max_uses: -1,
-          tags: ['openeral', workspaceId],
-          metadata: { source: 'openeral', workspace: workspaceId },
-        }),
-      });
 
-      if (presignResponse.ok) {
-        const presignData = await presignResponse.json() as { url: string };
-        // Extract base URL (remove /v1/messages suffix)
-        stringcostUrl = presignData.url.replace(/\/v1\/.*$/, '');
-        process.stderr.write('\x1b[32m✓ StringCost presign successful\x1b[0m\n');
-        process.stderr.write(`\x1b[2m  Proxy URL: ${stringcostUrl}\x1b[0m\n`);
-      } else {
-        const errorText = await presignResponse.text();
+    const stored = loadStoredPresign();
+    if (stored) {
+      // Reuse the stored permanent presign — no network call needed
+      stringcostUrl = stored.url.replace(/\/v1\/.*$/, '');
+      process.stderr.write('\x1b[32m✓ Using stored StringCost presign\x1b[0m\n');
+      process.stderr.write(`\x1b[2m  Proxy URL: ${stringcostUrl}\x1b[0m\n`);
+    } else {
+      process.stderr.write('\x1b[2mopeneral: no stored presign — creating permanent presign...\x1b[0m\n');
+      try {
+        const fullUrl = await createPresignUrl(anthropicKey, stringcostKey);
+        saveStoredPresign(fullUrl);
+        stringcostUrl = fullUrl.replace(/\/v1\/.*$/, '');
+        process.stderr.write('\x1b[32m✓ StringCost presign created and stored\x1b[0m\n');
+        // process.stderr.write(`\x1b[2m  Proxy URL: ${stringcostUrl}\x1b[0m\n`);
+        // process.stderr.write('\x1b[2m  (expires_in=-1, max_uses=-1, cost_limit=10$ 1\x1b[0m\n');
+      } catch (err) {
+        const error = err instanceof Error ? err : new Error(String(err));
         process.stderr.write(
-          '\x1b[33mwarning: StringCost presign failed: ' + presignResponse.status + '\x1b[0m\n' +
-          '\x1b[2m  ' + errorText + '\x1b[0m\n' +
-          '\x1b[2m  Continuing without StringCost tracking...\x1b[0m\n'
+          '\x1b[33mwarning: StringCost presign error: ' + error.message + '\x1b[0m\n' +
+          '\x1b[2m  Continuing without StringCost tracking...\x1b[0m\n',
         );
       }
-    } catch (err) {
-      const error = err instanceof Error ? err : new Error(String(err));
-      process.stderr.write(
-        '\x1b[33mwarning: StringCost presign error: ' + error.message + '\x1b[0m\n' +
-        '\x1b[2m  Continuing without StringCost tracking...\x1b[0m\n'
-      );
     }
   }
 
@@ -1364,12 +1546,36 @@ fi
 export async function main() {
   const args = process.argv.slice(2);
 
-  // Delegate optimize subcommand to its own CLI module
+  // presign show / renew
+  if (args[0] === 'presign') {
+    if (args[1] === 'renew') {
+      await cmdPresignRenew();
+    } else {
+      await cmdPresignShow();
+    }
+    return;
+  }
+
+  // stats / analyze / apply — forward to optimize CLI, passing stored presign URL via env
+  if (args[0] === 'stats' || args[0] === 'analyze' || args[0] === 'apply') {
+    const { fileURLToPath } = await import('node:url');
+    const optimizeCliPath = fileURLToPath(new URL('./optimize/cli.js', import.meta.url));
+    const env: NodeJS.ProcessEnv = { ...process.env };
+    const stored = loadStoredPresign();
+    if (stored) env['OPENERAL_PRESIGN_URL'] = stored.url;
+    const child = spawn('node', [optimizeCliPath, ...args], { stdio: 'inherit', env });
+    child.on('exit', (code) => process.exit(code ?? 0));
+    return;
+  }
+
+  // optimize <subcommand> — backwards compatibility alias
   if (args[0] === 'optimize') {
     const { fileURLToPath } = await import('node:url');
     const optimizeCliPath = fileURLToPath(new URL('./optimize/cli.js', import.meta.url));
-
-    const child = spawn('node', [optimizeCliPath, ...args.slice(1)], { stdio: 'inherit' });
+    const env: NodeJS.ProcessEnv = { ...process.env };
+    const stored = loadStoredPresign();
+    if (stored) env['OPENERAL_PRESIGN_URL'] = stored.url;
+    const child = spawn('node', [optimizeCliPath, ...args.slice(1)], { stdio: 'inherit', env });
     child.on('exit', (code) => process.exit(code ?? 0));
     return;
   }

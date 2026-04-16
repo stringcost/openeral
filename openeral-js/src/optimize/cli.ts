@@ -15,13 +15,13 @@ async function main() {
 
   if (!command || command === 'help') {
     console.log(`
-Openeral Optimizer Commands
+Openeral Commands
 
 Usage:
-  npx openeral optimize <command> [options]
+  npx openeral <command> [options]
 
 Commands:
-  stats                Show API call statistics (costs, tokens, cache hits)
+  stats                Show API usage statistics (costs, tokens, cache hits)
   analyze              Analyze session history and propose changes to reduce future token usage
   apply                Apply proposals from analyze (patches CLAUDE.md, creates context file, etc.)
   test-db              Test database connection
@@ -49,14 +49,16 @@ Proposal IDs:
 Note:
   Database is embedded PGlite (auto-starts, no Docker needed).
   Set DATABASE_URL to use an external PostgreSQL instead.
+  Set STRINGCOST_API_KEY to sync live usage data from StringCost before showing stats.
   Run sessions via 'npx openeral' first so analyze has usage data.
 
 Examples:
-  npx openeral optimize analyze
-  npx openeral optimize apply
-  npx openeral optimize apply --dry-run
-  npx openeral optimize apply --proposal model-routing
-  npx openeral optimize apply --proposal context-file
+  npx openeral stats
+  npx openeral analyze
+  npx openeral apply
+  npx openeral apply --dry-run
+  npx openeral apply --proposal model-routing
+  npx openeral apply --proposal context-file
 `);
     process.exit(0);
   }
@@ -136,8 +138,31 @@ Examples:
     await runMigrations(pool);
 
     if (command === 'stats') {
+      // Sync from StringCost first if we have a presign URL and API key
+      const presignUrl = process.env.OPENERAL_PRESIGN_URL;
+      const stringcostKey = process.env.STRINGCOST_API_KEY;
+      if (presignUrl && stringcostKey) {
+        console.log('Syncing usage data from StringCost...');
+        try {
+          const { decodePresignUrl, syncStringCostData } = await import('./stringcost-api.js');
+          const decoded = decodePresignUrl(presignUrl);
+          const result = await syncStringCostData(pool, workspaceId, stringcostKey, {
+            sessionId: decoded.sessionId,
+            daysBack: days,
+          });
+          if (result.stored > 0) {
+            console.log(`  Synced ${result.stored} new events from StringCost`);
+          } else {
+            console.log('  No new events to sync');
+          }
+        } catch (err: any) {
+          console.warn(`  Warning: could not sync from StringCost: ${err.message}`);
+        }
+        console.log('');
+      }
+
       const stats = await getOptimizationStats(pool, workspaceId, days);
-      console.log(formatStats(stats));
+      console.log(formatStats(stats, days));
     } else if (command === 'analyze') {
       const { analyzePromptSurface, formatPromptSurfaceReport } = await import('./analyzer.js');
       const report = await analyzePromptSurface({

@@ -89,7 +89,12 @@ export interface StrategicReport {
   sessionStats: SessionStats;
   promptSurface: PromptSurface;
   proposals: Proposal[];
-  hotspots: Array<{ relPath: string; tokens: number }>;
+  /**
+   * null  = file-path tracking is not available (StringCost only stores token counts, not file paths)
+   * []    = tracking available, no large files found
+   * [...] = tracking available, large files found
+   */
+  hotspots: Array<{ relPath: string; tokens: number }> | null;
 }
 
 export interface AnalyzeOptions {
@@ -371,16 +376,33 @@ async function findActualHotspots(
   daysBack: number,
   projectRoot: string,
   topN = 5
-): Promise<Array<{ relPath: string; tokens: number }>> {
-  if (!pool) {
-    // No session data - return empty array instead of guessing
-    return [];
-  }
+): Promise<Array<{ relPath: string; tokens: number }> | null> {
+  if (!pool) return null;
 
   try {
-    // Query for files that were actually read (from metadata)
+    // First: check whether any rows in the window have file_path in metadata at all.
+    // StringCost events never populate file_path — only the old proxy-based optimizer did.
+    // If no rows have it, we don't have the data; return null to signal "unavailable"
+    // rather than [] which would mean "available, nothing large found".
+    const hasFilePathData = await pool.query<{ has_data: string }>(
+      `SELECT EXISTS (
+         SELECT 1 FROM _openeral.optimization_metrics
+         WHERE workspace_id = $1
+           AND timestamp > NOW() - INTERVAL '1 day' * $2
+           AND metadata->>'file_path' IS NOT NULL
+       ) AS has_data`,
+      [workspaceId, daysBack],
+    );
+
+    if (hasFilePathData.rows[0]?.has_data !== 'true') {
+      // No file-path tracking data — StringCost only logs token counts per API call,
+      // not which files were read inside each call.
+      return null;
+    }
+
+    // File-path data exists — query it
     const result = await pool.query<{ file_path: string; read_count: string }>(
-      `SELECT 
+      `SELECT
          metadata->>'file_path' AS file_path,
          COUNT(*)::text AS read_count
        FROM _openeral.optimization_metrics
@@ -390,35 +412,30 @@ async function findActualHotspots(
        GROUP BY metadata->>'file_path'
        ORDER BY COUNT(*) DESC
        LIMIT $3`,
-      [workspaceId, daysBack, topN * 2] // Get more than needed, filter below
+      [workspaceId, daysBack, topN * 2],
     );
 
     const hotspots: Array<{ relPath: string; tokens: number }> = [];
-    
+
     for (const row of result.rows) {
       const filePath = row.file_path;
       if (!filePath) continue;
-      
-      // Try to read the file to estimate tokens
+
       const fullPath = join(projectRoot, filePath);
       try {
         const content = readFileSync(fullPath, 'utf8');
         const tokens = estimateTokens(content);
-        
-        // Only include if it's actually large (>1000 tokens)
         if (tokens >= 1000) {
           hotspots.push({ relPath: filePath, tokens });
         }
       } catch {
-        // File doesn't exist or can't be read - skip it
         continue;
       }
     }
 
     return hotspots.sort((a, b) => b.tokens - a.tokens).slice(0, topN);
   } catch {
-    // Query failed - return empty array
-    return [];
+    return null;
   }
 }
 
@@ -737,21 +754,30 @@ export function formatPromptSurfaceReport(report: StrategicReport): string {
   }
 
   // ── Hotspots ──────────────────────────────────────────────────────────────
-  if (report.hotspots.length > 0) {
-    lines.push('## Large Files Actually Read');
-    lines.push('');
+  lines.push('## Large Files Read During Sessions');
+  lines.push('');
+  if (report.hotspots === null) {
+    // StringCost proxy logs token counts per API call but not which files were read.
+    // File-path tracking was only available in the old proxy-based optimizer.
+    lines.push('  ⚠ File access data is not available with the current tracking setup.');
+    lines.push('  StringCost records token counts per API call but does not track which');
+    lines.push('  individual files Claude read inside each call.');
+    lines.push('  If your sessions are reading many large files, this section will remain empty.');
+    if (s.hasData && s.avgTokensPerCall > 1000) {
+      lines.push('');
+      lines.push(`  ℹ Your avg ${s.avgTokensPerCall.toLocaleString()} tokens/call suggests files may be`);
+      lines.push('  read in full. Consider adding lazy-reading rules (npx openeral apply --proposal lazy-reading).');
+    }
+  } else if (report.hotspots.length > 0) {
     lines.push('  These files were read during your sessions and are expensive (>1000 tokens each).');
     lines.push('  Consider using Grep to find specific sections instead of reading the full file.');
     for (const h of report.hotspots) {
       lines.push(`    ${h.relPath.padEnd(50)} ~${h.tokens} tokens`);
     }
-    lines.push('');
-  } else if (s.hasData) {
-    lines.push('## Large Files Actually Read');
-    lines.push('');
-    lines.push('  ✓ No large files were read during your sessions. Good job keeping reads targeted!');
-    lines.push('');
+  } else {
+    lines.push('  ✓ No large files (>1000 tokens) were read during your sessions.');
   }
+  lines.push('');
 
   return lines.join('\n');
 }

@@ -62,7 +62,8 @@
       "Bash(timeout 120 npx openeral --print \"say hello world\")",
       "Bash(docker info:*)",
       "Bash(npx openeral:*)",
-      "Bash(npm run *)"
+      "Bash(npm run *)",
+      "Bash(pnpm test *)"
     ]
   }
 }
