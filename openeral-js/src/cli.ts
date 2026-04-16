@@ -8,7 +8,9 @@
  * starts the openeral-bash daemon, then execs `claude`.
  *
  * Usage:
- *   npx openeral                      # interactive Claude Code
+ *   npx openeral                      # interactive Claude Code (published image)
+ *   npx openeral --dev                # interactive Claude Code (local dev image)
+ *   npx openeral -d                   # same as --dev (short flag)
  *   npx openeral -- -p 'hello'        # non-interactive
  *   npx openeral --workspace myid     # custom workspace ID
  *   npx openeral optimize stats       # show optimization stats
@@ -22,6 +24,7 @@
  *   DATABASE_URL            Database connection string (uses PGlite if not provided)
  *   OPENERAL_WORKSPACE_ID   Workspace ID (default: openeral-claude, normalized to lowercase)
  *   OPENERAL_SANDBOX_IMAGE  Override sandbox image (default: ghcr.io/sandys/openeral/sandbox:just-bash)
+ *   OPENERAL_DEV_IMAGE      Override dev sandbox image (default: openeral-sandbox:dev, used with --dev)
  *
  * Features:
  *   - Automatic TLS certificate generation for OpenShell gateway
@@ -35,7 +38,8 @@
 import { spawn, spawnSync } from 'node:child_process';
 import { homedir } from 'node:os';
 import { mkdirSync, writeFileSync, readFileSync, existsSync, chmodSync, copyFileSync } from 'node:fs';
-import { join } from 'node:path';
+import { join, dirname } from 'node:path';
+import { fileURLToPath } from 'node:url';
 
 // ---------------------------------------------------------------------------
 // Presign persistence — store one permanent presign in ~/.config/openeral/
@@ -45,6 +49,8 @@ interface StoredPresign {
   /** Full URL as returned by StringCost (e.g. .../t/{JWT}/v1/messages) */
   url: string;
   createdAt: string;
+  /** StringCost API key stored so skill downloads work without the env var */
+  stringcostApiKey?: string;
 }
 
 function getPresignConfigPath(): string {
@@ -63,15 +69,13 @@ function loadStoredPresign(): StoredPresign | null {
   }
 }
 
-function saveStoredPresign(url: string): void {
+function saveStoredPresign(url: string, apiKey?: string): void {
   const configDir = join(homedir(), '.config', 'openeral');
   mkdirSync(configDir, { recursive: true, mode: 0o700 });
   const presignPath = getPresignConfigPath();
-  writeFileSync(
-    presignPath,
-    JSON.stringify({ url, createdAt: new Date().toISOString() }, null, 2),
-    { mode: 0o600 }
-  );
+  const data: StoredPresign = { url, createdAt: new Date().toISOString() };
+  if (apiKey) data.stringcostApiKey = apiKey;
+  writeFileSync(presignPath, JSON.stringify(data, null, 2), { mode: 0o600 });
   // Ensure restrictive permissions (covers cases where mode is ignored)
   try {
     chmodSync(presignPath, 0o600);
@@ -207,7 +211,8 @@ export function parseCliArgs(args: string[]): ParsedArgs {
 
 function printHelp(): void {
   console.log(`Usage:
-  openeral [options] [-- claude-args]    Launch Claude Code in an OpenShell sandbox
+  openeral [options] [-- claude-args]    Launch Claude Code (published image)
+  openeral --dev [options] [-- args]     Launch Claude Code (local dev image)
   openeral presign                        Show the current StringCost presign
   openeral presign renew                  Create and store a new StringCost presign
   openeral stats [options]                Show API usage statistics
@@ -217,6 +222,7 @@ function printHelp(): void {
 
 Launch Options:
   --workspace, -w <id>    Workspace ID (default: openeral-claude)
+  --dev, -d               Use local dev image instead of published image
   --help, -h              Show this help
 
 Stats / Analyze / Apply Options:
@@ -245,7 +251,8 @@ Auth (presign-first model):
 Optional env:
   DATABASE_URL             Database connection string (uses PGlite if not provided)
   OPENERAL_WORKSPACE_ID    Default workspace ID (will be normalized to lowercase)
-  OPENERAL_SANDBOX_IMAGE   Override sandbox image (default: ghcr.io/sandys/openeral/sandbox:just-bash)
+  OPENERAL_SANDBOX_IMAGE   Override prod sandbox image (default: ghcr.io/sandys/openeral/sandbox:just-bash)
+  OPENERAL_DEV_IMAGE       Override dev sandbox image (default: openeral-sandbox:dev, used with --dev/-d)
   OPENERAL_AUTO_FIX_TLS    Set to 1 to suppress the TLS regeneration confirmation delay
 
 Features:
@@ -261,6 +268,60 @@ Notes:
   - Existing sandboxes with the same name will be cleaned up automatically
   - On first run, the gateway will be configured to access your filesystem
 `);
+}
+
+// ---------------------------------------------------------------------------
+// StringCost org skills
+// ---------------------------------------------------------------------------
+
+/**
+ * Fetch the org skills bundle from StringCost and return only the validated entries.
+ *
+ * Handles timeout, HTTP errors, and slug validation.
+ * Slugs are validated against `[a-z0-9][a-z0-9-]*` to prevent path traversal.
+ *
+ * Throws on network/HTTP failure — callers decide whether to propagate or warn.
+ */
+export async function fetchOrgSkills(apiKey: string): Promise<Array<{ slug: string; content: string }>> {
+  const controller = new AbortController();
+  const timeoutId = setTimeout(() => controller.abort(), 10000);
+
+  let res: Response;
+  try {
+    res = await fetch('https://app.stringcost.com/v2/skills/bundle', {
+      headers: { Authorization: `Bearer ${apiKey}` },
+      signal: controller.signal,
+    });
+  } finally {
+    clearTimeout(timeoutId);
+  }
+
+  if (!res.ok) throw new Error(`HTTP ${res.status}`);
+  const data = (await res.json()) as { skills: Array<{ slug: string; content: string }> };
+
+  return (data.skills ?? []).filter(s => /^[a-z0-9][a-z0-9-]*$/.test(s.slug));
+}
+
+/**
+ * Download org skills from StringCost and write them into `homeDir/.claude/skills/`.
+ *
+ * Each skill is a directory named by its slug with a `SKILL.md` file inside.
+ *
+ * Returns the number of skills written.
+ */
+export async function downloadOrgSkills(homeDir: string, apiKey: string): Promise<number> {
+  const skills = await fetchOrgSkills(apiKey);
+
+  const skillsDir = join(homeDir, '.claude', 'skills');
+  mkdirSync(skillsDir, { recursive: true });
+
+  for (const skill of skills) {
+    const skillDir = join(skillsDir, skill.slug);
+    mkdirSync(skillDir, { recursive: true });
+    writeFileSync(join(skillDir, 'SKILL.md'), skill.content);
+  }
+
+  return skills.length;
 }
 
 // ---------------------------------------------------------------------------
@@ -345,14 +406,39 @@ async function fixBrokenTls(): Promise<boolean> {
   ], { stdio: 'pipe', timeout: 10000 });
   const clientTlsExists = secretCheck.status === 0 && secretCheck.stdout.toString().trim() !== '';
 
-  if (tlsOk && clientTlsExists) {
+  // Also verify host mTLS cert files exist — if they're missing the openshell CLI falls
+  // back to non-TLS connections even when the k8s secret exists, causing the
+  // "received corrupt message of type InvalidContentType" error on the server.
+  const hostMtlsDir = join(homedir(), '.config', 'openshell', 'gateways', 'openshell', 'mtls');
+  const hostCertsExist =
+    existsSync(join(hostMtlsDir, 'ca.crt')) &&
+    existsSync(join(hostMtlsDir, 'tls.crt')) &&
+    existsSync(join(hostMtlsDir, 'tls.key'));
+
+  if (tlsOk && clientTlsExists && hostCertsExist) {
     return true;
   }
 
   if (!clientTlsExists) {
     process.stderr.write('\x1b[33mopenshell-client-tls secret missing — TLS certificates need regeneration\x1b[0m\n');
+  } else if (!hostCertsExist) {
+    process.stderr.write('\x1b[33mHost mTLS certificates missing — TLS certificates need regeneration\x1b[0m\n');
   } else {
     process.stderr.write('\x1b[33mTLS broken (tls handshake eof) — TLS certificates need regeneration\x1b[0m\n');
+  }
+
+  // Verify openssl is available before attempting cert generation
+  const opensslCheck = spawnSync('openssl', ['version'], { stdio: 'pipe', timeout: 5000 });
+  if (opensslCheck.error || opensslCheck.status !== 0) {
+    process.stderr.write(
+      '\x1b[31merror: openssl not found — required for TLS certificate generation.\x1b[0m\n' +
+      'Install it with your package manager:\n' +
+      '  Debian/Ubuntu:  sudo apt install openssl\n' +
+      '  RHEL/Fedora:    sudo dnf install openssl\n' +
+      '  Arch Linux:     sudo pacman -S openssl\n' +
+      '  Alpine:         sudo apk add openssl\n'
+    );
+    return false;
   }
 
   // Compliance: require explicit confirmation for destructive operations
@@ -661,16 +747,58 @@ async function waitForOpenshellPod(): Promise<boolean> {
 }
 
 /**
+ * Expand a short image reference to its fully-qualified docker.io form.
+ *
+ * containerd always stores image refs with the full registry prefix, so
+ * "openeral-sandbox:dev" becomes "docker.io/library/openeral-sandbox:dev".
+ * Short names passed to `ctr images tag` are NOT expanded automatically,
+ * causing silent failures when the source ref isn't found.
+ *
+ * Rules (same as containerd's short-name expansion):
+ *   - No slash               → docker.io/library/<ref>   (e.g. "ubuntu:22.04")
+ *   - First component has . or : or is "localhost" → already has registry
+ *   - Otherwise              → docker.io/<ref>            (e.g. "sandys/app:v1")
+ */
+function expandImageRef(ref: string): string {
+  const firstSlash = ref.indexOf('/');
+  if (firstSlash === -1) {
+    return `docker.io/library/${ref}`;
+  }
+  const firstComponent = ref.slice(0, firstSlash);
+  if (firstComponent.includes('.') || firstComponent.includes(':') || firstComponent === 'localhost') {
+    return ref; // already has explicit registry
+  }
+  return `docker.io/${ref}`;
+}
+
+/**
+ * Walk up from the compiled file's directory to find the repository root.
+ *
+ * Looks for `sandboxes/openeral/Dockerfile` as a landmark file so the
+ * result is correct regardless of where in the build output the CLI ends up.
+ * Returns `null` if the root cannot be found within `maxLevels` of traversal.
+ */
+export function findRepoRoot(maxLevels = 6): string | null {
+  let dir = dirname(fileURLToPath(import.meta.url));
+  for (let i = 0; i < maxLevels; i++) {
+    if (existsSync(join(dir, 'sandboxes', 'openeral', 'Dockerfile'))) {
+      return dir;
+    }
+    const parent = dirname(dir);
+    if (parent === dir) break; // filesystem root
+    dir = parent;
+  }
+  return null;
+}
+
+/**
  * Ensure the sandbox image is available in the k3s cluster.
  * Pre-pulls the image on the host and imports it into k3s to avoid DNS issues.
  */
 async function ensureSandboxImage(sandboxImage: string): Promise<void> {
-  // crictl output: IMAGE                              TAG        IMAGE ID   SIZE
-  // Image name and tag are space-separated columns, not colon-separated.
-  // Split at last colon to get repo and tag (handles tags like "just-bash").
-  const colonIdx = sandboxImage.lastIndexOf(':');
-  const imageRepo = colonIdx >= 0 ? sandboxImage.slice(0, colonIdx) : sandboxImage;
-  const imageTag  = colonIdx >= 0 ? sandboxImage.slice(colonIdx + 1) : 'latest';
+  // Containerd stores all image refs with their fully-qualified registry prefix.
+  // Expand the short name once so every k3s operation uses the canonical form.
+  const expandedSandboxImage = expandImageRef(sandboxImage);
 
   const K3S_CTR = [
     'exec', 'openshell-cluster-openshell',
@@ -686,8 +814,13 @@ async function ensureSandboxImage(sandboxImage: string): Promise<void> {
 
     if (result.status !== 0) return false;
     const refs = result.stdout.toString();
-    // ctr ls --quiet lists refs like: ghcr.io/sandys/openeral/sandbox:just-bash
-    return refs.split('\n').some(line => line.trim() === sandboxImage || line.includes(imageRepo) && line.includes(imageTag));
+    // ctr ls --quiet lists fully-qualified refs like: docker.io/library/openeral-sandbox:dev
+    // Match exact expanded ref only — substring matching causes false positives
+    // (e.g. openeral-sandbox:dev-openeral-flat also contains "openeral-sandbox" and "dev").
+    return refs.split('\n').some(line => {
+      const t = line.trim();
+      return t === expandedSandboxImage || t === sandboxImage;
+    });
   }
 
   process.stderr.write('\x1b[2mopeneral: checking sandbox image availability...\x1b[0m\n');
@@ -699,19 +832,76 @@ async function ensureSandboxImage(sandboxImage: string): Promise<void> {
 
   process.stderr.write('\x1b[2m  image not found in cluster, importing...\x1b[0m\n');
 
-  // Pull on host first
-  process.stderr.write('\x1b[2m  pulling image on host (this may take a few minutes)...\x1b[0m\n');
-  const pullResult = spawnSync('docker', ['pull', sandboxImage], {
-    stdio: 'inherit',
-    timeout: 600000,
+  // Check if the image already exists in the local Docker daemon.
+  // Local-only images (e.g. openeral-sandbox:dev built with `docker build`)
+  // are never in a registry, so `docker pull` would always fail for them.
+  const localCheck = spawnSync('docker', ['image', 'inspect', sandboxImage, '--format', '{{.Id}}'], {
+    stdio: 'pipe',
+    timeout: 10000,
   });
+  const imageExistsLocally = localCheck.status === 0 && localCheck.stdout.toString().trim().length > 0;
 
-  if (pullResult.status !== 0) {
-    process.stderr.write(
-      '\x1b[33mwarning: failed to pull image on host\x1b[0m\n' +
-      `  docker pull ${sandboxImage}\n`
-    );
-    return;
+  if (!imageExistsLocally) {
+    const devImageName = process.env.OPENERAL_DEV_IMAGE ?? 'openeral-sandbox:dev';
+    const isDevImage = sandboxImage === devImageName;
+
+    if (isDevImage) {
+      // Dev image not found locally — auto-build from the repo Dockerfile.
+      // Walk up from the compiled file's location to find the repo root
+      // (avoids fragile assumptions about the exact build output path).
+      const repoRoot = findRepoRoot();
+      const dockerfile = repoRoot ? join(repoRoot, 'sandboxes', 'openeral', 'Dockerfile') : null;
+
+      if (!dockerfile || !existsSync(dockerfile)) {
+        const location = dockerfile ?? '(repo root not found)';
+        process.stderr.write(
+          `\x1b[31merror: dev image "${sandboxImage}" not found and Dockerfile not found at:\n` +
+          `  ${location}\n` +
+          'Run from inside the openeral repo, or build the image manually:\n' +
+          `  docker build -f sandboxes/openeral/Dockerfile -t ${sandboxImage} <repo-root>\n`
+        );
+        process.exit(1);
+      }
+
+      process.stderr.write(`\x1b[2m  dev image not found — building from ${dockerfile}...\x1b[0m\n`);
+
+      // Work around broken Docker credential helpers common in WSL + Docker Desktop.
+      // docker-credential-desktop.exe is a Windows binary that can't run in WSL,
+      // so Docker fails credential lookup even for public images.
+      // Pointing DOCKER_CONFIG at a minimal config with no credsStore bypasses this
+      // while still allowing anonymous pulls of public images.
+      const dockerCfgDir = join(homedir(), '.config', 'openeral', 'docker');
+      mkdirSync(dockerCfgDir, { recursive: true });
+      writeFileSync(join(dockerCfgDir, 'config.json'), JSON.stringify({ auths: {} }));
+
+      const buildResult = spawnSync('docker', ['build', '-f', dockerfile, '-t', sandboxImage, repoRoot!], {
+        stdio: 'inherit',
+        timeout: 900000, // 15 minutes
+        env: { ...process.env, DOCKER_CONFIG: dockerCfgDir },
+      });
+
+      if (buildResult.status !== 0) {
+        process.stderr.write(`\x1b[31merror: failed to build dev image "${sandboxImage}"\x1b[0m\n`);
+        process.exit(1);
+      }
+      process.stderr.write(`\x1b[32m✓ Dev image built: ${sandboxImage}\x1b[0m\n`);
+    } else {
+      // Registry image — pull from remote
+      process.stderr.write('\x1b[2m  pulling image on host (this may take a few minutes)...\x1b[0m\n');
+      const pullResult = spawnSync('docker', ['pull', sandboxImage], {
+        stdio: 'inherit',
+        timeout: 600000,
+      });
+
+      if (pullResult.status !== 0) {
+        process.stderr.write(
+          `\x1b[31merror: image "${sandboxImage}" could not be pulled from registry.\x1b[0m\n`
+        );
+        process.exit(1);
+      }
+    }
+  } else {
+    process.stderr.write('\x1b[32m✓ Image found in local Docker daemon\x1b[0m\n');
   }
 
   // Flatten the image to a single layer before importing into k3s.
@@ -731,6 +921,10 @@ async function ensureSandboxImage(sandboxImage: string): Promise<void> {
   const tmpTar   = '/tmp/openeral-sandbox-image.tar';
   const containerTar = '/tmp/openeral-sandbox-image.tar';
   const flatTag  = `${sandboxImage}-openeral-flat`;
+  // Expanded forms for k3s ctr operations — containerd stores refs with the
+  // full docker.io/library/ prefix, so `ctr images tag SHORT_NAME ...` silently
+  // fails when the source isn't found under the short name.
+  const expandedFlatTag = expandImageRef(flatTag);
   const flatContainer = `openeral-flatten-${Date.now()}`;
 
   process.stderr.write('\x1b[2m  flattening image (squashing layers to remove whiteouts)...\x1b[0m\n');
@@ -771,9 +965,11 @@ async function ensureSandboxImage(sandboxImage: string): Promise<void> {
     return;
   }
 
-  // The flat image was imported under flatTag — retag it as the original image
-  // name so the OpenShell operator can find it when creating the sandbox pod.
-  spawnSync('docker', [...K3S_CTR, 'images', 'tag', flatTag, sandboxImage], { stdio: 'pipe', timeout: 10000 });
+  // The flat image was imported under expandedFlatTag — retag it as the original
+  // image name so the OpenShell operator can find it when creating the sandbox pod.
+  // Both source and target must use the expanded docker.io/library/ form because
+  // containerd does NOT expand short names in `ctr images tag`.
+  spawnSync('docker', [...K3S_CTR, 'images', 'tag', expandedFlatTag, expandedSandboxImage], { stdio: 'pipe', timeout: 10000 });
   process.stderr.write('\x1b[32m✓ Sandbox image imported to cluster\x1b[0m\n');
 
   if (imageExistsInCluster()) {
@@ -1013,6 +1209,13 @@ async function cmdPresignShow(): Promise<void> {
   console.log(`  Full URL:   ${stored.url}`);
   console.log(`  Created:    ${new Date(stored.createdAt).toLocaleString()}`);
   if (decoded.sessionId) console.log(`  Session ID: ${decoded.sessionId}`);
+  if (stored.stringcostApiKey) {
+    const k = stored.stringcostApiKey;
+    const masked = k.length > 8 ? `${k.slice(0, 4)}...${k.slice(-4)}` : '****';
+    console.log(`  StringCost API Key: ${masked}  (stored — used for automatic skill downloads)`);
+  } else {
+    console.log(`  StringCost API Key: not stored — run \`npx openeral presign renew\` to save it`);
+  }
   console.log('');
   console.log('Settings: expires_in=-1  max_uses=-1  cost_limit=10$  (all infinite, never exhausts)');
 }
@@ -1065,8 +1268,9 @@ async function cmdPresignRenew(): Promise<void> {
     const fullUrl = await createPresignUrl(anthropicKey, stringcostKey);
     const baseUrl = fullUrl.replace(/\/v1\/.*$/, '');
 
-    // 1. Store in openeral's own config
-    saveStoredPresign(fullUrl);
+    // 1. Store in openeral's own config (include the API key so skill downloads
+    //    work automatically on future runs without the env var being set)
+    saveStoredPresign(fullUrl, stringcostKey);
     console.log(`\x1b[32m✓ Stored in ${getPresignConfigPath()}\x1b[0m`);
 
     // 2. Write into host Claude Code settings so Claude picks it up automatically
@@ -1112,9 +1316,10 @@ async function cmdPresignRenew(): Promise<void> {
  *      setup.sh runs migrations, seeds the workspace, starts the
  *      openeral-bash daemon, then execs `claude`.
  */
-async function launchViaSandbox(workspaceId: string, claudeArgs: string[]): Promise<void> {
-  const sandboxImage =
-    process.env.OPENERAL_SANDBOX_IMAGE ?? 'ghcr.io/sandys/openeral/sandbox:just-bash';
+async function launchViaSandbox(workspaceId: string, claudeArgs: string[], devMode = false): Promise<void> {
+  const sandboxImage = devMode
+    ? (process.env.OPENERAL_DEV_IMAGE ?? 'openeral-sandbox:dev')
+    : (process.env.OPENERAL_SANDBOX_IMAGE ?? 'ghcr.io/sandys/openeral/sandbox:just-bash');
 
   // Check if openshell is installed
   const checkResult = spawnSync('openshell', ['--version'], { stdio: 'pipe' });
@@ -1133,12 +1338,31 @@ async function launchViaSandbox(workspaceId: string, claudeArgs: string[]): Prom
   // Check if Docker is running
   const dockerCheck = spawnSync('docker', ['info'], { stdio: 'pipe', timeout: 5000 });
   if (dockerCheck.error || dockerCheck.status !== 0) {
-    process.stderr.write(
-      '\x1b[31merror: Docker is not running.\x1b[0m\n' +
-      'OpenShell requires Docker. Start it with:\n' +
-      '  sudo systemctl start docker\n' +
-      '  # or on WSL: sudo service docker start\n',
-    );
+    // Detect which init system is running so we can give the right command
+    const hasSystemd = spawnSync('systemctl', ['is-active', 'docker'], { stdio: 'pipe', timeout: 3000 }).status !== undefined &&
+      !spawnSync('systemctl', ['--version'], { stdio: 'pipe', timeout: 3000 }).error;
+    const dockerStartCmd = hasSystemd
+      ? 'sudo systemctl start docker'
+      : 'sudo service docker start';
+
+    if (dockerCheck.error && (dockerCheck.error as NodeJS.ErrnoException).code === 'ENOENT') {
+      process.stderr.write(
+        '\x1b[31merror: Docker is not installed.\x1b[0m\n' +
+        'OpenShell requires Docker. Install it from:\n' +
+        '  https://docs.docker.com/engine/install/\n' +
+        'Quick install for most Linux distros:\n' +
+        '  curl -fsSL https://get.docker.com | sh\n',
+      );
+    } else {
+      process.stderr.write(
+        '\x1b[31merror: Docker is not running.\x1b[0m\n' +
+        'OpenShell requires Docker. Start it with one of:\n' +
+        `  ${dockerStartCmd}\n` +
+        '  sudo rc-service docker start      # OpenRC (Alpine, Gentoo)\n' +
+        '  sudo /etc/init.d/docker start     # SysV init\n' +
+        'Or enable it at boot: sudo systemctl enable --now docker\n',
+      );
+    }
     process.exit(1);
   }
 
@@ -1354,7 +1578,7 @@ async function launchViaSandbox(workspaceId: string, claudeArgs: string[]): Prom
     process.stderr.write('\x1b[2mopeneral: no stored presign — creating permanent presign...\x1b[0m\n');
     try {
       const fullUrl = await createPresignUrl(anthropicKey, stringcostKey);
-      saveStoredPresign(fullUrl);
+      saveStoredPresign(fullUrl, stringcostKey);
       stringcostUrl = fullUrl.replace(/\/v1\/.*$/, '');
       process.stderr.write('\x1b[32m✓ StringCost presign created and stored (expires_in=-1, max_uses=-1, cost_limit=$10)\x1b[0m\n');
     } catch (err) {
@@ -1388,7 +1612,36 @@ async function launchViaSandbox(workspaceId: string, claudeArgs: string[]): Prom
   }
 
   sandboxArgs.push('--auto-providers');
-  
+
+  // Resolve the StringCost API key for org skills download.
+  // Priority: env var > key stored alongside presign.
+  // If the env var is set and differs from the stored key, update the stored copy
+  // so future launches download skills automatically without the env var.
+  const envSkillsKey = (process.env.STRINGCOST_API_KEY ?? '').replace('@stringcost_api_key', '').trim();
+  const storedSkillsKey = storedPresign?.stringcostApiKey?.trim() ?? '';
+  const stringcostKeyForSkills = envSkillsKey || storedSkillsKey;
+
+  if (envSkillsKey && storedPresign && envSkillsKey !== storedSkillsKey) {
+    saveStoredPresign(storedPresign.url, envSkillsKey);
+    process.stderr.write('\x1b[2mopeneral: stored StringCost API key updated from env\x1b[0m\n');
+  }
+
+  // Fetch org skills on the host and embed them as a base64 payload in the
+  // setup script.  The sandbox never sees the API key — only the already-
+  // downloaded bundle (base64-encoded JSON) is passed in.
+  let skillsBase64 = '';
+  if (stringcostKeyForSkills) {
+    process.stderr.write('\x1b[2mopeneral: downloading org skills...\x1b[0m\n');
+    try {
+      const skills = await fetchOrgSkills(stringcostKeyForSkills);
+      skillsBase64 = Buffer.from(JSON.stringify(skills)).toString('base64');
+      process.stderr.write(`\x1b[32m✓ Downloaded ${skills.length} org skill${skills.length !== 1 ? 's' : ''}\x1b[0m\n`);
+    } catch (err: unknown) {
+      const msg = err instanceof Error ? err.message : String(err);
+      process.stderr.write(`\x1b[33mwarn: org skills download failed: ${msg} — continuing without org skills\x1b[0m\n`);
+    }
+  }
+
   const setupScript = `
 set -e
 
@@ -1396,6 +1649,29 @@ OPENERAL_DIR=/opt/openeral
 
 export WORKSPACE_ID="\${OPENSHELL_SANDBOX_ID:-default}"
 export DATABASE_URL="\${DATABASE_URL:-\${OPENERAL_DATABASE_URL:-}}"
+
+# Guard against literal placeholder strings that openshell may inject when a
+# generic provider credential expansion fails (e.g. the literal text
+# "\${DATABASE_URL}" instead of the actual connection string).
+# Also catch URLs that use localhost/127.0.0.1 — these refer to the sandbox
+# container itself, not the host machine.
+if [ -n "\${DATABASE_URL:-}" ]; then
+  case "\${DATABASE_URL}" in
+    postgresql://*|postgres://*)
+      # Looks like a real URL — check for localhost
+      case "\${DATABASE_URL}" in
+        *@localhost*|*@127.0.0.1*)
+          echo "setup: warning: DATABASE_URL uses localhost — this refers to the sandbox container, not the host machine. Connections may fail." >&2
+          ;;
+      esac
+      ;;
+    *)
+      echo "setup: error: DATABASE_URL does not look like a valid PostgreSQL URL (got: \${DATABASE_URL})." >&2
+      echo "setup: error: The openshell db provider may have injected a placeholder. Run with OPENERAL_AUTO_FIX_TLS=1 to refresh credentials." >&2
+      exit 1
+      ;;
+  esac
+fi
 
 # StringCost proxy URL (passed as environment variable from host)
 export STRINGCOST_PROXY_URL="${stringcostUrl || ''}"
@@ -1407,6 +1683,19 @@ if [ -n "\${STRINGCOST_PROXY_URL:-}" ]; then
 fi
 
 mkdir -p /home/agent/.claude /home/agent/.claude/projects /home/agent/.openeral/data
+
+${skillsBase64 ? `# Write org skills downloaded from StringCost (base64-encoded JSON bundle)
+node -e "
+const s=JSON.parse(Buffer.from('${skillsBase64}','base64').toString());
+const{mkdirSync,writeFileSync}=require('fs');
+s.forEach(function(x){
+  const d='/home/agent/.claude/skills/'+x.slug;
+  mkdirSync(d,{recursive:true});
+  writeFileSync(d+'/SKILL.md',x.content);
+});
+console.log('setup: wrote '+s.length+' org skill'+(s.length===1?'':'s'));
+"
+` : '# No org skills (STRINGCOST_API_KEY not set or bundle download skipped)'}
 
 # Stable PGlite data directory — must be set before starting the daemon so that
 # getDatabaseConnection() in embedded.js uses /home/agent regardless of what HOME
@@ -1505,8 +1794,8 @@ fi
 
 # Install Claude Code if not already present in the image
 if ! command -v claude >/dev/null 2>&1; then
-  echo "setup: Claude CLI not found, installing..."
-  npm install -g @anthropic-ai/claude-code 2>&1 | tail -20
+  echo "setup: Claude CLI not found, installing (this may take a few minutes)..."
+  npm install -g @anthropic-ai/claude-code
   if ! command -v claude >/dev/null 2>&1; then
     echo "setup: ERROR: Claude CLI install failed" >&2
     exit 1
@@ -1523,6 +1812,45 @@ exec env -u ANTHROPIC_API_KEY HOME=/home/agent SHELL=/usr/local/bin/openeral-bas
 
   sandboxArgs.push('--', 'bash', '-c', setupScript, '--', ...claudeArgs);
 
+  // Pre-flight: verify DATABASE_URL is reachable from the host before launching.
+  // A bad URL causes the migration step inside the sandbox to fail, which puts
+  // the sandbox pod into a crash-restart loop that manifests as TLS errors.
+  // Catching it here gives a clear, actionable error message.
+  if (process.env.DATABASE_URL) {
+    const dbUrl = process.env.DATABASE_URL;
+    process.stderr.write('\x1b[2mopeneral: verifying database connection...\x1b[0m\n');
+
+    // Warn early if the URL uses localhost — that address refers to the sandbox
+    // container inside k3s, NOT the user's machine.
+    if (/[@/](localhost|127\.0\.0\.1)([:/?]|$)/.test(dbUrl)) {
+      process.stderr.write(
+        '\x1b[33mwarn: DATABASE_URL uses localhost/127.0.0.1.\x1b[0m\n' +
+        '  This address resolves to the sandbox container, not your machine.\n' +
+        '  Use your real machine IP instead:\n' +
+        '    Linux: hostname -I | awk \'{print $1}\'\n' +
+        '  Then: export DATABASE_URL=postgresql://user:pass@<your-ip>:5432/db\n'
+      );
+    }
+
+    // Quick host-side connection test (same credentials the sandbox will use)
+    const { testConnection } = await import('./db/test-connection.js');
+    const result = await testConnection(dbUrl);
+    if (!result.success) {
+      process.stderr.write(
+        `\x1b[31merror: cannot connect to database — migrations would fail inside the sandbox.\x1b[0m\n` +
+        `  Error: ${result.error}\n` +
+        `  URL:   ${dbUrl.replace(/:[^:@]+@/, ':****@')}\n\n` +
+        'Check that:\n' +
+        '  1. The PostgreSQL server is running and accepting connections\n' +
+        '  2. Host, port, user, password, and database name are correct\n' +
+        '  3. The server pg_hba.conf allows connections from this host\n' +
+        '  4. Firewall/network allows TCP to the DB port\n'
+      );
+      process.exit(1);
+    }
+    process.stderr.write(`\x1b[32m✓ Database reachable (${result.latency}ms)\x1b[0m\n`);
+  }
+
   // Pre-create providers so their k8s Secrets exist BEFORE the sandbox pod is scheduled.
   //
   // When `openshell sandbox create --auto-providers` is used, the operator creates
@@ -1531,8 +1859,7 @@ exec env -u ANTHROPIC_API_KEY HOME=/home/agent SHELL=/usr/local/bin/openeral-bas
   // until those secrets appear (which can take 60-300+ seconds or never complete).
   //
   // By creating providers HERE (synchronously, before sandbox create), we guarantee
-  // the secrets exist when the pod is scheduled.  Errors are silently ignored because
-  // the provider may already exist from a previous run — the existing secret is reused.
+  // the secrets exist when the pod is scheduled.
   process.stderr.write('\x1b[2mopeneral: registering providers...\x1b[0m\n');
 
   // claude provider — only needed when NOT using presign (injects ANTHROPIC_API_KEY).
@@ -1548,18 +1875,50 @@ exec env -u ANTHROPIC_API_KEY HOME=/home/agent SHELL=/usr/local/bin/openeral-bas
     // Non-zero exit is expected when the provider already exists — that's fine.
   }
 
-  // db provider — injects DATABASE_URL into the sandbox (optional)
+  // db provider — injects DATABASE_URL into the sandbox (optional).
+  // Always delete-then-create so the stored credential reflects the CURRENT
+  // DATABASE_URL value.  Simply calling `provider create` on an existing
+  // provider is a no-op (non-zero exit silently ignored), so a changed URL
+  // would never be propagated — causing migrations to run against a stale URL.
   if (process.env.DATABASE_URL) {
-    spawnSync('openshell', [
+    // Delete any existing provider (ignore errors — it may not exist yet)
+    spawnSync('openshell', ['provider', 'delete', '--name', 'db'],
+      { stdio: 'pipe', timeout: 10000 });
+
+    const dbProvider = spawnSync('openshell', [
       'provider', 'create', '--name', 'db', '--type', 'generic', '--credential', 'DATABASE_URL',
     ], { stdio: 'pipe', timeout: 30000 });
+
+    if (dbProvider.status === 0) {
+      process.stderr.write('\x1b[32m✓ Database provider registered\x1b[0m\n');
+    } else {
+      const dbErr = (dbProvider.stderr ?? Buffer.from('')).toString().trim();
+      process.stderr.write(`\x1b[33mwarn: database provider registration returned non-zero${dbErr ? ': ' + dbErr : ''}\x1b[0m\n`);
+    }
   }
 
   process.stderr.write(
-    `\x1b[2mopeneral: launching Claude Code in OpenShell sandbox (${workspaceId})...\x1b[0m\n\n`,
+    `\x1b[2mopeneral: launching Claude Code in OpenShell sandbox (${workspaceId})...\x1b[0m\n` +
+    `\x1b[2m  (if startup stalls for >3 min, press Ctrl+C and retry with OPENERAL_AUTO_FIX_TLS=1)\x1b[0m\n\n`,
   );
 
   const child = spawn('openshell', sandboxArgs, { stdio: 'inherit' });
+
+  // Warn the user if the sandbox hasn't become interactive after 3 minutes —
+  // this is the most common symptom of a TLS handshake failure between the
+  // sandbox pod and the openshell server.
+  const STARTUP_WARN_MS = 3 * 60 * 1000;
+  const startupWarnTimer = setTimeout(() => {
+    process.stderr.write(
+      '\n\x1b[33mwarn: sandbox startup is taking longer than expected.\x1b[0m\n' +
+      'This is usually caused by a TLS handshake failure between the sandbox pod\n' +
+      'and the OpenShell gateway. Press Ctrl+C to abort, then retry with:\n' +
+      '  OPENERAL_AUTO_FIX_TLS=1 npx openeral\n' +
+      'Diagnostics:\n' +
+      '  docker logs openshell-cluster-openshell\n' +
+      '  docker exec openshell-cluster-openshell kubectl get pods -n openshell\n\n'
+    );
+  }, STARTUP_WARN_MS);
 
   // Background: inject /mnt into the running sandbox container via nsenter
   injectMntIntoSandbox(workspaceId).catch((err: unknown) => {
@@ -1567,11 +1926,15 @@ exec env -u ANTHROPIC_API_KEY HOME=/home/agent SHELL=/usr/local/bin/openeral-bas
   });
 
   child.on('error', (err: NodeJS.ErrnoException) => {
+    clearTimeout(startupWarnTimer);
     process.stderr.write(`\x1b[31merror: ${err.message}\x1b[0m\n`);
     process.exit(1);
   });
 
-  child.on('exit', (code) => process.exit(code ?? 0));
+  child.on('exit', (code) => {
+    clearTimeout(startupWarnTimer);
+    process.exit(code ?? 0);
+  });
 
   for (const sig of ['SIGTERM', 'SIGINT', 'SIGHUP'] as const) {
     process.on(sig, () => child.kill(sig));
@@ -1579,11 +1942,22 @@ exec env -u ANTHROPIC_API_KEY HOME=/home/agent SHELL=/usr/local/bin/openeral-bas
 }
 
 export async function main() {
-  const args = process.argv.slice(2);
+  const rawArgs = process.argv.slice(2);
+
+  // Separate openeral's own args from claude passthrough args (after --)
+  const dashIdx = rawArgs.indexOf('--');
+  const ownRawArgs = dashIdx >= 0 ? rawArgs.slice(0, dashIdx) : rawArgs;
+  const passthroughPart = dashIdx >= 0 ? rawArgs.slice(dashIdx) : [];
+
+  // Extract --dev/-d flag (must happen before subcommand dispatch so
+  // `npx openeral --dev presign` works — the flag can appear anywhere before --)
+  const devMode = ownRawArgs.some(a => a === '--dev' || a === '-d' || a === '-dev');
+  const ownArgs = ownRawArgs.filter(a => a !== '--dev' && a !== '-d' && a !== '-dev');
+  const args = [...ownArgs, ...passthroughPart];
 
   // presign show / renew
-  if (args[0] === 'presign') {
-    if (args[1] === 'renew') {
+  if (ownArgs[0] === 'presign') {
+    if (ownArgs[1] === 'renew') {
       await cmdPresignRenew();
     } else {
       await cmdPresignShow();
@@ -1592,25 +1966,25 @@ export async function main() {
   }
 
   // stats / analyze / apply — forward to optimize CLI, passing stored presign URL via env
-  if (args[0] === 'stats' || args[0] === 'analyze' || args[0] === 'apply') {
+  if (ownArgs[0] === 'stats' || ownArgs[0] === 'analyze' || ownArgs[0] === 'apply') {
     const { fileURLToPath } = await import('node:url');
     const optimizeCliPath = fileURLToPath(new URL('./optimize/cli.js', import.meta.url));
     const env: NodeJS.ProcessEnv = { ...process.env };
     const stored = loadStoredPresign();
     if (stored) env['OPENERAL_PRESIGN_URL'] = stored.url;
-    const child = spawn('node', [optimizeCliPath, ...args], { stdio: 'inherit', env });
+    const child = spawn('node', [optimizeCliPath, ...ownArgs], { stdio: 'inherit', env });
     child.on('exit', (code) => process.exit(code ?? 0));
     return;
   }
 
   // optimize <subcommand> — backwards compatibility alias
-  if (args[0] === 'optimize') {
+  if (ownArgs[0] === 'optimize') {
     const { fileURLToPath } = await import('node:url');
     const optimizeCliPath = fileURLToPath(new URL('./optimize/cli.js', import.meta.url));
     const env: NodeJS.ProcessEnv = { ...process.env };
     const stored = loadStoredPresign();
     if (stored) env['OPENERAL_PRESIGN_URL'] = stored.url;
-    const child = spawn('node', [optimizeCliPath, ...args.slice(1)], { stdio: 'inherit', env });
+    const child = spawn('node', [optimizeCliPath, ...ownArgs.slice(1)], { stdio: 'inherit', env });
     child.on('exit', (code) => process.exit(code ?? 0));
     return;
   }
@@ -1630,5 +2004,9 @@ export async function main() {
   const { workspaceId, claudeArgs } = parsed;
 
   process.stderr.write(`\x1b[2mopeneral: workspace  ${workspaceId}\x1b[0m\n`);
-  await launchViaSandbox(workspaceId, claudeArgs);
+  if (devMode) {
+    const devImage = process.env.OPENERAL_DEV_IMAGE ?? 'openeral-sandbox:dev';
+    process.stderr.write(`\x1b[2mopeneral: mode       dev (${devImage})\x1b[0m\n`);
+  }
+  await launchViaSandbox(workspaceId, claudeArgs, devMode);
 }
