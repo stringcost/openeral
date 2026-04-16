@@ -86,7 +86,9 @@ export async function getCachedResponse(
     return null;
   }
 
-  return JSON.parse(result.rows[0].response);
+  // Handle both string (from some drivers) and object (JSONB native) responses
+  const raw = result.rows[0].response;
+  return typeof raw === 'string' ? JSON.parse(raw) : (raw as APIResponse);
 }
 
 /**

@@ -26,8 +26,8 @@ That's it. OpenEral starts the OpenShell gateway, creates the sandbox, and Claud
 **Add cost tracking** with [StringCost](https://stringcost.com):
 
 ```bash
-export ANTHROPIC_API_KEY='sk-ant-...'
-export STRINGCOST_API_KEY='sc-...'
+export ANTHROPIC_API_KEY='[your-anthropic-api-key]'
+export STRINGCOST_API_KEY='[your-stringcost-api-key]'
 
 # First time only — creates a permanent presign (never expires) and saves it
 npx openeral presign renew
@@ -51,7 +51,7 @@ No PostgreSQL required. PGlite runs entirely in-process inside the sandbox.
 **Add persistence across sessions** by connecting an external PostgreSQL database:
 
 ```bash
-export DATABASE_URL='postgresql://user:pass@host:5432/dbname'
+export DATABASE_URL='postgresql://[username]:[password]@[host]:[port]/[database]'
 npx openeral
 ```
 

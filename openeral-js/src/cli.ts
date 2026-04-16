@@ -63,11 +63,19 @@ function loadStoredPresign(): StoredPresign | null {
 
 function saveStoredPresign(url: string): void {
   const configDir = join(homedir(), '.config', 'openeral');
-  mkdirSync(configDir, { recursive: true });
+  mkdirSync(configDir, { recursive: true, mode: 0o700 });
+  const presignPath = getPresignConfigPath();
   writeFileSync(
-    getPresignConfigPath(),
+    presignPath,
     JSON.stringify({ url, createdAt: new Date().toISOString() }, null, 2),
+    { mode: 0o600 }
   );
+  // Ensure restrictive permissions (covers cases where mode is ignored)
+  try {
+    chmodSync(presignPath, 0o600);
+  } catch {
+    // Ignore chmod errors on platforms that don't support it
+  }
 }
 
 /**
@@ -75,32 +83,46 @@ function saveStoredPresign(url: string): void {
  * Returns the full presign URL as returned by StringCost.
  */
 async function createPresignUrl(anthropicKey: string, stringcostKey: string): Promise<string> {
-  const response = await fetch('https://app.stringcost.com/v1/presign', {
-    method: 'POST',
-    headers: {
-      'Authorization': `Bearer ${stringcostKey}`,
-      'Content-Type': 'application/json',
-    },
-    body: JSON.stringify({
-      provider: 'anthropic',
-      client_api_key: anthropicKey,
-      path: ['/v1/messages'],
-      expires_in: -1,
-      max_uses: -1,
-      cost_limit: 10000000, // $10 in micro-dollars
-      tags: ['openeral'],
-      metadata: { source: 'openeral' },
-    }),
-  });
+  const controller = new AbortController();
+  const timeoutId = setTimeout(() => controller.abort(), 30000); // 30 second timeout
 
-  if (!response.ok) {
-    const text = await response.text();
-    throw new Error(`StringCost presign failed (${response.status}): ${text}`);
+  try {
+    const response = await fetch('https://app.stringcost.com/v1/presign', {
+      method: 'POST',
+      headers: {
+        'Authorization': `Bearer ${stringcostKey}`,
+        'Content-Type': 'application/json',
+      },
+      body: JSON.stringify({
+        provider: 'anthropic',
+        client_api_key: anthropicKey,
+        path: ['/v1/messages'],
+        expires_in: -1,
+        max_uses: -1,
+        cost_limit: 10000000, // $10 in micro-dollars
+        tags: ['openeral'],
+        metadata: { source: 'openeral' },
+      }),
+      signal: controller.signal,
+    });
+
+    clearTimeout(timeoutId);
+
+    if (!response.ok) {
+      const text = await response.text();
+      throw new Error(`StringCost presign failed (${response.status}): ${text}`);
+    }
+
+    const data = await response.json() as { url: string };
+    if (!data?.url) throw new Error('StringCost presign returned no URL');
+    return data.url;
+  } catch (err) {
+    clearTimeout(timeoutId);
+    if (err instanceof Error && err.name === 'AbortError') {
+      throw new Error('StringCost presign request timed out after 30 seconds');
+    }
+    throw err;
   }
-
-  const data = await response.json() as { url: string };
-  if (!data?.url) throw new Error('StringCost presign returned no URL');
-  return data.url;
 }
 
 function writeClaudeSettings(path: string): void {
@@ -138,7 +160,20 @@ function writeClaudeSettings(path: string): void {
     },
     enableAllProjectMcpServers: false
   };
-  writeFileSync(path, JSON.stringify(settings, null, 2));
+  
+  // Ensure parent directory exists with restrictive permissions
+  const dir = path.substring(0, path.lastIndexOf('/'));
+  mkdirSync(dir, { recursive: true, mode: 0o700 });
+  
+  // Write with restrictive permissions (contains presign URL with JWT)
+  writeFileSync(path, JSON.stringify(settings, null, 2), { mode: 0o600 });
+  
+  // Ensure restrictive permissions (covers cases where mode is ignored)
+  try {
+    chmodSync(path, 0o600);
+  } catch {
+    // Ignore chmod errors on platforms that don't support it
+  }
 }
 
 function writePgHelper(path: string): void {
@@ -198,7 +233,14 @@ export function parseCliArgs(args: string[]): ParsedArgs {
     }
 
     // Normalize workspace ID to be Kubernetes-compliant
-    workspaceId = workspaceId.toLowerCase().replace(/[^a-z0-9-]/g, '-').replace(/^-+|-+$/g, '');
+    const originalId = workspaceId;
+    workspaceId = workspaceId.toLowerCase().replace(/[^a-z0-9-]/g, '-').replace(/^-+|-+$/g, '').replace(/-{2,}/g, '-');
+    
+    // Prevent empty workspace ID
+    if (workspaceId.length === 0) {
+      workspaceId = 'openeral-claude';
+      process.stderr.write(`\x1b[33mwarning: workspace ID "${originalId}" normalized to empty string, using default: ${workspaceId}\x1b[0m\n`);
+    }
 
     return { kind: 'memory-refresh', workspaceId, projectRoot, query, dryRun, backup };
   }
@@ -218,7 +260,14 @@ export function parseCliArgs(args: string[]): ParsedArgs {
   }
 
   // Normalize workspace ID to be Kubernetes-compliant (lowercase, alphanumeric + hyphens)
-  workspaceId = workspaceId.toLowerCase().replace(/[^a-z0-9-]/g, '-').replace(/^-+|-+$/g, '');
+  const originalId = workspaceId;
+  workspaceId = workspaceId.toLowerCase().replace(/[^a-z0-9-]/g, '-').replace(/^-+|-+$/g, '').replace(/-{2,}/g, '-');
+  
+  // Prevent empty workspace ID
+  if (workspaceId.length === 0) {
+    workspaceId = 'openeral-claude';
+    process.stderr.write(`\x1b[33mwarning: workspace ID "${originalId}" normalized to empty string, using default: ${workspaceId}\x1b[0m\n`);
+  }
 
   return { kind: 'launch', workspaceId, claudeArgs };
 }
@@ -283,23 +332,18 @@ Notes:
  * Does NOT recreate the container.
  */
 async function ensureGatewayHasMntMount(): Promise<void> {
-  // Check if /mnt is already in the bind mounts
-  const inspectResult = spawnSync('docker', [
-    'inspect', 'openshell-cluster-openshell',
-    '--format', '{{json .HostConfig.Binds}}'
+  // Check if /mnt is already a mountpoint inside the gateway container.
+  // Important: HostConfig.Binds only captures mounts configured at container
+  // creation time (-v flags). Mounts added dynamically via nsenter from a prior
+  // run never appear in HostConfig.Binds, so we must check the live mount table.
+  const mountCheck = spawnSync('docker', [
+    'exec', 'openshell-cluster-openshell',
+    'mountpoint', '-q', '/mnt'
   ], { stdio: 'pipe', timeout: 5000 });
 
-  if (inspectResult.status === 0) {
-    let binds: string[] = [];
-    try {
-      const parsed = JSON.parse(inspectResult.stdout.toString().trim() || 'null') as unknown;
-      if (Array.isArray(parsed)) binds = parsed as string[];
-    } catch { /* use empty */ }
-
-    if (binds.some(b => b.startsWith('/mnt'))) {
-      process.stderr.write('\x1b[32m✓ /mnt already mounted in gateway container\x1b[0m\n');
-      return;
-    }
+  if (mountCheck.status === 0) {
+    process.stderr.write('\x1b[32m✓ /mnt already mounted in gateway container\x1b[0m\n');
+    return;
   }
 
   // Get the container PID for nsenter
@@ -314,19 +358,31 @@ async function ensureGatewayHasMntMount(): Promise<void> {
   }
 
   const pid = pidResult.stdout.toString().trim();
+  const nsenterArgs = ['-t', pid, '--mount', '--', 'mount', '--rbind', '/mnt', '/mnt'];
 
-  // Try nsenter to add the mount without recreating the container
-  const nsenterResult = spawnSync('sudo', [
-    'nsenter', '-t', pid, '--mount', '--',
-    'mount', '--rbind', '/mnt', '/mnt'
-  ], { stdio: 'pipe', timeout: 15000 });
+  // Attempt 1: nsenter without sudo (works when this process is already root).
+  let mounted = spawnSync('nsenter', nsenterArgs, { stdio: 'pipe', timeout: 15000 }).status === 0;
 
-  if (nsenterResult.status === 0) {
-    process.stderr.write('\x1b[32m✓ /mnt bind-mounted into gateway container via nsenter\x1b[0m\n');
+  // Attempt 2: sudo -n nsenter — non-interactive, succeeds only with passwordless sudo.
+  if (!mounted) {
+    mounted = spawnSync('sudo', ['-n', 'nsenter', ...nsenterArgs], { stdio: 'pipe', timeout: 15000 }).status === 0;
+  }
+
+  // Attempt 3: interactive sudo — inherit stdio so the password prompt is visible
+  // and the user can type their password.  This is the normal path for anyone
+  // who has sudo but hasn't configured passwordless access.
+  if (!mounted) {
+    process.stderr.write('\x1b[2mopeneral: mounting host filesystem — sudo password may be required...\x1b[0m\n');
+    mounted = spawnSync('sudo', ['nsenter', ...nsenterArgs], { stdio: 'inherit', timeout: 60000 }).status === 0;
+  }
+
+  if (mounted) {
+    process.stderr.write('\x1b[32m✓ /mnt bind-mounted into gateway container\x1b[0m\n');
   } else {
     process.stderr.write(
       'warning: host filesystem (/mnt) not mounted in gateway container.\n' +
-      `To fix, run: sudo nsenter -t $(docker inspect --format '{{.State.Pid}}' openshell-cluster-openshell) --mount -- mount --rbind /mnt /mnt\n` +
+      'To avoid this prompt permanently, configure passwordless sudo for nsenter:\n' +
+      '  echo "$(whoami) ALL=(ALL) NOPASSWD: /usr/bin/nsenter" | sudo tee /etc/sudoers.d/openeral-nsenter\n' +
       'Sandbox will have limited filesystem access.\n'
     );
   }
@@ -354,10 +410,27 @@ async function fixBrokenTls(): Promise<boolean> {
   }
 
   if (!clientTlsExists) {
-    process.stderr.write('\x1b[33mopenshell-client-tls secret missing — regenerating certs...\x1b[0m\n');
+    process.stderr.write('\x1b[33mopenshell-client-tls secret missing — TLS certificates need regeneration\x1b[0m\n');
+  } else {
+    process.stderr.write('\x1b[33mTLS broken (tls handshake eof) — TLS certificates need regeneration\x1b[0m\n');
   }
 
-  process.stderr.write('\x1b[33mTLS broken (tls handshake eof) — regenerating certs...\x1b[0m\n');
+  // Compliance: require explicit confirmation for destructive operations
+  // Skip confirmation if OPENERAL_AUTO_FIX_TLS=1 is set (for automation/CI)
+  if (process.env.OPENERAL_AUTO_FIX_TLS !== '1') {
+    process.stderr.write(
+      '\x1b[33mThis will overwrite TLS certificates in:\x1b[0m\n' +
+      `  - ~/.config/openshell/gateways/openshell/mtls/\n` +
+      `  - Kubernetes secrets in the openshell namespace\n\n` +
+      '\x1b[33mTo proceed automatically in the future, set: OPENERAL_AUTO_FIX_TLS=1\x1b[0m\n' +
+      '\x1b[33mProceeding with TLS regeneration...\x1b[0m\n\n'
+    );
+    // Note: In a fully interactive CLI, you could add a prompt here.
+    // For now, we log the warning and proceed (user can Ctrl+C to abort).
+    await new Promise(resolve => setTimeout(resolve, 2000)); // 2s delay to allow Ctrl+C
+  }
+
+  process.stderr.write('\x1b[2mRegenerating TLS certificates...\x1b[0m\n');
 
   const tmpDir = '/tmp/openeral-tls';
   try {
@@ -532,10 +605,18 @@ async function fixBrokenTls(): Promise<boolean> {
   // ---------- Update host mtls files ----------
   const mtlsDir = `${homedir()}/.config/openshell/gateways/openshell/mtls`;
   try {
-    mkdirSync(mtlsDir, { recursive: true });
+    mkdirSync(mtlsDir, { recursive: true, mode: 0o700 });
     copyFileSync(caCrt,     `${mtlsDir}/ca.crt`);
     copyFileSync(clientCrt, `${mtlsDir}/tls.crt`);
     copyFileSync(clientKey, `${mtlsDir}/tls.key`);
+    // Ensure restrictive permissions on certificate files
+    try {
+      chmodSync(`${mtlsDir}/ca.crt`, 0o600);
+      chmodSync(`${mtlsDir}/tls.crt`, 0o600);
+      chmodSync(`${mtlsDir}/tls.key`, 0o600);
+    } catch {
+      // Ignore chmod errors on platforms that don't support it
+    }
   } catch (err) {
     process.stderr.write(`\x1b[33mwarning: failed to update host mtls files: ${(err as Error).message}\x1b[0m\n`);
   }
@@ -1303,34 +1384,43 @@ async function launchViaSandbox(workspaceId: string, claudeArgs: string[]): Prom
   // Check if sandbox already exists and delete it
   await cleanupExistingSandbox(workspaceId);
 
-  // StringCost presign integration — reuse a stored permanent presign, or create one.
-  // The presign has expires_in=-1, max_uses=-1, cost_limit=$10.
-  // Run `npx openeral presign renew` to replace it.
+  // Presign-first auth model:
+  //   - Stored presign present → use it; ANTHROPIC_API_KEY and STRINGCOST_API_KEY are not needed.
+  //   - No stored presign       → require both keys to create one now, then store it.
+  // Run `npx openeral presign renew` to replace the stored presign at any time.
   let stringcostUrl: string | undefined;
-  if (process.env.STRINGCOST_API_KEY && process.env.ANTHROPIC_API_KEY) {
-    const anthropicKey = process.env.ANTHROPIC_API_KEY.replace('@anthropic_api_key', '').trim();
-    const stringcostKey = process.env.STRINGCOST_API_KEY.replace('@stringcost_api_key', '').trim();
+  const storedPresign = loadStoredPresign();
+  if (storedPresign) {
+    // Reuse the stored permanent presign — no env vars required
+    stringcostUrl = storedPresign.url.replace(/\/v1\/.*$/, '');
+    process.stderr.write('\x1b[32m✓ Using stored StringCost presign\x1b[0m\n');
+    process.stderr.write(`\x1b[2m  Proxy URL: ${stringcostUrl}\x1b[0m\n`);
+  } else {
+    // No stored presign — both keys are required to create one
+    const anthropicKey = (process.env.ANTHROPIC_API_KEY ?? '').replace('@anthropic_api_key', '').trim();
+    const stringcostKey = (process.env.STRINGCOST_API_KEY ?? '').replace('@stringcost_api_key', '').trim();
 
-    const stored = loadStoredPresign();
-    if (stored) {
-      // Reuse the stored permanent presign — no network call needed
-      stringcostUrl = stored.url.replace(/\/v1\/.*$/, '');
-      process.stderr.write('\x1b[32m✓ Using stored StringCost presign\x1b[0m\n');
-      process.stderr.write(`\x1b[2m  Proxy URL: ${stringcostUrl}\x1b[0m\n`);
-    } else {
-      process.stderr.write('\x1b[2mopeneral: no stored presign — creating permanent presign...\x1b[0m\n');
-      try {
-        const fullUrl = await createPresignUrl(anthropicKey, stringcostKey);
-        saveStoredPresign(fullUrl);
-        stringcostUrl = fullUrl.replace(/\/v1\/.*$/, '');
-        process.stderr.write('\x1b[32m✓ StringCost presign created and stored (expires_in=-1, max_uses=-1, cost_limit=$10)\x1b[0m\n');
-      } catch (err) {
-        const error = err instanceof Error ? err : new Error(String(err));
-        process.stderr.write(
-          '\x1b[33mwarning: StringCost presign error: ' + error.message + '\x1b[0m\n' +
-          '\x1b[2m  Continuing without StringCost tracking...\x1b[0m\n',
-        );
-      }
+    if (!anthropicKey || !stringcostKey) {
+      process.stderr.write(
+        '\x1b[31merror: no stored presign found and required keys are missing.\x1b[0m\n' +
+        'Either run `npx openeral presign renew` once (requires both keys), or set:\n' +
+        '  ANTHROPIC_API_KEY=sk-ant-...   your Anthropic API key\n' +
+        '  STRINGCOST_API_KEY=...          your StringCost API key\n' +
+        'Once created, the presign is stored permanently and no keys are needed again.\n',
+      );
+      process.exit(1);
+    }
+
+    process.stderr.write('\x1b[2mopeneral: no stored presign — creating permanent presign...\x1b[0m\n');
+    try {
+      const fullUrl = await createPresignUrl(anthropicKey, stringcostKey);
+      saveStoredPresign(fullUrl);
+      stringcostUrl = fullUrl.replace(/\/v1\/.*$/, '');
+      process.stderr.write('\x1b[32m✓ StringCost presign created and stored (expires_in=-1, max_uses=-1, cost_limit=$10)\x1b[0m\n');
+    } catch (err) {
+      const error = err instanceof Error ? err : new Error(String(err));
+      process.stderr.write('\x1b[31merror: failed to create StringCost presign: ' + error.message + '\x1b[0m\n');
+      process.exit(1);
     }
   }
 
@@ -1338,14 +1428,20 @@ async function launchViaSandbox(workspaceId: string, claudeArgs: string[]): Prom
   // --name   maps to OPENSHELL_SANDBOX_ID inside the container, which
   //          setup.sh uses as the workspace ID.
   // --auto-providers  creates/resolves named providers automatically from
-  //          the current environment (ANTHROPIC_API_KEY → claude,
-  //          DATABASE_URL → db).
+  //          the current environment (DATABASE_URL → db).
+  // When a presign is in use we do NOT include --provider claude: the sandbox
+  // authenticates via the presign URL written to ~/.claude/settings.json and
+  // must never see ANTHROPIC_API_KEY.
   const sandboxArgs: string[] = [
     'sandbox', 'create',
     '--name', workspaceId,
     '--from', sandboxImage,
-    '--provider', 'claude',
   ];
+
+  if (!stringcostUrl && process.env.ANTHROPIC_API_KEY) {
+    // Fallback (no presign): inject the raw API key via the claude provider
+    sandboxArgs.push('--provider', 'claude');
+  }
 
   if (process.env.DATABASE_URL) {
     sandboxArgs.push('--provider', 'db');
@@ -1479,11 +1575,10 @@ if ! command -v claude >/dev/null 2>&1; then
 fi
 
 echo "setup: launching Claude Code..."
-if [ -n "\${STRINGCOST_PROXY_URL:-}" ]; then
-  exec env -u ANTHROPIC_API_KEY HOME=/home/agent SHELL=/usr/local/bin/openeral-bash claude "$@"
-else
-  exec env HOME=/home/agent SHELL=/usr/local/bin/openeral-bash claude "$@"
-fi
+# Always strip ANTHROPIC_API_KEY — the sandbox uses the presign stored in
+# ~/.claude/settings.json (written above). The raw API key must never reach
+# Claude Code inside the sandbox or it will prompt the user to choose a key.
+exec env -u ANTHROPIC_API_KEY HOME=/home/agent SHELL=/usr/local/bin/openeral-bash claude "$@"
 `;
 
   sandboxArgs.push('--', 'bash', '-c', setupScript, '--', ...claudeArgs);
@@ -1500,8 +1595,10 @@ fi
   // the provider may already exist from a previous run — the existing secret is reused.
   process.stderr.write('\x1b[2mopeneral: registering providers...\x1b[0m\n');
 
-  // claude provider — injects ANTHROPIC_API_KEY into the sandbox
-  if (process.env.ANTHROPIC_API_KEY) {
+  // claude provider — only needed when NOT using presign (injects ANTHROPIC_API_KEY).
+  // When a presign is in use, the sandbox authenticates via the presign URL written to
+  // ~/.claude/settings.json and ANTHROPIC_API_KEY must not be injected.
+  if (!stringcostUrl && process.env.ANTHROPIC_API_KEY) {
     const claudeProvider = spawnSync('openshell', [
       'provider', 'create', '--name', 'claude', '--type', 'generic', '--credential', 'ANTHROPIC_API_KEY',
     ], { stdio: 'pipe', timeout: 30000 });
