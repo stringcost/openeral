@@ -9,7 +9,7 @@ Isolated home directory and optional database access for AI agents. Runs on embe
 ```bash
 git clone https://github.com/sandys/openeral.git
 cd openeral/openeral-js
-npm install && npm run build
+pnpm install && pnpm run build
 npx openeral
 ```
 
