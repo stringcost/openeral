@@ -63,7 +63,9 @@
       "Bash(docker info:*)",
       "Bash(npx openeral:*)",
       "Bash(npm run *)",
-      "Bash(pnpm test *)"
+      "Bash(pnpm test *)",
+      "Bash(node *)",
+      "Bash(pnpm typecheck *)"
     ]
   }
 }

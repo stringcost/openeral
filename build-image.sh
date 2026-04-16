@@ -1,11 +1,18 @@
 #!/bin/bash
 set -e
 
-echo "=== Building OpenEral Sandbox Image ==="
+# Build the local dev image (openeral-sandbox:dev) and import it into k3s.
+# Use `npx openeral --dev` to launch with this image.
+# `npx openeral` (no flag) always uses the published image and is unaffected by this script.
+
+DEV_IMAGE="${OPENERAL_DEV_IMAGE:-openeral-sandbox:dev}"
+FLAT_IMAGE="${DEV_IMAGE}-openeral-flat"
+
+echo "=== Building OpenEral Dev Sandbox Image ==="
+echo "  Image: $DEV_IMAGE"
 echo ""
 
 echo "Step 0: Checking Docker setup..."
-# Ensure Docker network exists
 if ! docker network inspect openshell-cluster-openshell >/dev/null 2>&1; then
   echo "  Creating Docker network..."
   docker network create --driver bridge openshell-cluster-openshell
@@ -21,39 +28,28 @@ cd ..
 echo "✓ openeral-js built"
 echo ""
 
-echo "Step 2: Building Docker image (this may take 5-10 minutes)..."
-docker build -f sandboxes/openeral/Dockerfile -t ghcr.io/sandys/openeral/sandbox:just-bash .
-echo "✓ Docker image built"
+echo "Step 2: Building dev Docker image (this may take 5-10 minutes)..."
+docker build -f sandboxes/openeral/Dockerfile -t "$DEV_IMAGE" .
+echo "✓ Dev image built: $DEV_IMAGE"
 echo ""
 
 echo "Step 3: Verifying image..."
-docker run --rm ghcr.io/sandys/openeral/sandbox:just-bash ls -la /opt/openeral/dist/ | head -10
-echo "✓ Image verified - dist directory exists"
+docker run --rm "$DEV_IMAGE" ls -la /opt/openeral/dist/ | head -10
+echo "✓ Image verified — dist directory exists"
 echo ""
 
 echo "Step 4: Ensuring k3s cluster is running..."
-# Check if container exists and is running
 if ! docker ps | grep -q openshell-cluster-openshell; then
   echo "  k3s container not running, starting with OpenShell gateway..."
-  
-  # Use OpenShell CLI to start the gateway properly
   openshell gateway start
-  
-  # Wait for k3s to be ready (longer wait for first-time setup)
   echo "  Waiting for k3s to be ready (60 seconds)..."
   sleep 60
-  
-  # Verify it's running
   if ! docker ps | grep -q openshell-cluster-openshell; then
     echo ""
     echo "⚠️  Failed to start k3s cluster!"
-    echo ""
-    echo "The gateway may still be starting. Please check:"
     echo "  1. Docker is running: docker ps"
     echo "  2. OpenShell is installed: openshell --version"
     echo "  3. Check logs: docker logs openshell-cluster-openshell"
-    echo "  4. Try running 'openshell gateway start' manually"
-    echo ""
     exit 1
   fi
 else
@@ -62,33 +58,49 @@ fi
 echo "✓ k3s cluster is running"
 echo ""
 
-echo "Step 5: Removing old images from k3s..."
+echo "Step 5: Removing old dev images from k3s..."
 K3S_CTR="ctr --address /run/k3s/containerd/containerd.sock -n k8s.io"
+
+# containerd stores images with the full docker.io/library/ prefix.
+# Expand short names before passing to ctr so rm/tag find the right ref.
+expand_ref() {
+  local ref="$1"
+  # If ref has no slash → library image (e.g. "openeral-sandbox:dev")
+  if [[ "$ref" != */* ]]; then
+    echo "docker.io/library/$ref"
+    return
+  fi
+  # If first component has a dot or colon → already has explicit registry
+  local first="${ref%%/*}"
+  if [[ "$first" == *.* || "$first" == *:* || "$first" == "localhost" ]]; then
+    echo "$ref"
+    return
+  fi
+  # Single org component (e.g. "sandys/image:tag")
+  echo "docker.io/$ref"
+}
+
+EXPANDED_DEV_IMAGE="$(expand_ref "$DEV_IMAGE")"
+EXPANDED_FLAT_IMAGE="$(expand_ref "$FLAT_IMAGE")"
+
 docker exec openshell-cluster-openshell sh -c "
-  $K3S_CTR images rm ghcr.io/sandys/openeral/sandbox:just-bash 2>/dev/null || true
-  $K3S_CTR images rm ghcr.io/sandys/openeral/sandbox:just-bash-openeral-flat 2>/dev/null || true
+  $K3S_CTR images rm '$EXPANDED_DEV_IMAGE' 2>/dev/null || true
+  $K3S_CTR images rm '$EXPANDED_FLAT_IMAGE' 2>/dev/null || true
 "
-echo "✓ Old images removed (or were not present)"
+echo "✓ Old dev images removed (or were not present)"
 echo ""
 
-echo "Step 6: Flattening and importing image into k3s..."
-# Docker images built on top of a base that replaces system packages (e.g. apt
-# installing nodejs over an existing npm) contain opaque whiteout files
-# (.wh..wh..opq).  k3s's containerd extracts these by calling mknod to create
-# whiteout char devices in the overlayfs upper dir — but mknod is restricted
-# inside a Docker container (seccomp/AppArmor), so the pod is stuck Pending.
-#
-# Fix: docker export produces a flat filesystem tarball with no whiteouts.
-# docker import turns that into a single-layer image.  This extracts cleanly
-# on any Linux system regardless of mknod restrictions.
+echo "Step 6: Flattening and importing dev image into k3s..."
+# Docker images built on top of a base that replaces packages contain opaque
+# whiteout files that mknod can't create inside a Docker container (seccomp).
+# Fix: docker export produces a flat tarball with no whiteouts.
 
-FLAT_IMAGE="ghcr.io/sandys/openeral/sandbox:just-bash-openeral-flat"
 FSTAR="$(mktemp /tmp/openeral-fs-XXXXXX.tar)"
 IMGTAR="$(mktemp /tmp/openeral-img-XXXXXX.tar)"
 
 echo "  Step 6a: Flattening image layers..."
 docker rm -f openeral-flatten-tmp 2>/dev/null || true
-docker create --name openeral-flatten-tmp ghcr.io/sandys/openeral/sandbox:just-bash >/dev/null
+docker create --name openeral-flatten-tmp "$DEV_IMAGE" >/dev/null
 docker export openeral-flatten-tmp -o "$FSTAR"
 docker rm openeral-flatten-tmp >/dev/null
 docker rmi -f "$FLAT_IMAGE" 2>/dev/null || true
@@ -104,11 +116,11 @@ rm -f "$IMGTAR"
 echo "  Step 6c: Importing into k3s..."
 if docker exec openshell-cluster-openshell \
     $K3S_CTR images import /tmp/openeral-sandbox-import.tar; then
-  # Retag the flat image as the expected sandbox image name
+  # Use expanded refs — containerd does NOT expand short names in `ctr images tag`
   docker exec openshell-cluster-openshell \
-    $K3S_CTR images tag "$FLAT_IMAGE" ghcr.io/sandys/openeral/sandbox:just-bash 2>/dev/null || true
+    $K3S_CTR images tag "$EXPANDED_FLAT_IMAGE" "$EXPANDED_DEV_IMAGE" 2>/dev/null || true
   docker exec openshell-cluster-openshell rm -f /tmp/openeral-sandbox-import.tar
-  echo "✓ Image imported to k3s"
+  echo "✓ Dev image imported to k3s: $DEV_IMAGE"
 else
   docker exec openshell-cluster-openshell rm -f /tmp/openeral-sandbox-import.tar
   echo ""
@@ -119,16 +131,12 @@ else
 fi
 echo ""
 
-echo "=== Build Complete! ==="
+echo "=== Dev Build Complete! ==="
 echo ""
-echo "Now you can run:"
-echo "  cd openeral-js"
+echo "Run with the dev image:"
+echo "  npx openeral --dev"
+echo "  npx openeral -d"
+echo ""
+echo "Run with the published image (unchanged):"
 echo "  npx openeral"
 echo ""
-echo "You'll have all features:"
-echo "  ✓ Database persistence"
-echo "  ✓ StringCost tracking"
-echo "  ✓ Token usage monitoring"
-echo "  ✓ npx openeral optimize stats"
-echo "  ✓ npx openeral optimize analyze"
-echo "  ✓ npx openeral optimize apply"

@@ -667,16 +667,38 @@ async function waitForOpenshellPod(): Promise<boolean> {
 }
 
 /**
+ * Expand a short image reference to its fully-qualified docker.io form.
+ *
+ * containerd always stores image refs with the full registry prefix, so
+ * "openeral-sandbox:dev" becomes "docker.io/library/openeral-sandbox:dev".
+ * Short names passed to `ctr images tag` are NOT expanded automatically,
+ * causing silent failures when the source ref isn't found.
+ *
+ * Rules (same as containerd's short-name expansion):
+ *   - No slash               → docker.io/library/<ref>   (e.g. "ubuntu:22.04")
+ *   - First component has . or : or is "localhost" → already has registry
+ *   - Otherwise              → docker.io/<ref>            (e.g. "sandys/app:v1")
+ */
+function expandImageRef(ref: string): string {
+  const firstSlash = ref.indexOf('/');
+  if (firstSlash === -1) {
+    return `docker.io/library/${ref}`;
+  }
+  const firstComponent = ref.slice(0, firstSlash);
+  if (firstComponent.includes('.') || firstComponent.includes(':') || firstComponent === 'localhost') {
+    return ref; // already has explicit registry
+  }
+  return `docker.io/${ref}`;
+}
+
+/**
  * Ensure the sandbox image is available in the k3s cluster.
  * Pre-pulls the image on the host and imports it into k3s to avoid DNS issues.
  */
 async function ensureSandboxImage(sandboxImage: string): Promise<void> {
-  // crictl output: IMAGE                              TAG        IMAGE ID   SIZE
-  // Image name and tag are space-separated columns, not colon-separated.
-  // Split at last colon to get repo and tag (handles tags like "just-bash").
-  const colonIdx = sandboxImage.lastIndexOf(':');
-  const imageRepo = colonIdx >= 0 ? sandboxImage.slice(0, colonIdx) : sandboxImage;
-  const imageTag  = colonIdx >= 0 ? sandboxImage.slice(colonIdx + 1) : 'latest';
+  // Containerd stores all image refs with their fully-qualified registry prefix.
+  // Expand the short name once so every k3s operation uses the canonical form.
+  const expandedSandboxImage = expandImageRef(sandboxImage);
 
   const K3S_CTR = [
     'exec', 'openshell-cluster-openshell',
@@ -692,8 +714,13 @@ async function ensureSandboxImage(sandboxImage: string): Promise<void> {
 
     if (result.status !== 0) return false;
     const refs = result.stdout.toString();
-    // ctr ls --quiet lists refs like: ghcr.io/sandys/openeral/sandbox:just-bash
-    return refs.split('\n').some(line => line.trim() === sandboxImage || line.includes(imageRepo) && line.includes(imageTag));
+    // ctr ls --quiet lists fully-qualified refs like: docker.io/library/openeral-sandbox:dev
+    // Match exact expanded ref only — substring matching causes false positives
+    // (e.g. openeral-sandbox:dev-openeral-flat also contains "openeral-sandbox" and "dev").
+    return refs.split('\n').some(line => {
+      const t = line.trim();
+      return t === expandedSandboxImage || t === sandboxImage;
+    });
   }
 
   process.stderr.write('\x1b[2mopeneral: checking sandbox image availability...\x1b[0m\n');
@@ -720,9 +747,9 @@ async function ensureSandboxImage(sandboxImage: string): Promise<void> {
 
     if (isDevImage) {
       // Dev image not found locally — auto-build from the repo Dockerfile.
-      // The CLI lives at openeral-js/dist/bin/openeral.js so three levels up is the repo root.
+      // The CLI compiles to openeral-js/dist/cli.js so two levels up is the repo root.
       const { fileURLToPath } = await import('node:url');
-      const repoRoot = fileURLToPath(new URL('../../..', import.meta.url));
+      const repoRoot = fileURLToPath(new URL('../..', import.meta.url));
       const dockerfile = join(repoRoot, 'sandboxes', 'openeral', 'Dockerfile');
 
       if (!existsSync(dockerfile)) {
@@ -736,9 +763,20 @@ async function ensureSandboxImage(sandboxImage: string): Promise<void> {
       }
 
       process.stderr.write(`\x1b[2m  dev image not found — building from ${dockerfile}...\x1b[0m\n`);
+
+      // Work around broken Docker credential helpers common in WSL + Docker Desktop.
+      // docker-credential-desktop.exe is a Windows binary that can't run in WSL,
+      // so Docker fails credential lookup even for public images.
+      // Pointing DOCKER_CONFIG at a minimal config with no credsStore bypasses this
+      // while still allowing anonymous pulls of public images.
+      const dockerCfgDir = join(homedir(), '.config', 'openeral', 'docker');
+      mkdirSync(dockerCfgDir, { recursive: true });
+      writeFileSync(join(dockerCfgDir, 'config.json'), JSON.stringify({ auths: {} }));
+
       const buildResult = spawnSync('docker', ['build', '-f', dockerfile, '-t', sandboxImage, repoRoot], {
         stdio: 'inherit',
         timeout: 900000, // 15 minutes
+        env: { ...process.env, DOCKER_CONFIG: dockerCfgDir },
       });
 
       if (buildResult.status !== 0) {
@@ -782,6 +820,10 @@ async function ensureSandboxImage(sandboxImage: string): Promise<void> {
   const tmpTar   = '/tmp/openeral-sandbox-image.tar';
   const containerTar = '/tmp/openeral-sandbox-image.tar';
   const flatTag  = `${sandboxImage}-openeral-flat`;
+  // Expanded forms for k3s ctr operations — containerd stores refs with the
+  // full docker.io/library/ prefix, so `ctr images tag SHORT_NAME ...` silently
+  // fails when the source isn't found under the short name.
+  const expandedFlatTag = expandImageRef(flatTag);
   const flatContainer = `openeral-flatten-${Date.now()}`;
 
   process.stderr.write('\x1b[2m  flattening image (squashing layers to remove whiteouts)...\x1b[0m\n');
@@ -822,9 +864,11 @@ async function ensureSandboxImage(sandboxImage: string): Promise<void> {
     return;
   }
 
-  // The flat image was imported under flatTag — retag it as the original image
-  // name so the OpenShell operator can find it when creating the sandbox pod.
-  spawnSync('docker', [...K3S_CTR, 'images', 'tag', flatTag, sandboxImage], { stdio: 'pipe', timeout: 10000 });
+  // The flat image was imported under expandedFlatTag — retag it as the original
+  // image name so the OpenShell operator can find it when creating the sandbox pod.
+  // Both source and target must use the expanded docker.io/library/ form because
+  // containerd does NOT expand short names in `ctr images tag`.
+  spawnSync('docker', [...K3S_CTR, 'images', 'tag', expandedFlatTag, expandedSandboxImage], { stdio: 'pipe', timeout: 10000 });
   process.stderr.write('\x1b[32m✓ Sandbox image imported to cluster\x1b[0m\n');
 
   if (imageExistsInCluster()) {
@@ -1557,8 +1601,8 @@ fi
 
 # Install Claude Code if not already present in the image
 if ! command -v claude >/dev/null 2>&1; then
-  echo "setup: Claude CLI not found, installing..."
-  npm install -g @anthropic-ai/claude-code 2>&1 | tail -20
+  echo "setup: Claude CLI not found, installing (this may take a few minutes)..."
+  npm install -g @anthropic-ai/claude-code
   if ! command -v claude >/dev/null 2>&1; then
     echo "setup: ERROR: Claude CLI install failed" >&2
     exit 1
