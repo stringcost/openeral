@@ -71,7 +71,7 @@ function saveStoredPresign(url: string): void {
 }
 
 /**
- * Create a new StringCost presign with infinite expire_time, max_uses, and cost_limit.
+ * Create a new StringCost presign: never expires, unlimited uses, $10 cost cap.
  * Returns the full presign URL as returned by StringCost.
  */
 async function createPresignUrl(anthropicKey: string, stringcostKey: string): Promise<string> {
@@ -87,7 +87,7 @@ async function createPresignUrl(anthropicKey: string, stringcostKey: string): Pr
       path: ['/v1/messages'],
       expires_in: -1,
       max_uses: -1,
-      cost_limit: 10000000,
+      cost_limit: 10000000, // $10 in micro-dollars
       tags: ['openeral'],
       metadata: { source: 'openeral' },
     }),
@@ -266,7 +266,7 @@ Features:
   - API usage statistics and optimization suggestions
 
 Notes:
-  - Presign is stored in ~/.config/openeral/presign.json (expires_in=-1, max_uses=-1, cost_limit=-1)
+  - Presign is stored in ~/.config/openeral/presign.json (expires_in=-1, max_uses=-1, cost_limit=$10)
   - Workspace IDs are automatically normalized to be Kubernetes-compliant
   - Claude CLI will be automatically installed in the sandbox if not present
   - Existing sandboxes with the same name will be cleaned up automatically
@@ -1304,7 +1304,7 @@ async function launchViaSandbox(workspaceId: string, claudeArgs: string[]): Prom
   await cleanupExistingSandbox(workspaceId);
 
   // StringCost presign integration — reuse a stored permanent presign, or create one.
-  // The presign has expires_in=-1, max_uses=-1, cost_limit=-1 so it never exhausts.
+  // The presign has expires_in=-1, max_uses=-1, cost_limit=$10.
   // Run `npx openeral presign renew` to replace it.
   let stringcostUrl: string | undefined;
   if (process.env.STRINGCOST_API_KEY && process.env.ANTHROPIC_API_KEY) {
@@ -1323,9 +1323,7 @@ async function launchViaSandbox(workspaceId: string, claudeArgs: string[]): Prom
         const fullUrl = await createPresignUrl(anthropicKey, stringcostKey);
         saveStoredPresign(fullUrl);
         stringcostUrl = fullUrl.replace(/\/v1\/.*$/, '');
-        process.stderr.write('\x1b[32m✓ StringCost presign created and stored\x1b[0m\n');
-        // process.stderr.write(`\x1b[2m  Proxy URL: ${stringcostUrl}\x1b[0m\n`);
-        // process.stderr.write('\x1b[2m  (expires_in=-1, max_uses=-1, cost_limit=10$ 1\x1b[0m\n');
+        process.stderr.write('\x1b[32m✓ StringCost presign created and stored (expires_in=-1, max_uses=-1, cost_limit=$10)\x1b[0m\n');
       } catch (err) {
         const error = err instanceof Error ? err : new Error(String(err));
         process.stderr.write(

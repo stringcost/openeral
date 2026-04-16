@@ -1,6 +1,6 @@
 # OpenEral
 
-Persistent home directory and database access for AI agents, backed by PostgreSQL.
+Isolated home directory and optional database access for AI agents. Runs on embedded PGlite by default — no PostgreSQL setup needed.
 
 ## Run Claude Code with OpenEral
 
@@ -23,25 +23,39 @@ npx openeral
 
 That's it. OpenEral starts the OpenShell gateway, creates the sandbox, and Claude Code launches inside it.
 
-**Add cost tracking** with [StringCost](https://github.com/arakoodev/stringcost) — just set your StringCost API key:
+**Add cost tracking** with [StringCost](https://stringcost.com):
 
 ```bash
-export ANTHROPIC_API_KEY='@anthropic_api_key'
-export STRINGCOST_API_KEY='@stringcost_api_key'
+export ANTHROPIC_API_KEY='sk-ant-...'
+export STRINGCOST_API_KEY='sc-...'
 
+# First time only — creates a permanent presign (never expires) and saves it
+npx openeral presign renew
+
+# All future launches reuse the stored presign automatically
 npx openeral
 ```
 
-When `STRINGCOST_API_KEY` is set, OpenEral automatically presigns with StringCost and routes all API traffic through it. Costs are tracked automatically — no extra configuration needed.
+The presign is stored in `~/.config/openeral/presign.json` with `expires_in=-1, max_uses=-1, cost_limit=$10` — it never expires or exhausts by session count. Every session reuses it; no new presign is created on each launch.
 
-**Add persistence** by setting `DATABASE_URL` — files then survive across sessions:
+**How `npx openeral` works:**
+
+1. Starts the OpenShell gateway (a k3s cluster inside Docker) if not already running
+2. Checks `~/.config/openeral/presign.json` for a stored [StringCost](https://stringcost.com) presign — reuses it if present, creates one on first launch if `STRINGCOST_API_KEY` is set
+3. Creates a sandbox pod from the openeral image, runs `setup.sh` inside it
+4. `setup.sh` starts the embedded PGlite database, runs migrations, seeds your workspace, then launches Claude Code
+5. Claude's API calls route through the StringCost proxy URL — token counts and costs are logged automatically
+
+No PostgreSQL required. PGlite runs entirely in-process inside the sandbox.
+
+**Add persistence across sessions** by connecting an external PostgreSQL database:
 
 ```bash
 export DATABASE_URL='postgresql://user:pass@host:5432/dbname'
 npx openeral
 ```
 
-Without `DATABASE_URL`, OpenEral still works — Claude Code runs normally with a local temp home, just without cross-session persistence or database access.
+Without `DATABASE_URL`, OpenEral uses embedded PGlite — Claude Code runs fully, files are persisted within the session, but the workspace resets on next launch.
 
 ### Refresh Claude memory
 
@@ -94,16 +108,14 @@ openshell sandbox create \
 
 npm traffic routes through `registry.socket.dev` with credential injection via the OpenShell proxy. The sandbox never sees the real `SOCKET_TOKEN`.
 
-**Add StringCost cost tracking** — presign your Anthropic key and pass the URL:
+**Add StringCost cost tracking** — create the presign once, then read it from the stored file:
 
 ```bash
-# Presign on the host
-PRESIGN=$(curl -s -X POST \
-  -H "Authorization: Bearer $STRINGCOST_API_KEY" \
-  -H "Content-Type: application/json" \
-  -d '{"provider":"anthropic","client_api_key":"'"$ANTHROPIC_API_KEY"'","path":["/v1/messages"],"expires_in":-1,"max_uses":-1,"tags":["openeral"],"metadata":{"source":"openeral"}}' \
-  https://app.stringcost.com/v1/presign)
-STRINGCOST_URL=$(echo "$PRESIGN" | jq -r '.url' | sed 's|/v1/.*$||')
+# Create the permanent presign (do this once)
+npx openeral presign renew
+
+# Read the stored base URL
+STRINGCOST_URL=$(node -e "const f=require('fs'),d=JSON.parse(f.readFileSync(require('os').homedir()+'/.config/openeral/presign.json','utf8'));console.log(d.url.replace(/\\/v1\\/.*\$/,''))")
 
 # Launch with StringCost
 openshell sandbox create \
@@ -112,21 +124,96 @@ openshell sandbox create \
   -- env ANTHROPIC_BASE_URL="$STRINGCOST_URL" /opt/openeral/setup.sh
 ```
 
-Claude's API traffic routes through StringCost for cost tracking. The OpenShell proxy rewrites the `x-api-key` placeholder to the real key — Claude picks its own model, no override.
+Claude's API traffic routes through StringCost for cost tracking.
+
+## Commands
+
+| Command | Description |
+|---|---|
+| `npx openeral` | Launch Claude Code in an OpenShell sandbox |
+| `npx openeral presign` | Show the currently stored StringCost presign (URL, session ID, created date) |
+| `npx openeral presign renew` | Create a new permanent presign and store it — prompts for API keys if not in env |
+| `npx openeral stats` | Show API usage statistics (cost, tokens, model distribution, cache hit rate) |
+| `npx openeral analyze` | Analyze session history and project files, produce ranked optimization proposals |
+| `npx openeral apply` | Auto-apply proposals from `analyze` — patches `CLAUDE.md`, creates `CONTEXT.md`, compacts memory files |
+| `npx openeral apply --dry-run` | Preview what `apply` would change without writing anything |
+| `npx openeral apply --proposal <id>` | Apply a single proposal by ID (`model-routing`, `context-file`, `lazy-reading`, `readme-updates`, `memory-compact`) |
+| `npx openeral memory refresh` | Rewrite Claude's native project memory files in the isolated home |
+| `npx openeral -- <args>` | Pass arguments directly to Claude (e.g. `npx openeral -- -p 'hello'`) |
+
+**Options shared by `stats`, `analyze`, `apply`:**
+
+```bash
+--workspace <id>    Workspace ID (default: hostname)
+--days <n>          Days of history to look back (default: 7)
+--project-root <p>  Project root for analyze/apply (default: cwd)
+--json              Output as JSON (analyze only)
+```
+
+### Usage analytics
+
+After running sessions via `npx openeral`, check what was spent:
+
+```bash
+npx openeral stats
+```
+
+```
+Openeral - Usage Statistics (last 7 days)
+════════════════════════════════════════════════════════════
+COST
+  Total spent:             $0.760890
+
+TOKEN USAGE
+  Total input tokens:      7,315
+  Total API calls:         55
+
+MODEL DISTRIBUTION
+  Sonnet:  47 calls (85%)
+  Haiku:   8 calls (15%)
+
+CACHE PERFORMANCE
+  Cache hits:  47 / 55 calls (85%)
+```
+
+`stats` syncs live data from [StringCost](https://stringcost.com) automatically before displaying (requires `STRINGCOST_API_KEY`).
+
+Analyze your sessions and get ranked proposals to reduce token usage in future sessions:
+
+```bash
+npx openeral analyze
+```
+
+This reads your session history from the local database and scans your `CLAUDE.md` and memory files. It produces proposals like adding model-routing rules (use Haiku for simple reads, Sonnet for coding), creating a `CONTEXT.md` so Claude doesn't re-explore your project every session, and compacting memory files.
+
+Apply all proposals automatically:
+
+```bash
+npx openeral apply           # apply all auto-applicable proposals
+npx openeral apply --dry-run # preview changes first
+npx openeral apply --proposal model-routing   # apply one specific proposal
+```
+
+`apply` patches your `CLAUDE.md` and creates `.claude/CONTEXT.md` — all changes are idempotent (safe to re-run).
 
 ## What you get
 
 - **Isolated home** — Claude Code runs in its own `$HOME`, separate from your system
-- **Cost tracking** (with `STRINGCOST_API_KEY`) — automatic API cost metering via [StringCost](https://github.com/arakoodev/stringcost)
-- **Persistent home** (with `DATABASE_URL`) — files survive across sessions, backed by PostgreSQL
+- **Embedded database** — PGlite runs in-process with no setup; workspace state is always persisted within a session
+- **Cost tracking** (with `STRINGCOST_API_KEY`) — automatic API cost metering via [StringCost](https://stringcost.com), one permanent presign reused across all sessions
+- **Cross-session persistence** (with `DATABASE_URL`) — files survive across launches, backed by external PostgreSQL
 - **Database access** (with `DATABASE_URL`) — `pg "SELECT * FROM users LIMIT 5"` from Claude's bash
-- **Automatic sync** (with `DATABASE_URL`) — file changes sync to PostgreSQL in the background
+- **Usage analytics** — `npx openeral stats` / `analyze` / `apply` to track spend and reduce token usage
 - **Package scanning** (with `SOCKET_TOKEN` via OpenShell) — npm routes through Socket.dev
 - **Credential injection** (via OpenShell) — API keys never reach the sandbox; the proxy resolves placeholders at egress
 - **Session isolation** — different `OPENERAL_WORKSPACE_ID` = different workspace
 - **Memory refresh** — `openeral memory refresh` rewrites Claude's native project memory files in the isolated home
 
-## Persistence (requires DATABASE_URL)
+## Persistence
+
+By default, OpenEral uses embedded PGlite — no `DATABASE_URL` needed. Files written during a session are kept in the workspace, but the workspace is recreated fresh on next launch.
+
+For files that survive across launches, connect an external PostgreSQL database via `DATABASE_URL`.
 
 Same machine = same workspace (keyed to hostname by default).
 
@@ -182,14 +269,14 @@ The `pg` command is automatically available — OpenEral writes a `CLAUDE.md` th
 
 ```
                     ┌─────────────┐
-PostgreSQL ◄──sync──┤ /home/agent ├──► Claude Code (Read, Write, Edit, Bash, ...)
+  PGlite/PG ◄──sync─┤ /home/agent ├──► Claude Code (Read, Write, Edit, Bash, ...)
                     └──────┬──────┘
                       file watcher
                            │
-                    sync on change ──► PostgreSQL
+                    sync on change ──► PGlite/PG
 ```
 
-On startup, OpenEral restores your workspace from PostgreSQL to a real directory. Claude Code runs normally — all its tools (Read, Write, Edit, Bash, Glob, Grep) work on real files. A background watcher syncs changes back to PostgreSQL. On exit, a final sync saves everything.
+On startup, OpenEral restores your workspace from the embedded PGlite database (or external PostgreSQL if `DATABASE_URL` is set) to a real directory. Claude Code runs normally — all its tools (Read, Write, Edit, Bash, Glob, Grep) work on real files. A background watcher syncs changes back to the database. On exit, a final sync saves everything.
 
 ## Custom agents
 
