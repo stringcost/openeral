@@ -97,17 +97,40 @@ echo "connected to: $DATABASE_URL"
   });
 });
 
-describe('openeral-shell skill bootstrap', () => {
-  it('checks both dist/ and node_modules/ before launching', () => {
-    const skillPath = join(__dirname, '../../.claude/skills/openeral-shell/SKILL.md');
-    const skill = readFileSync(skillPath, 'utf8');
+describe('openeral-shell skill shape', () => {
+  const skillPath = join(__dirname, '../../.claude/skills/openeral-shell/SKILL.md');
+  const skill = readFileSync(skillPath, 'utf8');
 
-    // Must check node_modules alongside dist
-    expect(skill).toContain('node_modules');
-    expect(skill).toContain('dist');
+  it('launches from the published GHCR image, not a local build', () => {
+    expect(skill).toContain('ghcr.io/sandys/openeral/sandbox:just-bash');
+    // No `docker build` or local-image references in the main flow
+    expect(skill).not.toMatch(/--dev\b/);
+    expect(skill).not.toMatch(/openeral-sandbox:dev/);
+  });
 
-    // The check line must be a conjunction (&&), not just dist alone
-    expect(skill).toMatch(/\[ -d dist \].*&&.*\[ -d node_modules \]/);
+  it('uses openshell-only commands (no npx, no pnpm)', () => {
+    expect(skill).not.toMatch(/\bnpx openeral\b/);
+    expect(skill).not.toMatch(/\bpnpm (install|build)\b/);
+  });
+
+  it('uses gateway info (not the nonexistent gateway list)', () => {
+    expect(skill).not.toMatch(/openshell gateway list\b/);
+    expect(skill).toContain('openshell gateway info');
+  });
+
+  it('creates generic providers explicitly with KEY=VALUE (not by env lookup)', () => {
+    expect(skill).toMatch(/openshell provider create --name db[\s\S]*DATABASE_URL=/);
+    expect(skill).toMatch(/openshell provider create --name stringcost[\s\S]*STRINGCOST_API_KEY=/);
+  });
+
+  it('does not invoke openshell sandbox exec (which does not exist)', () => {
+    // Allow mentions inside prose (e.g. "There is no `openshell sandbox exec`"),
+    // but reject it appearing in a shell code block.
+    const codeBlockRe = /```[a-z]*\n([\s\S]*?)```/g;
+    let m: RegExpExecArray | null;
+    while ((m = codeBlockRe.exec(skill)) !== null) {
+      expect(m[1]).not.toMatch(/openshell sandbox exec\b/);
+    }
   });
 });
 

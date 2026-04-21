@@ -384,25 +384,49 @@ if (!syncContent.includes('dbTypes') || !syncContent.includes('dbIsDir === false
 }
 
 // ---------------------------------------------------------------------------
-// Lint 20: README quickstart must include install+build steps
-// Catches: telling users "npx openeral" without showing pnpm install && pnpm build
+// Lint 20: README.md is openshell-only (no npx/pnpm/npm install)
+// Catches: regressions that mix developer commands into the end-user README.
+// Developer commands live in BUILD.md.
 // ---------------------------------------------------------------------------
-console.log('\n--- Lint: README includes build steps ---');
+console.log('\n--- Lint: README has no npx/pnpm (user-facing only) ---');
 
 try {
   const readme = readFileSync('../README.md', 'utf8');
-  // The first code block that mentions npx openeral must also mention pnpm install
-  const firstOpeneral = readme.indexOf('npx openeral');
-  const blockStart = readme.lastIndexOf('```', firstOpeneral);
-  const blockEnd = readme.indexOf('```', firstOpeneral);
-  const block = readme.slice(blockStart, blockEnd);
-  if (!block.includes('pnpm install') && !block.includes('npm install')) {
-    fail('README.md', 'quickstart code block with npx openeral must include install+build steps');
-  } else {
-    pass('README quickstart includes install+build');
+  const forbidden = [
+    [/\bnpx openeral\b/, 'contains `npx openeral` — move to BUILD.md'],
+    [/\bpnpm (install|build|check|run)\b/, 'contains `pnpm install|build|check|run` — move to BUILD.md'],
+    [/\bnpm install\b/, 'contains `npm install` — move to BUILD.md'],
+  ];
+  let readmeOk = true;
+  for (const [rx, msg] of forbidden) {
+    if (rx.test(readme)) {
+      fail('README.md', msg);
+      readmeOk = false;
+    }
   }
+  if (readmeOk) pass('README contains no npx/pnpm/npm-install commands');
 } catch {
   pass('README not found (skipped)');
+}
+
+// BUILD.md SHOULD contain the build steps — verify the first npx-openeral
+// block shows users how to install+build first
+console.log('\n--- Lint: BUILD.md installs before running ---');
+try {
+  const build = readFileSync('../BUILD.md', 'utf8');
+  if (!build.includes('npx openeral')) {
+    pass('BUILD.md has no npx (skipped)');
+  } else {
+    const firstOpeneral = build.indexOf('npx openeral');
+    const priorText = build.slice(0, firstOpeneral);
+    if (!priorText.includes('pnpm install') && !priorText.includes('pnpm build')) {
+      fail('BUILD.md', 'first `npx openeral` must be preceded by `pnpm install && pnpm build` instructions');
+    } else {
+      pass('BUILD.md shows install+build before first npx openeral');
+    }
+  }
+} catch {
+  pass('BUILD.md not found (skipped)');
 }
 
 // ---------------------------------------------------------------------------

@@ -1997,8 +1997,40 @@ export async function main() {
   }
 
   if (parsed.kind === 'memory-refresh') {
-    process.stderr.write('\x1b[31mopeneral: memory refresh not yet implemented\x1b[0m\n');
-    process.exit(1);
+    const { refreshClaudeMemory } = await import('./memory/refresh.js');
+    try {
+      const result = await refreshClaudeMemory({
+        homeDir: process.env.HOME || '/home/agent',
+        cwd: process.cwd(),
+        projectRoot: parsed.projectRoot || undefined,
+        query: parsed.query || undefined,
+        dryRun: parsed.dryRun,
+        backup: parsed.backup,
+      });
+      process.stderr.write(
+        `\x1b[2mopeneral: memory ${result.mode} mode (project: ${result.context.projectSlug})\x1b[0m\n`,
+      );
+      process.stderr.write(
+        `\x1b[2mopeneral: memory dir  ${result.context.memoryDir}\x1b[0m\n`,
+      );
+      if (result.backupDir) {
+        process.stderr.write(`\x1b[2mopeneral: backup      ${result.backupDir}\x1b[0m\n`);
+      }
+      for (const f of result.writtenFiles) {
+        process.stderr.write(`\x1b[32m  wrote\x1b[0m ${f}\n`);
+      }
+      if (result.dryRun && result.plannedFiles.length > 0) {
+        process.stderr.write('\x1b[2m(dry-run — no files written; planned:)\x1b[0m\n');
+        for (const f of result.plannedFiles) {
+          process.stderr.write(`  plan  ${f}\n`);
+        }
+      }
+      return;
+    } catch (err: any) {
+      process.stderr.write(`\x1b[31mopeneral: memory refresh failed: ${err?.message || err}\x1b[0m\n`);
+      if (err?.stack) process.stderr.write(err.stack + '\n');
+      process.exit(1);
+    }
   }
 
   const { workspaceId, claudeArgs } = parsed;

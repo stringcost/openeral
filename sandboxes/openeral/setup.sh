@@ -41,8 +41,89 @@ mkdir -p "$OPENERAL_DATA_DIR"
 # getDatabaseConnection() picks it up over PGlite.
 export DATABASE_URL="${DATABASE_URL:-${OPENERAL_DATABASE_URL:-}}"
 
-# StringCost integration — write proxy config into Claude Code settings.json so it
-# takes effect regardless of how the sandbox injects environment variables.
+# StringCost integration.
+#
+# Priority:
+#   1. STRINGCOST_PROXY_URL already set → use it verbatim.
+#   2. STRINGCOST_PROXY_URL stored from previous session in /home/agent/.openeral/presign.json → reuse.
+#   3. STRINGCOST_API_KEY + ANTHROPIC_API_KEY present → create a new permanent presign
+#      (expires_in=-1, max_uses=-1, cost_limit=$10), store in workspace, reuse on next launch.
+STRINGCOST_PRESIGN_FILE=/home/agent/.openeral/presign.json
+
+if [ -z "${STRINGCOST_PROXY_URL:-}" ] && [ -f "$STRINGCOST_PRESIGN_FILE" ]; then
+  STRINGCOST_PROXY_URL="$(node -e "
+try {
+  const d = JSON.parse(require('fs').readFileSync(process.argv[1], 'utf8'));
+  if (d && d.url) process.stdout.write(d.url);
+} catch {}
+" "$STRINGCOST_PRESIGN_FILE" 2>/dev/null || true)"
+  if [ -n "$STRINGCOST_PROXY_URL" ]; then
+    echo "setup.sh: reusing stored StringCost presign from $STRINGCOST_PRESIGN_FILE"
+    export STRINGCOST_PROXY_URL
+  fi
+fi
+
+if [ -z "${STRINGCOST_PROXY_URL:-}" ] && [ -n "${STRINGCOST_API_KEY:-}" ] && [ -n "${ANTHROPIC_API_KEY:-}" ]; then
+  echo "setup.sh: creating a permanent StringCost presign..."
+  mkdir -p "$(dirname "$STRINGCOST_PRESIGN_FILE")"
+  set +e
+  STRINGCOST_PROXY_URL="$(node -e "
+const fetch = globalThis.fetch;
+(async () => {
+  const controller = new AbortController();
+  const to = setTimeout(() => controller.abort(), 30000);
+  try {
+    const r = await fetch('https://app.stringcost.com/v1/presign', {
+      method: 'POST',
+      headers: {
+        'Authorization': 'Bearer ' + process.env.STRINGCOST_API_KEY,
+        'Content-Type': 'application/json',
+      },
+      body: JSON.stringify({
+        provider: 'anthropic',
+        client_api_key: process.env.ANTHROPIC_API_KEY,
+        path: ['/v1/messages'],
+        expires_in: -1,
+        max_uses: -1,
+        cost_limit: 10000000,
+        tags: ['openeral'],
+        metadata: { source: 'openeral-sandbox' },
+      }),
+      signal: controller.signal,
+    });
+    clearTimeout(to);
+    if (!r.ok) {
+      const t = await r.text();
+      process.stderr.write('presign failed (' + r.status + '): ' + t + '\n');
+      process.exit(1);
+    }
+    const d = await r.json();
+    if (!d || !d.url) {
+      process.stderr.write('presign returned no URL\n');
+      process.exit(1);
+    }
+    const fs = require('fs');
+    fs.writeFileSync(process.argv[1], JSON.stringify({ url: d.url, created_at: new Date().toISOString() }, null, 2), { mode: 0o600 });
+    process.stdout.write(d.url);
+  } catch (e) {
+    process.stderr.write('presign error: ' + (e && e.message || String(e)) + '\n');
+    process.exit(1);
+  }
+})();
+" "$STRINGCOST_PRESIGN_FILE" 2>&1)"
+  rc=$?
+  set -e
+  if [ $rc -eq 0 ] && [ -n "$STRINGCOST_PROXY_URL" ]; then
+    echo "setup.sh: presign stored at $STRINGCOST_PRESIGN_FILE"
+    export STRINGCOST_PROXY_URL
+  else
+    echo "setup.sh: presign creation failed — continuing without StringCost" >&2
+    echo "  detail: $STRINGCOST_PROXY_URL" >&2
+    STRINGCOST_PROXY_URL=""
+  fi
+fi
+
+# Apply proxy to Claude Code settings if we have one
 if [ -n "${STRINGCOST_PROXY_URL:-}" ]; then
   echo "setup.sh: writing StringCost proxy to ~/.claude/settings.json..."
   node -e "
@@ -60,6 +141,14 @@ console.log('setup.sh: StringCost proxy written to ~/.claude/settings.json');
 fi
 
 echo "setup.sh: running migrations..."
+# Log which DB target we're pointing at (redact credentials from the URL)
+if [ -n "${DATABASE_URL:-}" ]; then
+  DB_HOST="$(node -e "try { const u = new URL(process.env.DATABASE_URL); console.log(u.hostname + ':' + (u.port || '5432')); } catch { console.log('(unparseable)'); }")"
+  echo "setup.sh: using external PostgreSQL at $DB_HOST"
+else
+  echo "setup.sh: using embedded PGlite at $OPENERAL_DATA_DIR"
+fi
+
 node -e "
   import('$OPENERAL_DIR/dist/db/embedded.js').then(async ({ getDatabaseConnection }) => {
     const { runMigrations } = await import('$OPENERAL_DIR/dist/db/migrations.js');
@@ -68,7 +157,15 @@ node -e "
     await pool.end();
     console.log('setup.sh: migrations complete');
   }).catch(err => {
-    console.error('setup.sh: migration failed:', err.message);
+    // Print EVERY piece of info we have — demo users need something to go on
+    const msg = err && (err.message || err.toString()) || '(no message)';
+    const code = err && err.code ? ' code=' + err.code : '';
+    const hint = err && err.code === 'ENOTFOUND' ? '  (DATABASE_URL host is not resolvable from the sandbox — ensure it is a public hostname like Supabase, not a loopback IP)' :
+                 err && err.code === 'ECONNREFUSED' ? '  (DATABASE_URL host refused the connection — check port and firewall)' :
+                 err && /password/i.test(msg) ? '  (credential rejected — re-check DATABASE_URL)' : '';
+    console.error('setup.sh: migration failed:', msg + code);
+    if (hint) console.error(hint);
+    if (err && err.stack) console.error(err.stack);
     process.exit(1);
   });
 "

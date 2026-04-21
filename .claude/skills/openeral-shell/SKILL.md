@@ -32,21 +32,26 @@ echo "STRINGCOST_API_KEY=${STRINGCOST_API_KEY:+(set)}"
 ### Step 2: Start the OpenShell gateway if it's not running
 
 ```bash
-openshell gateway list 2>/dev/null | grep -q running || openshell gateway start
+# openshell gateway info exits 0 when a gateway is active, non-zero otherwise.
+openshell gateway info >/dev/null 2>&1 || openshell gateway start
 ```
 
-### Step 3: Build the provider list
+### Step 3: Create providers
 
-`--auto-providers` will create any missing provider from the matching local env var. We always include `claude`; we include `db` and `stringcost` only when the user has set the corresponding env var.
+`--auto-providers` only auto-creates providers whose name matches a recognized type (`claude`, `openai`, `anthropic`, `nvidia`, etc.). Generic providers like `db` and `stringcost` must be created explicitly.
 
 ```bash
-PROVIDERS="--provider claude"
+PROVIDERS="--provider claude"   # claude is auto-created from ANTHROPIC_API_KEY
 
 if [ -n "${DATABASE_URL:-}" ]; then
+  openshell provider create --name db --type generic \
+    --credential "DATABASE_URL=$DATABASE_URL" 2>/dev/null || true
   PROVIDERS="$PROVIDERS --provider db"
 fi
 
 if [ -n "${STRINGCOST_API_KEY:-}" ]; then
+  openshell provider create --name stringcost --type generic \
+    --credential "STRINGCOST_API_KEY=$STRINGCOST_API_KEY" 2>/dev/null || true
   PROVIDERS="$PROVIDERS --provider stringcost"
 fi
 ```
@@ -60,7 +65,7 @@ openshell sandbox create \
   -- /opt/openeral/setup.sh
 ```
 
-`--auto-providers` pulls `ANTHROPIC_API_KEY`, `DATABASE_URL`, and `STRINGCOST_API_KEY` from the user's local shell and registers them as OpenShell providers. `setup.sh` inside the sandbox then runs migrations, seeds the workspace, starts the daemon, and exec's `claude`.
+`--auto-providers` creates the `claude` provider from the local `ANTHROPIC_API_KEY`. The `db` and `stringcost` providers created in Step 3 are attached. `setup.sh` inside the sandbox then runs migrations, seeds the workspace, starts the daemon, and exec's `claude`.
 
 ## What happens after launch
 
@@ -73,21 +78,35 @@ openshell sandbox create \
 
 ```bash
 openshell sandbox list                            # list sandboxes
-openshell sandbox connect <name>                  # reattach to a sandbox
-openshell sandbox exec <name> -- <cmd>            # run a command inside
+openshell sandbox connect <name>                  # open an interactive shell
 openshell sandbox delete <name>                   # stop and remove
+openshell sandbox ssh-config <name>               # print ssh config for scripted access
 ```
+
+There is no `openshell sandbox exec` subcommand. Run one-off commands via the ssh-config helper:
+
+```bash
+openshell sandbox ssh-config <name> > /tmp/sb-cfg
+ssh -F /tmp/sb-cfg openshell-<name> '<command>'
+```
+
+Always prefix with `HOME=/home/agent` — SSH connects as the sandbox user whose home is `/sandbox`, but openeral keeps all state under `/home/agent`.
 
 ### Refresh Claude's memory files
 
 From outside the sandbox:
 
 ```bash
-openshell sandbox exec <name> -- node /opt/openeral/dist/bin/openeral.js memory refresh
-openshell sandbox exec <name> -- node /opt/openeral/dist/bin/openeral.js memory refresh --query "openshell policy"
+openshell sandbox ssh-config <name> > /tmp/sb-cfg
+ssh -F /tmp/sb-cfg openshell-<name> \
+  'HOME=/home/agent node /opt/openeral/dist/bin/openeral.js memory refresh'
+
+# focus on a topic
+ssh -F /tmp/sb-cfg openshell-<name> \
+  'HOME=/home/agent node /opt/openeral/dist/bin/openeral.js memory refresh --query "openshell policy"'
 ```
 
-This rewrites `$HOME/.claude/projects/<project>/memory/*.md` inside the workspace with a backup in `.openeral-memory-backups/` unless `--no-backup` is set.
+This rewrites `/home/agent/.claude/projects/<project>/memory/*.md` inside the workspace with a backup in `.openeral-memory-backups/` unless `--no-backup` is set.
 
 ## Prompting note
 

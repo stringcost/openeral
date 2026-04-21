@@ -40,9 +40,18 @@ By default, the sandbox workspace is recreated fresh on each launch. To make fil
 
 **Supabase** gives you a PostgreSQL connection string out of the box — copy it from Supabase dashboard → Project Settings → Database → Connection string (URI). Use the pooled (pgbouncer) connection on port `6543` or the direct connection on `5432` — whichever the dashboard gives you.
 
+The database must be **reachable from inside the sandbox pod over the public internet** — a loopback or private-docker IP will not work. Use Supabase, Neon, RDS, or any host with a public DNS name.
+
 ```bash
 export ANTHROPIC_API_KEY='sk-ant-...'
 export DATABASE_URL='postgresql://postgres.PROJECT:PASSWORD@aws-0-REGION.pooler.supabase.com:6543/postgres'
+
+# Explicitly create the db provider with the connection string baked in.
+# (--auto-providers only auto-creates providers whose name matches a known type —
+# claude, openai, anthropic, etc. A "generic" provider like `db` must be created
+# explicitly before sandbox create.)
+openshell provider create --name db --type generic \
+  --credential "DATABASE_URL=$DATABASE_URL"
 
 openshell sandbox create \
   --from ghcr.io/sandys/openeral/sandbox:just-bash \
@@ -57,12 +66,6 @@ With `DATABASE_URL` set and the `db` provider attached:
 
 Any PostgreSQL that accepts standard connections works — Supabase, Neon, RDS, or self-hosted. Paste the connection string **verbatim** from the provider dashboard; don't strip the port.
 
-If the `db` provider doesn't exist yet, `--auto-providers` creates it from your local `DATABASE_URL` env var. You can also create it explicitly:
-
-```bash
-openshell provider create --name db --type generic --credential DATABASE_URL
-```
-
 ---
 
 ## Cost tracking with StringCost
@@ -71,7 +74,12 @@ Route Claude's API calls through [StringCost](https://stringcost.com) to track t
 
 ```bash
 export ANTHROPIC_API_KEY='sk-ant-...'
-export STRINGCOST_API_KEY='sc_...'
+export STRINGCOST_API_KEY='sk-st-...'
+
+# Explicitly create the stringcost provider (same reason as `db` — `stringcost`
+# is a generic provider type, not an auto-discoverable one)
+openshell provider create --name stringcost --type generic \
+  --credential "STRINGCOST_API_KEY=$STRINGCOST_API_KEY"
 
 openshell sandbox create \
   --from ghcr.io/sandys/openeral/sandbox:just-bash \
@@ -104,23 +112,25 @@ Combine with `--provider db` to make the presign itself persist across launches.
 
 ```bash
 openshell sandbox list                            # list running sandboxes
-openshell sandbox connect <name>                  # reattach to a running sandbox
+openshell sandbox connect <name>                  # open an interactive shell inside
 openshell sandbox delete <name>                   # stop and remove a sandbox
-openshell sandbox exec <name> -- <cmd>            # run a one-off command inside
+openshell sandbox ssh-config <name>               # print ssh config for scripted access
 ```
 
-**Refresh Claude's memory files from outside:**
+**Run a one-off command in a running sandbox** via the ssh-config helper:
 
 ```bash
-openshell sandbox exec <name> -- node /opt/openeral/dist/bin/openeral.js memory refresh
-openshell sandbox exec <name> -- node /opt/openeral/dist/bin/openeral.js memory refresh --query "openshell policy"
+openshell sandbox ssh-config <name> > /tmp/sb-cfg
+ssh -F /tmp/sb-cfg openshell-<name> 'HOME=/home/agent node /opt/openeral/dist/bin/openeral.js memory refresh'
+
+# focus the refresh on a specific topic
+ssh -F /tmp/sb-cfg openshell-<name> 'HOME=/home/agent node /opt/openeral/dist/bin/openeral.js memory refresh --query "openshell policy"'
+
+# query the workspace database (DATABASE_URL-configured sandboxes only)
+ssh -F /tmp/sb-cfg openshell-<name> 'HOME=/home/agent pg "SELECT count(*) FROM public.users"'
 ```
 
-**Query the workspace database from outside:**
-
-```bash
-openshell sandbox exec <name> -- pg 'SELECT count(*) FROM public.users'
-```
+The `HOME=/home/agent` prefix is required because SSH drops you into the default `/sandbox` home of the base image — openeral's workspace, memory files, and `.claude/` state all live under `/home/agent`.
 
 ---
 
