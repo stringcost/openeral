@@ -20,6 +20,7 @@
  */
 
 import { Socket } from 'node:net';
+import { Duplex } from 'node:stream';
 import { URL } from 'node:url';
 
 export interface TunneledSocketOptions {
@@ -30,28 +31,18 @@ export interface TunneledSocketOptions {
 }
 
 /**
- * Return a synchronous `net.Socket` whose `.connect(port, host)` actually
- * routes through an HTTP CONNECT proxy. Suitable for passing as pg's
- * `PoolConfig.stream` factory.
+ * Return a stream that pg treats as a `net.Socket`, but whose raw TCP goes
+ * through an HTTP CONNECT proxy. Suitable for `pg.PoolConfig.stream`.
  *
- * Internals:
- *   - Override `connect(port, host)` to TCP-connect to the PROXY instead,
- *     and remember the real target.
- *   - At `.connect()` time, snapshot any user-registered `'connect'` listeners
- *     (pg's own) and remove them. They must not fire on the raw proxy TCP
- *     connect — the tunnel isn't ready yet. We replay them after the
- *     CONNECT handshake succeeds.
- *   - Install our own `'connect'` listener that writes `CONNECT target:port`
- *     to the already-open proxy socket.
- *   - A `'data'` listener parses the CONNECT response. On `200`, we replay
- *     the saved user listeners — so pg's `'connect'` handler fires exactly
- *     once, and only after the tunnel is ready.
- *   - On non-200, destroy the socket with an error whose message includes
- *     the full proxy status line so misconfigurations are diagnosable.
- *
- * We deliberately do NOT intercept `emit('connect')`. Suppressing the native
- * emission breaks stream.Readable's internal flow-mode activation — after
- * which `'data'` never fires and the CONNECT response is silently dropped.
+ * Why a Duplex wrapper and not a patched net.Socket: pg attaches its
+ * `'connect'` and `'data'` listeners AFTER calling `.connect()`. Monkey-
+ * patching the socket's EventEmitter methods to intercept those additions
+ * also intercepts Node's own internal listener bookkeeping and breaks the
+ * readable stream. Giving pg a Duplex whose internal raw Socket is fully
+ * encapsulated sidesteps the whole problem: pg's listeners live on the
+ * Duplex, our handshake runs entirely against the inner Socket, and no
+ * byte reaches the Duplex's readable side until the `200 Connection
+ * Established` is parsed and stripped.
  */
 export function createTunneledSocket(opts: TunneledSocketOptions): Socket {
   const { proxyUrl, handshakeTimeoutMs = 15_000 } = opts;
@@ -63,102 +54,167 @@ export function createTunneledSocket(opts: TunneledSocketOptions): Socket {
   const proxyHost = proxyU.hostname;
   const proxyPort = parseInt(proxyU.port || '80', 10);
 
-  const socket = new Socket();
-  let targetHost = '';
-  let targetPort = 0;
-  let handshakeComplete = false;
-  let buf = '';
-  const savedConnectListeners: Array<(...args: unknown[]) => void> = [];
+  // pg's `PoolConfig.stream` factory contract says "return a net.Socket".
+  // What actually flows through pg is: setNoDelay, setKeepAlive, connect,
+  // .on/.once, .write, .end, .destroy, and the 'connect'/'data'/'error'/
+  // 'close' events. A stream.Duplex with those methods and events is
+  // indistinguishable to pg — and gives us a clean boundary where user
+  // bytes never touch the raw Socket until after the CONNECT tunnel is up.
+  return new TunneledSocket({
+    proxyHost,
+    proxyPort,
+    handshakeTimeoutMs,
+  }) as unknown as Socket;
+}
 
-  // Data listener catches the proxy's CONNECT response.
-  socket.on('data', (chunk: Buffer) => {
-    if (handshakeComplete) return; // normal tunnel data — let other listeners handle
-    buf += chunk.toString('binary');
-    const end = buf.indexOf('\r\n\r\n');
+class TunneledSocket extends Duplex {
+  private readonly raw: Socket;
+  private readonly proxyHost: string;
+  private readonly proxyPort: number;
+  private readonly handshakeTimeoutMs: number;
+  private targetHost = '';
+  private targetPort = 0;
+  private handshakeComplete = false;
+  private buf = '';
+  private handshakeTimer: NodeJS.Timeout | null = null;
+
+  constructor(opts: { proxyHost: string; proxyPort: number; handshakeTimeoutMs: number }) {
+    super();
+    this.proxyHost = opts.proxyHost;
+    this.proxyPort = opts.proxyPort;
+    this.handshakeTimeoutMs = opts.handshakeTimeoutMs;
+    this.raw = new Socket();
+
+    this.raw.on('connect', () => this.onProxyConnect());
+    this.raw.on('data', (chunk: Buffer) => this.onRawData(chunk));
+    this.raw.on('error', (err) => this.destroy(err));
+    this.raw.on('close', (hadErr) => {
+      // Propagate close to the Duplex. push(null) signals EOF on the readable side.
+      if (!this.destroyed) this.push(null);
+      this.emit('close', hadErr);
+    });
+    this.raw.on('end', () => this.push(null));
+  }
+
+  // net.Socket-compatible knobs pg calls before connect.
+  setNoDelay(enable?: boolean): this {
+    this.raw.setNoDelay(enable);
+    return this;
+  }
+  setKeepAlive(enable?: boolean, initialDelay?: number): this {
+    this.raw.setKeepAlive(enable, initialDelay);
+    return this;
+  }
+  setTimeout(timeout: number, cb?: () => void): this {
+    this.raw.setTimeout(timeout, cb);
+    return this;
+  }
+  ref(): this {
+    this.raw.ref();
+    return this;
+  }
+  unref(): this {
+    this.raw.unref();
+    return this;
+  }
+
+  connect(port: number, host?: string): this;
+  connect(options: { port: number; host?: string }): this;
+  connect(...args: unknown[]): this {
+    if (typeof args[0] === 'number') {
+      this.targetPort = args[0];
+      this.targetHost = typeof args[1] === 'string' ? args[1] : 'localhost';
+    } else if (typeof args[0] === 'object' && args[0] !== null) {
+      const opt = args[0] as { port: number; host?: string };
+      this.targetPort = opt.port;
+      this.targetHost = opt.host ?? 'localhost';
+    } else {
+      throw new Error(`http-connect-socket: unsupported connect() arguments`);
+    }
+    this.raw.connect(this.proxyPort, this.proxyHost);
+    return this;
+  }
+
+  override _write(
+    chunk: Buffer | string,
+    encoding: BufferEncoding,
+    cb: (err?: Error | null) => void,
+  ): void {
+    // pg (and TLS-wrapped pg) writes here after handshake completes. We
+    // forward straight to the real socket. During handshake the Duplex
+    // Writable side is unused — we call this.raw.write() directly for
+    // the CONNECT request.
+    this.raw.write(chunk, encoding, cb);
+  }
+
+  override _read(): void {
+    // No-op. push() is driven by the raw socket's 'data' event in
+    // onRawData; consumers pull from our internal buffer automatically.
+  }
+
+  override _destroy(err: Error | null, cb: (err: Error | null) => void): void {
+    if (this.handshakeTimer) clearTimeout(this.handshakeTimer);
+    this.raw.destroy(err ?? undefined);
+    cb(err);
+  }
+
+  private onProxyConnect(): void {
+    this.handshakeTimer = setTimeout(() => {
+      if (!this.handshakeComplete) {
+        this.destroy(
+          new Error(
+            `http-connect-socket: CONNECT handshake with ${this.proxyHost}:${this.proxyPort} timed out after ${this.handshakeTimeoutMs}ms`,
+          ),
+        );
+      }
+    }, this.handshakeTimeoutMs);
+    this.handshakeTimer.unref();
+
+    const req =
+      `CONNECT ${this.targetHost}:${this.targetPort} HTTP/1.1\r\n` +
+      `Host: ${this.targetHost}:${this.targetPort}\r\n` +
+      `Proxy-Connection: keep-alive\r\n\r\n`;
+    this.raw.write(req);
+  }
+
+  private onRawData(chunk: Buffer): void {
+    if (this.handshakeComplete) {
+      // Post-handshake bytes go straight to the Duplex's readable side,
+      // where pg (or the TLS wrapper around us) consumes them.
+      this.push(chunk);
+      return;
+    }
+    this.buf += chunk.toString('binary');
+    const end = this.buf.indexOf('\r\n\r\n');
     if (end === -1) return;
-    const statusLine = buf.slice(0, buf.indexOf('\r\n'));
+    const statusLine = this.buf.slice(0, this.buf.indexOf('\r\n'));
     if (!/^HTTP\/\d\.\d\s+200\b/.test(statusLine)) {
-      socket.destroy(
+      this.destroy(
         new Error(
-          `http-connect-socket: tunnel to ${targetHost}:${targetPort} denied — ${statusLine}`,
+          `http-connect-socket: tunnel to ${this.targetHost}:${this.targetPort} denied — ${statusLine}`,
         ),
       );
       return;
     }
-    // Any tunnel bytes that arrived in the same chunk as the response headers
-    // must be pushed back onto the socket for downstream consumers.
+    this.handshakeComplete = true;
+    if (this.handshakeTimer) {
+      clearTimeout(this.handshakeTimer);
+      this.handshakeTimer = null;
+    }
+
+    // Any bytes past the header boundary are real tunnel data (e.g. pg
+    // server greeting packed into the same TCP segment as the 200).
     const bodyStart = end + 4;
-    if (bodyStart < buf.length) {
-      socket.unshift(Buffer.from(buf.slice(bodyStart), 'binary'));
+    if (bodyStart < this.buf.length) {
+      this.push(Buffer.from(this.buf.slice(bodyStart), 'binary'));
     }
-    buf = '';
-    handshakeComplete = true;
-    // Replay the user's saved 'connect' listeners now that the tunnel is up.
-    // We invoke them directly rather than re-adding + emitting — the native
-    // 'connect' already fired for the proxy TCP, and we've suppressed exactly
-    // those listeners; re-emitting would be a second event.
-    for (const fn of savedConnectListeners) {
-      try {
-        fn();
-      } catch (e) {
-        socket.emit('error', e as Error);
-      }
-    }
-  });
+    this.buf = '';
 
-  // Override connect() to go to the proxy instead of the target, remembering
-  // the real target for the CONNECT line.
-  const origConnect = Socket.prototype.connect;
-  (socket as any).connect = function (...args: unknown[]): Socket {
-    // Parse target from the overloaded connect() signature.
-    //   connect(options, [connectListener])
-    //   connect(port, [host], [connectListener])
-    if (typeof args[0] === 'number') {
-      targetPort = args[0];
-      targetHost = typeof args[1] === 'string' ? args[1] : 'localhost';
-    } else if (typeof args[0] === 'object' && args[0] !== null) {
-      const opt = args[0] as { port: number; host?: string };
-      targetPort = opt.port;
-      targetHost = opt.host ?? 'localhost';
-    } else {
-      throw new Error(`http-connect-socket: unsupported connect() arguments`);
-    }
-
-    // Snapshot any 'connect' listeners the caller attached (pg, tests) and
-    // remove them — they must not fire on the raw proxy TCP connect.
-    for (const fn of socket.listeners('connect')) {
-      savedConnectListeners.push(fn as (...args: unknown[]) => void);
-    }
-    socket.removeAllListeners('connect');
-
-    // Our 'connect' listener: TCP to proxy is up, kick off the CONNECT
-    // handshake and arm a timeout.
-    socket.on('connect', () => {
-      setTimeout(() => {
-        if (!handshakeComplete) {
-          socket.destroy(
-            new Error(
-              `http-connect-socket: CONNECT handshake with ${proxyHost}:${proxyPort} timed out after ${handshakeTimeoutMs}ms`,
-            ),
-          );
-        }
-      }, handshakeTimeoutMs).unref();
-      const req =
-        `CONNECT ${targetHost}:${targetPort} HTTP/1.1\r\n` +
-        `Host: ${targetHost}:${targetPort}\r\n` +
-        `Proxy-Connection: keep-alive\r\n\r\n`;
-      socket.write(req);
-    });
-
-    // Actually dial the proxy. Cast: `connect` has many overloads; object form is valid.
-    (origConnect as (opts: { port: number; host: string }) => Socket).call(socket, {
-      port: proxyPort,
-      host: proxyHost,
-    });
-    return socket;
-  };
-
-  return socket;
+    // Emit 'connect' on the Duplex — this is the user-facing signal that
+    // the tunnel is live. pg's 'connect' handler runs next tick and starts
+    // its wire protocol, which flows through _write → raw socket.
+    this.emit('connect');
+  }
 }
 
 /**
