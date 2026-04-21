@@ -46,19 +46,9 @@ mkdir -p $HOME/work
 echo "notes" > $HOME/work/todo.txt
 ```
 
-## Package management (OpenShell with SOCKET_TOKEN)
-
-When running in OpenShell with `--provider socket`, npm routes through Socket.dev:
-
-```bash
-npm install express    # traffic goes to registry.socket.dev, scanned before install
-```
-
-The `SOCKET_TOKEN` credential is injected by the OpenShell proxy — the sandbox only sees a placeholder.
-
 ## Rules
 
 - `/db` is read-only — writes throw EROFS
 - `/tmp` is ephemeral
-- Without `DATABASE_URL`, only local temp storage (no persistence, no `pg`, no `/db`)
-- Credentials (ANTHROPIC_API_KEY, SOCKET_TOKEN) are placeholders in the sandbox — resolved by the OpenShell proxy at egress
+- Without `DATABASE_URL`, only session-local storage (no cross-session persistence, no `pg`, no `/db`)
+- `ANTHROPIC_API_KEY` stays as a placeholder in the sandbox — resolved by the OpenShell proxy at egress

@@ -1,5 +1,13 @@
 # CLAUDE.md
 
+## Documentation layout
+
+- `README.md` — **end-user** docs. Uses ONLY `openshell sandbox create ...` with the published GHCR image. No `npx`, no `pnpm`, no clone steps. This is the supported path for anyone who wants to run OpenEral.
+- `BUILD.md` — **contributor / developer** docs. All `npx openeral`, `pnpm`, `docker build`, and test-suite commands live here.
+- `CLAUDE.md` (this file) — conventions for modifying the codebase.
+
+When editing user docs, **never add `npx`/`pnpm`/`npm install` commands to `README.md`** — those belong in `BUILD.md`.
+
 ## Build & Test
 
 ```bash

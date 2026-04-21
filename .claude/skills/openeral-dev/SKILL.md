@@ -9,7 +9,9 @@ argument-hint: [task description]
 
 # OpenEral Development
 
-OpenEral gives AI agents an isolated home directory with optional PostgreSQL-backed persistence and database access. Works with stock OpenShell or standalone via `npx openeral`.
+OpenEral gives AI agents an isolated home directory with optional PostgreSQL-backed persistence and database access. This skill is for contributors modifying the OpenEral source.
+
+**End users should use the published GHCR image via `openshell sandbox create`** (see `README.md`). This skill's `npx`/`pnpm` commands apply only when you have the repo cloned locally — full developer setup is in `BUILD.md`.
 
 ## Key Files
 

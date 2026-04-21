@@ -1,6 +1,6 @@
 ---
 name: openeral-shell
-description: Launch Claude Code with an isolated home directory. Optionally backed by PostgreSQL for cross-session persistence.
+description: Launch Claude Code in an OpenShell sandbox from the published OpenEral image. Optional PostgreSQL persistence and StringCost cost tracking.
 disable-model-invocation: false
 user-invocable: true
 allowed-tools: Read, Bash, Grep, Glob
@@ -9,126 +9,95 @@ argument-hint: [optional: workspace ID]
 
 # OpenEral Shell
 
-Launch Claude Code with an isolated home directory. If `DATABASE_URL` is set, files persist to PostgreSQL across sessions. Without it, Claude Code still launches — just without persistence.
+Launch Claude Code inside an OpenShell sandbox, from the published image `ghcr.io/sandys/openeral/sandbox:just-bash`. No local clone or build required.
 
 ## Instructions
 
-When this skill is invoked, execute the following steps. Do NOT just show documentation — actually run the commands.
+When this skill is invoked, execute the steps below. Do not just show documentation — run the commands.
 
-### Step 1: Check environment
+### Step 1: Check prerequisites
 
 ```bash
-echo "DATABASE_URL=${DATABASE_URL:-(not set)}"
+which docker    || echo "MISSING docker"
+which openshell || echo "MISSING openshell — install: https://github.com/NVIDIA/OpenShell-Community"
 echo "ANTHROPIC_API_KEY=${ANTHROPIC_API_KEY:+(set)}"
-echo "OPENSHELL_SANDBOX=${OPENSHELL_SANDBOX:-0}"
+echo "DATABASE_URL=${DATABASE_URL:+(set)}"
+echo "STRINGCOST_API_KEY=${STRINGCOST_API_KEY:+(set)}"
 ```
 
-- If `DATABASE_URL` is not set:
-  - **Local path (Step 3a)**: continue without persistence — it's optional locally.
-  - **OpenShell paths (Step 3b/3c)**: stop — `DATABASE_URL` is required for OpenShell sandbox setup. Tell the user to set it.
-- If `ANTHROPIC_API_KEY` is not set, warn but continue.
+- `ANTHROPIC_API_KEY` is required; if missing, stop and ask the user to `export ANTHROPIC_API_KEY='sk-ant-...'`.
+- `DATABASE_URL` is optional — enables persistence across launches.
+- `STRINGCOST_API_KEY` is optional — enables cost tracking.
 
-### Step 2: Detect environment
-
-```bash
-[ "$OPENSHELL_SANDBOX" = "1" ] && echo "openshell" || echo "local"
-```
-
-### Step 3a: Local machine
-
-1. Find the openeral-js directory:
-```bash
-OPENERAL_DIR="$(git rev-parse --show-toplevel 2>/dev/null)/openeral-js"
-[ -d "$OPENERAL_DIR" ] || OPENERAL_DIR="$HOME/openeral/openeral-js"
-[ -d "$OPENERAL_DIR" ] && echo "found: $OPENERAL_DIR" || echo "not found"
-```
-
-2. If not found, clone and build:
-```bash
-git clone https://github.com/sandys/openeral.git /tmp/openeral-clone
-cd /tmp/openeral-clone/openeral-js
-pnpm install && pnpm build
-OPENERAL_DIR=/tmp/openeral-clone/openeral-js
-```
-
-3. If found but missing `dist/` or `node_modules/`, install and build:
-```bash
-cd "$OPENERAL_DIR" && [ -d dist ] && [ -d node_modules ] || (pnpm install && pnpm build)
-```
-
-4. Launch:
-```bash
-cd "$OPENERAL_DIR" && node dist/bin/openeral.js
-```
-
-If the user provided a workspace ID argument:
-```bash
-cd "$OPENERAL_DIR" && OPENERAL_WORKSPACE_ID="<argument>" node dist/bin/openeral.js
-```
-
-### Step 3b: Inside OpenShell sandbox
+### Step 2: Start the OpenShell gateway if it's not running
 
 ```bash
-/opt/openeral/setup.sh
-```
-
-If `/opt/openeral/` doesn't exist:
-> This sandbox doesn't have openeral. Launch with the openeral image:
-> `openshell sandbox create --from ghcr.io/sandys/openeral/sandbox:just-bash --provider db --provider claude --auto-providers -- /opt/openeral/setup.sh`
-
-### Step 3c: Launch via OpenShell from outside
-
-```bash
-which openshell || echo "Install openshell: https://github.com/NVIDIA/OpenShell"
 openshell gateway list 2>/dev/null | grep -q running || openshell gateway start
-openshell provider create --name db --type generic --credential DATABASE_URL 2>/dev/null || true
+```
 
-# Build provider list — socket is only added if SOCKET_TOKEN is set
-PROVIDERS="--provider db --provider claude"
-if [ -n "${SOCKET_TOKEN:-}" ]; then
-  openshell provider create --name socket --type generic --credential SOCKET_TOKEN 2>/dev/null || true
-  PROVIDERS="$PROVIDERS --provider socket"
+### Step 3: Build the provider list
+
+`--auto-providers` will create any missing provider from the matching local env var. We always include `claude`; we include `db` and `stringcost` only when the user has set the corresponding env var.
+
+```bash
+PROVIDERS="--provider claude"
+
+if [ -n "${DATABASE_URL:-}" ]; then
+  PROVIDERS="$PROVIDERS --provider db"
 fi
 
+if [ -n "${STRINGCOST_API_KEY:-}" ]; then
+  PROVIDERS="$PROVIDERS --provider stringcost"
+fi
+```
+
+### Step 4: Create the sandbox from the published image
+
+```bash
 openshell sandbox create \
   --from ghcr.io/sandys/openeral/sandbox:just-bash \
   $PROVIDERS --auto-providers \
   -- /opt/openeral/setup.sh
 ```
 
+`--auto-providers` pulls `ANTHROPIC_API_KEY`, `DATABASE_URL`, and `STRINGCOST_API_KEY` from the user's local shell and registers them as OpenShell providers. `setup.sh` inside the sandbox then runs migrations, seeds the workspace, starts the daemon, and exec's `claude`.
+
 ## What happens after launch
 
-- Claude Code starts with `HOME` pointing to an isolated workspace
-- Without `DATABASE_URL`: local temp home, no persistence, no `pg` command
-- With `DATABASE_URL`: files sync to PostgreSQL, `pg` command available, files survive across sessions
-- With `SOCKET_TOKEN` (OpenShell): npm routes through Socket.dev with credential injection
-- Credential injection: API keys stay as placeholders in the sandbox; the OpenShell proxy resolves them at egress
+- Claude Code starts with `HOME` pointing to the isolated sandbox workspace.
+- **Without `DATABASE_URL`**: PGlite runs in-process. Files are kept for the session, lost when the sandbox is deleted.
+- **With `DATABASE_URL`**: files sync to PostgreSQL (Supabase, Neon, RDS, self-hosted). `pg "SELECT ..."` is available inside Claude's Bash tool. Workspace restores on next launch.
+- **With `STRINGCOST_API_KEY`**: Claude's API calls route through StringCost. A permanent presign is created on first launch and reused on every subsequent one.
+
+## Managing a running sandbox
+
+```bash
+openshell sandbox list                            # list sandboxes
+openshell sandbox connect <name>                  # reattach to a sandbox
+openshell sandbox exec <name> -- <cmd>            # run a command inside
+openshell sandbox delete <name>                   # stop and remove
+```
+
+### Refresh Claude's memory files
+
+From outside the sandbox:
+
+```bash
+openshell sandbox exec <name> -- node /opt/openeral/dist/bin/openeral.js memory refresh
+openshell sandbox exec <name> -- node /opt/openeral/dist/bin/openeral.js memory refresh --query "openshell policy"
+```
+
+This rewrites `$HOME/.claude/projects/<project>/memory/*.md` inside the workspace with a backup in `.openeral-memory-backups/` unless `--no-backup` is set.
 
 ## Prompting note
 
-When asking Claude to touch files inside the isolated home, prefer `Run:` Bash commands so `$HOME` expands in the sandboxed shell:
+Claude's Write/Edit tools don't reliably expand `$HOME` or `~` to the sandbox's isolated home. When a prompt needs to touch files under `$HOME`, prefer `Run:` Bash commands so the shell expands the variable:
 
-```bash
+```
 Run: printf "%s" "hello" > "$HOME/notes.txt" && echo WRITTEN
 Run: cat "$HOME/notes.txt"
 ```
 
-Do not assume Claude's Write/Edit tools will expand `$HOME` or `~` correctly for persisted-home checks.
+## Developer path (not for end users)
 
-## Refresh memory
-
-To rebuild Claude's native project memory files inside the OpenEral home:
-
-```bash
-cd "${OPENERAL_DIR:-/opt/openeral}" && node dist/bin/openeral.js memory refresh
-```
-
-To focus memory on a specific topic:
-
-```bash
-cd "${OPENERAL_DIR:-/opt/openeral}" && node dist/bin/openeral.js memory refresh --query "openshell proxy and policy"
-```
-
-This rewrites `$HOME/.claude/projects/<project>/memory/*.md` inside the OpenEral home and keeps a backup unless `--no-backup` is used.
-
-For interactive terminal use, `npx openeral` is still fine. For repo-local automation or harnesses, prefer `node dist/bin/openeral.js` after build.
+If the user explicitly asks to run openeral without OpenShell (e.g. for local development), point them at `BUILD.md` in the repo. The supported production path is OpenShell + the published image.
