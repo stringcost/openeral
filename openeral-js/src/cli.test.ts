@@ -119,8 +119,11 @@ describe('openeral-shell skill shape', () => {
   });
 
   it('creates generic providers explicitly with KEY=VALUE (not by env lookup)', () => {
-    expect(skill).toMatch(/openshell provider create --name db[\s\S]*DATABASE_URL=/);
+    // External DATABASE_URL is not supported (see FLAG #9 in the architecture —
+    // OpenShell's HTTP-only proxy cannot route raw-TCP PostgreSQL). The only
+    // generic provider we still wire is `stringcost`.
     expect(skill).toMatch(/openshell provider create --name stringcost[\s\S]*STRINGCOST_API_KEY=/);
+    expect(skill).not.toMatch(/openshell provider create --name db\b/);
   });
 
   it('does not invoke openshell sandbox exec (which does not exist)', () => {

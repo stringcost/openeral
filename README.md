@@ -34,37 +34,23 @@ openshell sandbox create \
 
 ---
 
-## Persistence across launches (Supabase or any PostgreSQL)
+## Persistence within a sandbox
 
-By default, the sandbox workspace is recreated fresh on each launch. To make files survive, point OpenEral at any PostgreSQL database.
+By default, every sandbox starts with a fresh embedded PostgreSQL (PGlite). Files Claude writes under `$HOME` are persisted by openeral's sync layer into that PGlite database for the duration of the sandbox — so within a single sandbox lifetime, workspace state is durable across restarts, crashes, and reconnects (`openshell sandbox connect`).
 
-**Supabase** gives you a PostgreSQL connection string out of the box — copy it from Supabase dashboard → Project Settings → Database → Connection string (URI). Use the pooled (pgbouncer) connection on port `6543` or the direct connection on `5432` — whichever the dashboard gives you.
+If you delete the sandbox, the workspace is gone with it. There is no "bring-your-own PostgreSQL to persist across sandboxes" flow today — see the limitation note below.
 
-The database must be **reachable from inside the sandbox pod over the public internet** — a loopback or private-docker IP will not work. Use Supabase, Neon, RDS, or any host with a public DNS name.
+### About external PostgreSQL (Supabase, Neon, RDS, …)
 
-```bash
-export ANTHROPIC_API_KEY='sk-ant-...'
-export DATABASE_URL='postgresql://postgres.PROJECT:PASSWORD@aws-0-REGION.pooler.supabase.com:6543/postgres'
+We verified end-to-end that external PostgreSQL from inside an OpenShell sandbox is **not currently reachable** with the upstream OpenShell networking model:
 
-# Explicitly create the db provider with the connection string baked in.
-# (--auto-providers only auto-creates providers whose name matches a known type —
-# claude, openai, anthropic, etc. A "generic" provider like `db` must be created
-# explicitly before sandbox create.)
-openshell provider create --name db --type generic \
-  --credential "DATABASE_URL=$DATABASE_URL"
+- The sandbox has a single egress route to `10.200.0.1:3128`, an **HTTP CONNECT** proxy. Raw-TCP clients (the PostgreSQL wire protocol) cannot speak HTTP CONNECT, so they have no route out.
+- DNS resolution inside the sandbox is scoped to cluster services. External hostnames never resolve for raw-TCP callers.
+- L4 policy entries in `policy.yaml` (endpoints without `protocol: rest`) apply to the HTTP proxy's CONNECT tunnels — they don't open a raw-socket bypass.
 
-openshell sandbox create \
-  --from ghcr.io/sandys/openeral/sandbox:just-bash \
-  --provider claude --provider db --auto-providers \
-  -- /opt/openeral/setup.sh
-```
+Claude Code itself works because its API calls are HTTPS and it honours `HTTPS_PROXY`. PostgreSQL cannot use that path.
 
-With `DATABASE_URL` set and the `db` provider attached:
-- Every file Claude writes under `$HOME` is synced to PostgreSQL.
-- Launching again with the same database restores the workspace.
-- Claude can query the database directly via `pg "SELECT ..."` inside its Bash tool.
-
-Any PostgreSQL that accepts standard connections works — Supabase, Neon, RDS, or self-hosted. Paste the connection string **verbatim** from the provider dashboard; don't strip the port.
+Upstream OpenShell would need to add SOCKS5 / transparent TCP redirection, or an application-specific SQL proxy, before DATABASE_URL persistence can work. Track that at https://github.com/NVIDIA/OpenShell.
 
 ---
 
@@ -89,19 +75,17 @@ openshell sandbox create \
 
 `setup.sh` inside the sandbox creates a permanent StringCost presign (never expires, unlimited uses) on first launch, stores it inside the workspace, and reuses it on every subsequent launch. Claude's traffic then routes through the presign URL automatically.
 
-Combine with `--provider db` to make the presign itself persist across launches.
+The presign is stored inside the sandbox workspace (embedded PGlite) and reused as long as that sandbox lives. Delete the sandbox and the stored presign goes with it.
 
 ---
 
 ## What you get
 
 - **Isolated home** — Claude Code runs in its own `$HOME`, separate from your system
-- **Embedded database** — PGlite runs in-process; workspace state is persisted within a session, no PostgreSQL setup required
-- **Cross-session persistence** (with `DATABASE_URL`) — files survive across launches
-- **Database access** (with `DATABASE_URL`) — `pg "SELECT * FROM users LIMIT 5"` from Claude's bash
+- **Embedded database** — PGlite runs in-process; workspace state is persisted within a sandbox's lifetime, no PostgreSQL setup required
 - **Cost tracking** (with `STRINGCOST_API_KEY`) — automatic API cost metering per session
 - **Memory refresh** — rewrites Claude's native project memory files based on your workspace content
-- **Credential injection** — API keys stay as placeholders in the sandbox; the OpenShell proxy resolves them at egress
+- **Credential injection** — API keys stay as placeholders in the sandbox; the OpenShell HTTP proxy resolves them at egress
 - **Session isolation** — different sandbox = different workspace
 
 ---
@@ -126,8 +110,8 @@ ssh -F /tmp/sb-cfg openshell-<name> 'HOME=/home/agent node /opt/openeral/dist/bi
 # focus the refresh on a specific topic
 ssh -F /tmp/sb-cfg openshell-<name> 'HOME=/home/agent node /opt/openeral/dist/bin/openeral.js memory refresh --query "openshell policy"'
 
-# query the workspace database (DATABASE_URL-configured sandboxes only)
-ssh -F /tmp/sb-cfg openshell-<name> 'HOME=/home/agent pg "SELECT count(*) FROM public.users"'
+# query the embedded PGlite workspace database
+ssh -F /tmp/sb-cfg openshell-<name> 'HOME=/home/agent pg "SELECT now()"'
 ```
 
 The `HOME=/home/agent` prefix is required because SSH drops you into the default `/sandbox` home of the base image — openeral's workspace, memory files, and `.claude/` state all live under `/home/agent`.
@@ -154,36 +138,36 @@ OpenEral reads these from your local shell; `--auto-providers` makes them availa
 | Variable | Required? | What it does |
 |---|---|---|
 | `ANTHROPIC_API_KEY` | yes | Authenticates Claude Code. Backs the `claude` provider. |
-| `DATABASE_URL` | optional | PostgreSQL connection string. Backs the `db` provider. Enables cross-session persistence and the `pg` command. |
-| `STRINGCOST_API_KEY` | optional | StringCost API key. Backs the `stringcost` provider. Enables cost tracking. |
+| `STRINGCOST_API_KEY` | optional | StringCost API key. Enables cost tracking via the `stringcost` provider. |
 
 You can set them per-invocation (`ANTHROPIC_API_KEY=... openshell sandbox create ...`) or in your shell profile.
+
+External `DATABASE_URL` is intentionally omitted — see the "External PostgreSQL" note above for the architectural reason.
 
 ---
 
 ## How it works
 
 ```
-  ┌────────────────────── Sandbox ─────────────────────────┐
+  ┌─────────────────────── Sandbox ────────────────────────┐
   │  $HOME = isolated workspace                              │
   │  Claude Code (Read, Write, Edit, Bash, Glob, Grep)       │
   │                      │                                   │
   │                 file watcher                             │
   │                      │                                   │
   │  ┌───────────────────▼────────────────────────────────┐ │
-  │  │  PGlite (embedded) or external PostgreSQL          │ │
+  │  │  Embedded PGlite (stored inside the sandbox)       │ │
   │  └────────────────────────────────────────────────────┘ │
-  └──────────────────────┬───────────────────────────────────┘
-                         │
-         ┌───────────────┼────────────────┐
-         ▼               ▼                ▼
-   api.anthropic.com  StringCost    Your PostgreSQL
-   (via OpenShell    (cost proxy,  (Supabase, Neon, etc.)
-    credential        optional)
-    injection)
+  └─────────────────────────┬──────────────────────────────┘
+                            │ (HTTP-only via OpenShell proxy)
+             ┌──────────────┴─────────────┐
+             ▼                            ▼
+      api.anthropic.com              StringCost
+      (credential injection           (optional cost
+       via x-api-key placeholder)      tracking proxy)
 ```
 
-On startup, the sandbox restores the workspace from the database (PGlite or external PostgreSQL) into a real directory. Claude Code runs normally; all its tools work on real files. A background watcher syncs changes back to the database. On exit, a final sync saves everything.
+On startup, the sandbox restores the workspace from PGlite into a real directory. Claude Code runs normally; all its tools work on real files. A background watcher syncs changes back to PGlite. On exit, a final sync saves everything. The sandbox's only outbound route is the OpenShell HTTP proxy — HTTPS APIs work through it; raw-TCP clients (PostgreSQL, MySQL, Redis) do not.
 
 ---
 
@@ -195,14 +179,11 @@ On startup, the sandbox restores the workspace from the database (PGlite or exte
 **"No active gateway"** when running `openshell sandbox create`
 : Run `openshell gateway start` first.
 
-**Supabase connection fails / hangs**
-: Paste the connection string **exactly** as Supabase shows it, port and all. Test it from your laptop first: `psql "$DATABASE_URL" -c 'select 1'`. If that fails, the string is wrong. Supabase gives two strings — pooled (port 6543) and direct (port 5432); either works.
-
 **Claude Code reports "authentication failed"**
 : `export ANTHROPIC_API_KEY=...` in the shell where you run `openshell sandbox create`, and confirm `--provider claude --auto-providers` is on the command. Verify the key starts with `sk-ant-`.
 
-**Files aren't persisting across launches**
-: Confirm `DATABASE_URL` was exported, `--provider db` was on the create command, and the startup log inside the sandbox shows `openeral: persist    PostgreSQL` (not `embedded PGlite`).
+**Files disappear after deleting the sandbox**
+: Expected. The embedded PGlite lives inside the sandbox. Cross-sandbox persistence via an external PostgreSQL is not currently supported — see the "External PostgreSQL" note in the persistence section.
 
 ---
 

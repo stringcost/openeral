@@ -21,13 +21,12 @@ When this skill is invoked, execute the steps below. Do not just show documentat
 which docker    || echo "MISSING docker"
 which openshell || echo "MISSING openshell — install: https://github.com/NVIDIA/OpenShell-Community"
 echo "ANTHROPIC_API_KEY=${ANTHROPIC_API_KEY:+(set)}"
-echo "DATABASE_URL=${DATABASE_URL:+(set)}"
 echo "STRINGCOST_API_KEY=${STRINGCOST_API_KEY:+(set)}"
 ```
 
 - `ANTHROPIC_API_KEY` is required; if missing, stop and ask the user to `export ANTHROPIC_API_KEY='sk-ant-...'`.
-- `DATABASE_URL` is optional — enables persistence across launches.
 - `STRINGCOST_API_KEY` is optional — enables cost tracking.
+- External `DATABASE_URL` is NOT supported (OpenShell's HTTP-only proxy cannot route PostgreSQL; workspace persistence uses embedded PGlite inside the sandbox).
 
 ### Step 2: Start the OpenShell gateway if it's not running
 
@@ -42,12 +41,6 @@ openshell gateway info >/dev/null 2>&1 || openshell gateway start
 
 ```bash
 PROVIDERS="--provider claude"   # claude is auto-created from ANTHROPIC_API_KEY
-
-if [ -n "${DATABASE_URL:-}" ]; then
-  openshell provider create --name db --type generic \
-    --credential "DATABASE_URL=$DATABASE_URL" 2>/dev/null || true
-  PROVIDERS="$PROVIDERS --provider db"
-fi
 
 if [ -n "${STRINGCOST_API_KEY:-}" ]; then
   openshell provider create --name stringcost --type generic \
@@ -70,8 +63,7 @@ openshell sandbox create \
 ## What happens after launch
 
 - Claude Code starts with `HOME` pointing to the isolated sandbox workspace.
-- **Without `DATABASE_URL`**: PGlite runs in-process. Files are kept for the session, lost when the sandbox is deleted.
-- **With `DATABASE_URL`**: files sync to PostgreSQL (Supabase, Neon, RDS, self-hosted). `pg "SELECT ..."` is available inside Claude's Bash tool. Workspace restores on next launch.
+- **Workspace persistence**: embedded PGlite runs in-process. Files Claude writes survive restarts/reconnects within the sandbox's lifetime; they are lost when the sandbox is deleted. External PostgreSQL (Supabase/Neon/RDS) is not supported — OpenShell's proxy is HTTP-only, PostgreSQL's raw-TCP wire protocol has no route out.
 - **With `STRINGCOST_API_KEY`**: Claude's API calls route through StringCost. A permanent presign is created on first launch and reused on every subsequent one.
 
 ## Managing a running sandbox
