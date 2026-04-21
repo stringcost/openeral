@@ -1,17 +1,17 @@
 import { describe, it, expect, afterEach, beforeEach } from 'vitest';
 import { createServer, Server, Socket } from 'node:net';
 import {
-  connectViaHttpProxy,
+  createTunneledSocket,
   isLocalHost,
   resolveHttpProxy,
 } from './http-connect-socket.js';
 
 /**
- * Spin up a fake HTTP CONNECT proxy on a random port that:
- *   - Waits for `CONNECT host:port HTTP/1.1` (+ headers + blank line)
- *   - Writes back a configurable status line
- *   - On 200, echoes any subsequent client bytes back to the client
- *   - Records the target the client asked for
+ * Fake HTTP CONNECT proxy:
+ *   - accepts any connection
+ *   - parses the CONNECT request line
+ *   - writes back a configurable status line
+ *   - on 200, echoes any further client bytes back
  */
 function createFakeProxy(status: string): Promise<{
   server: Server;
@@ -33,7 +33,6 @@ function createFakeProxy(status: string): Promise<{
         sock.off('data', onData);
         sock.write(`${status}\r\n\r\n`);
         if (status.startsWith('HTTP/1.1 200')) {
-          // Echo mode: whatever the client writes next, bounce back.
           sock.on('data', (d) => sock.write(d));
         } else {
           sock.end();
@@ -58,7 +57,7 @@ function createFakeProxy(status: string): Promise<{
   });
 }
 
-describe('connectViaHttpProxy', () => {
+describe('createTunneledSocket', () => {
   let proxy: Awaited<ReturnType<typeof createFakeProxy>> | null = null;
 
   afterEach(async () => {
@@ -68,79 +67,91 @@ describe('connectViaHttpProxy', () => {
     }
   });
 
-  it('resolves a socket when the proxy returns 200', async () => {
+  it('emits synthetic connect only after CONNECT handshake succeeds', async () => {
     proxy = await createFakeProxy('HTTP/1.1 200 Connection Established');
-    const socket = await connectViaHttpProxy({
+
+    const socket = createTunneledSocket({
       proxyUrl: `http://127.0.0.1:${proxy.port}`,
-      targetHost: 'supabase.example.com',
-      targetPort: 5432,
     });
+
+    const connected = new Promise<void>((resolve) => socket.once('connect', () => resolve()));
+    // pg's contract: setNoDelay then connect(port, host).
+    socket.setNoDelay(true);
+    socket.connect(5432, 'supabase.example.com');
+
+    await connected;
     expect(proxy.lastTarget()).toBe('supabase.example.com:5432');
 
-    // Echo round-trip confirms the socket is still live and positioned after the handshake.
+    // Echo round-trip confirms the tunnel is transparent after handshake.
     const payload = Buffer.from('pg-wire-bytes');
     const echoed = await new Promise<Buffer>((resolve) => {
-      socket.on('data', (d) => resolve(d));
+      socket.once('data', (d) => resolve(d));
       socket.write(payload);
     });
     expect(echoed).toEqual(payload);
     socket.destroy();
   });
 
-  it('rejects with the proxy status line on non-200', async () => {
+  it('emits error when the proxy returns non-200', async () => {
     proxy = await createFakeProxy('HTTP/1.1 403 Forbidden');
-    await expect(
-      connectViaHttpProxy({
-        proxyUrl: `http://127.0.0.1:${proxy.port}`,
-        targetHost: 'denied.example.com',
-        targetPort: 5432,
-      }),
-    ).rejects.toThrow(/403 Forbidden/);
+
+    const socket = createTunneledSocket({
+      proxyUrl: `http://127.0.0.1:${proxy.port}`,
+    });
+
+    const err = await new Promise<Error>((resolve) => {
+      socket.once('error', resolve);
+      socket.connect(5432, 'denied.example.com');
+    });
+    expect(err.message).toMatch(/403 Forbidden/);
+    socket.destroy();
   });
 
-  it('rejects when the proxy closes without a response', async () => {
-    // Server accepts the connection and immediately closes.
-    const server = createServer((s) => s.destroy());
-    await new Promise<void>((res) => server.listen(0, '127.0.0.1', () => res()));
-    const addr = server.address();
-    const port = typeof addr === 'object' && addr ? addr.port : 0;
-    try {
-      await expect(
-        connectViaHttpProxy({
-          proxyUrl: `http://127.0.0.1:${port}`,
-          targetHost: 'supabase.example.com',
-          targetPort: 5432,
-          connectTimeoutMs: 2_000,
-          handshakeTimeoutMs: 2_000,
-        }),
-      ).rejects.toThrow();
-    } finally {
-      await new Promise<void>((res) => server.close(() => res()));
-    }
+  it('exposes setNoDelay and the pg-style connect(port, host) signature', async () => {
+    proxy = await createFakeProxy('HTTP/1.1 200 Connection Established');
+    const socket = createTunneledSocket({
+      proxyUrl: `http://127.0.0.1:${proxy.port}`,
+    });
+
+    // Neither call should throw.
+    expect(() => socket.setNoDelay(true)).not.toThrow();
+    expect(() => socket.setKeepAlive(true)).not.toThrow();
+
+    const connected = new Promise<void>((r) => socket.once('connect', () => r()));
+    socket.connect(5432, 'target.example.com');
+    await connected;
+
+    socket.destroy();
   });
 
-  it('validates the proxy URL', async () => {
-    await expect(
-      connectViaHttpProxy({
-        proxyUrl: 'not-a-url',
-        targetHost: 'x',
-        targetPort: 1,
-      }),
-    ).rejects.toThrow(/invalid proxy URL/);
-    await expect(
-      connectViaHttpProxy({
-        proxyUrl: 'https://example.com:443',
-        targetHost: 'x',
-        targetPort: 1,
-      }),
-    ).rejects.toThrow(/must be http/);
+  it('rejects a non-http proxy URL', () => {
+    expect(() =>
+      createTunneledSocket({ proxyUrl: 'https://example.com:443' }),
+    ).toThrow(/must be http/);
+  });
+
+  it('rejects a malformed proxy URL', () => {
+    expect(() => createTunneledSocket({ proxyUrl: 'not-a-url' })).toThrow(/Invalid URL/);
+  });
+
+  it('accepts object-form connect({ port, host })', async () => {
+    proxy = await createFakeProxy('HTTP/1.1 200 Connection Established');
+    const socket = createTunneledSocket({
+      proxyUrl: `http://127.0.0.1:${proxy.port}`,
+    });
+
+    const connected = new Promise<void>((r) => socket.once('connect', () => r()));
+    // node-postgres typically passes { port, host }.
+    (socket as any).connect({ port: 6543, host: 'pooler.example.com' });
+    await connected;
+    expect(proxy.lastTarget()).toBe('pooler.example.com:6543');
+    socket.destroy();
   });
 });
 
 describe('resolveHttpProxy', () => {
-  const originals: Record<string, string | undefined> = {};
   const keys = ['HTTPS_PROXY', 'https_proxy', 'HTTP_PROXY', 'http_proxy', 'ALL_PROXY'];
-
+  const originals: Record<string, string | undefined> = {};
   beforeEach(() => {
     for (const k of keys) {
       originals[k] = process.env[k];
@@ -154,11 +165,11 @@ describe('resolveHttpProxy', () => {
     }
   });
 
-  it('returns undefined when no proxy env is set', () => {
+  it('returns undefined with no proxy env', () => {
     expect(resolveHttpProxy({})).toBeUndefined();
   });
 
-  it('prefers HTTPS_PROXY', () => {
+  it('prefers HTTPS_PROXY over others', () => {
     expect(
       resolveHttpProxy({
         HTTPS_PROXY: 'http://a:1',
@@ -168,7 +179,7 @@ describe('resolveHttpProxy', () => {
     ).toBe('http://a:1');
   });
 
-  it('falls back through the OpenShell env precedence', () => {
+  it('falls back through OpenShell precedence order', () => {
     expect(resolveHttpProxy({ https_proxy: 'http://b:2' })).toBe('http://b:2');
     expect(resolveHttpProxy({ HTTP_PROXY: 'http://c:3' })).toBe('http://c:3');
     expect(resolveHttpProxy({ http_proxy: 'http://d:4' })).toBe('http://d:4');

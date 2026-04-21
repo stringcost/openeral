@@ -6,141 +6,143 @@
  * HTTP proxy at `10.200.0.1:3128`. Raw TCP to an external PostgreSQL host
  * cannot leave the sandbox.
  *
- * The HTTP CONNECT proxy, however, accepts a `CONNECT host:port` request and —
- * once it returns `200 Connection Established` — relays bytes bidirectionally
- * without further inspection. That relay carries anything: the pg wire
- * protocol, its end-to-end TLS handshake with Supabase, everything.
+ * The HTTP CONNECT proxy accepts a `CONNECT host:port` request and — once it
+ * returns `200 Connection Established` — relays bytes bidirectionally without
+ * further inspection. That relay carries anything: pg wire protocol, its
+ * end-to-end TLS handshake with Supabase, everything.
  *
- * `connectViaHttpProxy()` produces a Node `net.Socket` that is already past
- * the CONNECT handshake, ready to be handed to node-postgres via the Pool's
- * `stream` factory option. pg then writes its own wire protocol (including
- * its own TLS) onto the tunneled socket and the proxy just shuttles bytes.
+ * This module produces a `net.Socket` whose `.connect(port, host)` transparently
+ * routes through the proxy. It's designed to match pg 8.20's `stream` option
+ * contract: the factory returns a **synchronous** Socket, pg then calls
+ * `setNoDelay(true)` and `.connect(port, host)` on it, and pg's `'connect'`
+ * listener fires only after the tunnel is established. No Promise-returning
+ * API (pg doesn't await the factory result).
  */
 
-import { Socket, createConnection } from 'node:net';
+import { Socket } from 'node:net';
 import { URL } from 'node:url';
 
-export interface HttpConnectOptions {
+export interface TunneledSocketOptions {
   /** Proxy URL — e.g. "http://10.200.0.1:3128". Must be http, not https. */
   proxyUrl: string;
-  /** Target host the tunnel should reach (DNS is done proxy-side). */
-  targetHost: string;
-  /** Target port. */
-  targetPort: number;
-  /** TCP connect timeout for reaching the proxy (ms). Default 15_000. */
-  connectTimeoutMs?: number;
-  /** CONNECT handshake read timeout (ms). Default 15_000. */
+  /** CONNECT handshake timeout (ms) after the proxy TCP connection is up. */
   handshakeTimeoutMs?: number;
 }
 
 /**
- * Open a TCP socket, negotiate HTTP CONNECT against `proxyUrl`, and resolve
- * a `Socket` that is positioned at the start of the tunneled byte stream.
+ * Return a synchronous `net.Socket` whose `.connect(port, host)` actually
+ * routes through an HTTP CONNECT proxy. Suitable for passing as pg's
+ * `PoolConfig.stream` factory.
  *
- * On non-200 responses, rejects with an error whose message includes the full
- * status line so the proxy's deny reason is surfaced (e.g. `403 binary policy
- * denied`, `502 upstream dns lookup failed`).
+ * Internals:
+ *   - Override `connect(port, host)` to TCP-connect to the PROXY instead,
+ *     and remember the real target.
+ *   - At `.connect()` time, snapshot any user-registered `'connect'` listeners
+ *     (pg's own) and remove them. They must not fire on the raw proxy TCP
+ *     connect — the tunnel isn't ready yet. We replay them after the
+ *     CONNECT handshake succeeds.
+ *   - Install our own `'connect'` listener that writes `CONNECT target:port`
+ *     to the already-open proxy socket.
+ *   - A `'data'` listener parses the CONNECT response. On `200`, we replay
+ *     the saved user listeners — so pg's `'connect'` handler fires exactly
+ *     once, and only after the tunnel is ready.
+ *   - On non-200, destroy the socket with an error whose message includes
+ *     the full proxy status line so misconfigurations are diagnosable.
+ *
+ * We deliberately do NOT intercept `emit('connect')`. Suppressing the native
+ * emission breaks stream.Readable's internal flow-mode activation — after
+ * which `'data'` never fires and the CONNECT response is silently dropped.
  */
-export function connectViaHttpProxy(opts: HttpConnectOptions): Promise<Socket> {
-  const {
-    proxyUrl,
-    targetHost,
-    targetPort,
-    connectTimeoutMs = 15_000,
-    handshakeTimeoutMs = 15_000,
-  } = opts;
+export function createTunneledSocket(opts: TunneledSocketOptions): Socket {
+  const { proxyUrl, handshakeTimeoutMs = 15_000 } = opts;
 
-  let proxy: URL;
-  try {
-    proxy = new URL(proxyUrl);
-  } catch (err) {
-    return Promise.reject(new Error(`http-connect-socket: invalid proxy URL ${proxyUrl}`));
+  const proxyU = new URL(proxyUrl);
+  if (proxyU.protocol !== 'http:') {
+    throw new Error(`http-connect-socket: proxy must be http://, got ${proxyU.protocol}`);
   }
-  if (proxy.protocol !== 'http:') {
-    return Promise.reject(
-      new Error(`http-connect-socket: proxy must be http://, got ${proxy.protocol}`),
-    );
-  }
-  const proxyHost = proxy.hostname;
-  const proxyPort = parseInt(proxy.port || '80', 10);
+  const proxyHost = proxyU.hostname;
+  const proxyPort = parseInt(proxyU.port || '80', 10);
 
-  return new Promise<Socket>((resolve, reject) => {
-    const socket = createConnection({ host: proxyHost, port: proxyPort });
-    let buf = '';
-    let settled = false;
+  const socket = new Socket();
+  let targetHost = '';
+  let targetPort = 0;
+  let handshakeComplete = false;
+  let buf = '';
+  const savedConnectListeners: Array<(...args: unknown[]) => void> = [];
 
-    const connectTimer = setTimeout(() => {
-      if (settled) return;
-      settled = true;
-      socket.destroy();
-      reject(
+  // Data listener catches the proxy's CONNECT response.
+  socket.on('data', (chunk: Buffer) => {
+    if (handshakeComplete) return; // normal tunnel data — let other listeners handle
+    buf += chunk.toString('binary');
+    const end = buf.indexOf('\r\n\r\n');
+    if (end === -1) return;
+    const statusLine = buf.slice(0, buf.indexOf('\r\n'));
+    if (!/^HTTP\/\d\.\d\s+200\b/.test(statusLine)) {
+      socket.destroy(
         new Error(
-          `http-connect-socket: TCP connect to proxy ${proxyHost}:${proxyPort} timed out after ${connectTimeoutMs}ms`,
+          `http-connect-socket: tunnel to ${targetHost}:${targetPort} denied — ${statusLine}`,
         ),
       );
-    }, connectTimeoutMs);
-
-    let handshakeTimer: NodeJS.Timeout | null = null;
-
-    const finish = (err: Error | null, s?: Socket) => {
-      if (settled) return;
-      settled = true;
-      clearTimeout(connectTimer);
-      if (handshakeTimer) clearTimeout(handshakeTimer);
-      socket.removeListener('data', onData);
-      socket.removeListener('error', onError);
-      socket.removeListener('end', onEnd);
-      if (err) {
-        socket.destroy();
-        reject(err);
-      } else {
-        resolve(s!);
+      return;
+    }
+    // Any tunnel bytes that arrived in the same chunk as the response headers
+    // must be pushed back onto the socket for downstream consumers.
+    const bodyStart = end + 4;
+    if (bodyStart < buf.length) {
+      socket.unshift(Buffer.from(buf.slice(bodyStart), 'binary'));
+    }
+    buf = '';
+    handshakeComplete = true;
+    // Replay the user's saved 'connect' listeners now that the tunnel is up.
+    // We invoke them directly rather than re-adding + emitting — the native
+    // 'connect' already fired for the proxy TCP, and we've suppressed exactly
+    // those listeners; re-emitting would be a second event.
+    for (const fn of savedConnectListeners) {
+      try {
+        fn();
+      } catch (e) {
+        socket.emit('error', e as Error);
       }
-    };
+    }
+  });
 
-    const onData = (chunk: Buffer) => {
-      buf += chunk.toString('binary');
-      const headerEnd = buf.indexOf('\r\n\r\n');
-      if (headerEnd === -1) return; // keep buffering
-      const statusLine = buf.slice(0, buf.indexOf('\r\n'));
-      // Spec: HTTP/1.1 200 Connection Established
-      const match = statusLine.match(/^HTTP\/\d\.\d\s+(\d{3})\s*(.*)$/);
-      if (!match) {
-        finish(new Error(`http-connect-socket: unparseable proxy response: ${statusLine}`));
-        return;
-      }
-      const status = parseInt(match[1], 10);
-      if (status !== 200) {
-        finish(
-          new Error(
-            `http-connect-socket: tunnel to ${targetHost}:${targetPort} denied — ${statusLine}`,
-          ),
-        );
-        return;
-      }
-      // Any payload bytes arrived after the \r\n\r\n belong to the tunnel —
-      // unshift them back so the pg client reads them first.
-      const bodyStart = headerEnd + 4;
-      if (bodyStart < buf.length) {
-        socket.unshift(Buffer.from(buf.slice(bodyStart), 'binary'));
-      }
-      finish(null, socket);
-    };
+  // Override connect() to go to the proxy instead of the target, remembering
+  // the real target for the CONNECT line.
+  const origConnect = Socket.prototype.connect;
+  (socket as any).connect = function (...args: unknown[]): Socket {
+    // Parse target from the overloaded connect() signature.
+    //   connect(options, [connectListener])
+    //   connect(port, [host], [connectListener])
+    if (typeof args[0] === 'number') {
+      targetPort = args[0];
+      targetHost = typeof args[1] === 'string' ? args[1] : 'localhost';
+    } else if (typeof args[0] === 'object' && args[0] !== null) {
+      const opt = args[0] as { port: number; host?: string };
+      targetPort = opt.port;
+      targetHost = opt.host ?? 'localhost';
+    } else {
+      throw new Error(`http-connect-socket: unsupported connect() arguments`);
+    }
 
-    const onError = (err: Error) => finish(err);
-    const onEnd = () =>
-      finish(new Error('http-connect-socket: proxy closed connection before CONNECT response'));
+    // Snapshot any 'connect' listeners the caller attached (pg, tests) and
+    // remove them — they must not fire on the raw proxy TCP connect.
+    for (const fn of socket.listeners('connect')) {
+      savedConnectListeners.push(fn as (...args: unknown[]) => void);
+    }
+    socket.removeAllListeners('connect');
 
-    socket.once('connect', () => {
-      clearTimeout(connectTimer);
-      handshakeTimer = setTimeout(() => {
-        finish(
-          new Error(
-            `http-connect-socket: CONNECT handshake with ${proxyHost}:${proxyPort} timed out after ${handshakeTimeoutMs}ms`,
-          ),
-        );
-      }, handshakeTimeoutMs);
-
+    // Our 'connect' listener: TCP to proxy is up, kick off the CONNECT
+    // handshake and arm a timeout.
+    socket.on('connect', () => {
+      setTimeout(() => {
+        if (!handshakeComplete) {
+          socket.destroy(
+            new Error(
+              `http-connect-socket: CONNECT handshake with ${proxyHost}:${proxyPort} timed out after ${handshakeTimeoutMs}ms`,
+            ),
+          );
+        }
+      }, handshakeTimeoutMs).unref();
       const req =
         `CONNECT ${targetHost}:${targetPort} HTTP/1.1\r\n` +
         `Host: ${targetHost}:${targetPort}\r\n` +
@@ -148,10 +150,15 @@ export function connectViaHttpProxy(opts: HttpConnectOptions): Promise<Socket> {
       socket.write(req);
     });
 
-    socket.on('data', onData);
-    socket.on('error', onError);
-    socket.on('end', onEnd);
-  });
+    // Actually dial the proxy. Cast: `connect` has many overloads; object form is valid.
+    (origConnect as (opts: { port: number; host: string }) => Socket).call(socket, {
+      port: proxyPort,
+      host: proxyHost,
+    });
+    return socket;
+  };
+
+  return socket;
 }
 
 /**
@@ -160,13 +167,17 @@ export function connectViaHttpProxy(opts: HttpConnectOptions): Promise<Socket> {
  */
 export function resolveHttpProxy(env: NodeJS.ProcessEnv = process.env): string | undefined {
   return (
-    env.HTTPS_PROXY || env.https_proxy || env.HTTP_PROXY || env.http_proxy || env.ALL_PROXY || undefined
+    env.HTTPS_PROXY ||
+    env.https_proxy ||
+    env.HTTP_PROXY ||
+    env.http_proxy ||
+    env.ALL_PROXY ||
+    undefined
   );
 }
 
 /**
- * Is the given hostname "local" (loopback or unset)? Used to decide whether
- * a connection needs tunneling.
+ * Is the given hostname "local" (loopback or unset)?
  */
 export function isLocalHost(host: string | undefined): boolean {
   if (!host) return true;
