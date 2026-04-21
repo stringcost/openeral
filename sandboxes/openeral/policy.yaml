@@ -195,6 +195,46 @@ network_policies:
       - { path: /usr/local/bin/claude }
       - { path: /usr/bin/node }
 
+  # --- External PostgreSQL (Supabase) via HTTP CONNECT tunnel ---
+  # pg traffic cannot bypass OpenShell's HTTP proxy — the sandbox netns REJECTs
+  # all raw TCP. openeral-js wraps its pg socket with an HTTP CONNECT handshake
+  # (see src/db/http-connect-socket.ts) so the proxy sees `CONNECT host:port`
+  # from /usr/bin/node, allows it per this policy, and then bidirectionally
+  # relays bytes. pg negotiates its own end-to-end TLS with Supabase inside
+  # the tunnel; the proxy never inspects payloads (no `protocol:` field).
+  #
+  # Host matching in OPA is literal — every Supabase region you use needs an
+  # explicit entry here. If your pooler host is not listed, rebuild the image
+  # with your host appended.
+  postgres:
+    name: postgres
+    endpoints:
+      # Supabase pooler — session mode (5432) and transaction mode (6543)
+      - { host: aws-0-ap-south-1.pooler.supabase.com, port: 5432 }
+      - { host: aws-0-ap-south-1.pooler.supabase.com, port: 6543 }
+      - { host: aws-0-ap-southeast-1.pooler.supabase.com, port: 5432 }
+      - { host: aws-0-ap-southeast-1.pooler.supabase.com, port: 6543 }
+      - { host: aws-0-ap-southeast-2.pooler.supabase.com, port: 5432 }
+      - { host: aws-0-ap-southeast-2.pooler.supabase.com, port: 6543 }
+      - { host: aws-1-ap-northeast-1.pooler.supabase.com, port: 5432 }
+      - { host: aws-1-ap-northeast-1.pooler.supabase.com, port: 6543 }
+      - { host: aws-0-us-east-1.pooler.supabase.com, port: 5432 }
+      - { host: aws-0-us-east-1.pooler.supabase.com, port: 6543 }
+      - { host: aws-0-us-east-2.pooler.supabase.com, port: 5432 }
+      - { host: aws-0-us-east-2.pooler.supabase.com, port: 6543 }
+      - { host: aws-0-us-west-1.pooler.supabase.com, port: 5432 }
+      - { host: aws-0-us-west-1.pooler.supabase.com, port: 6543 }
+      - { host: aws-0-eu-west-1.pooler.supabase.com, port: 5432 }
+      - { host: aws-0-eu-west-1.pooler.supabase.com, port: 6543 }
+      - { host: aws-0-eu-west-2.pooler.supabase.com, port: 5432 }
+      - { host: aws-0-eu-west-2.pooler.supabase.com, port: 6543 }
+      - { host: aws-0-eu-central-1.pooler.supabase.com, port: 5432 }
+      - { host: aws-0-eu-central-1.pooler.supabase.com, port: 6543 }
+      - { host: aws-0-sa-east-1.pooler.supabase.com, port: 5432 }
+      - { host: aws-0-sa-east-1.pooler.supabase.com, port: 6543 }
+    binaries:
+      - { path: /usr/bin/node }
+
   # --- Copilot ---
   copilot:
     name: copilot

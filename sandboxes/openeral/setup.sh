@@ -39,7 +39,36 @@ mkdir -p "$OPENERAL_DATA_DIR"
 
 # If DATABASE_URL is provided (external PostgreSQL), propagate it so
 # getDatabaseConnection() picks it up over PGlite.
+#
+# Resolution order:
+#   1. DATABASE_URL / OPENERAL_DATABASE_URL already set in env — use it,
+#      unless it's an OpenShell placeholder (which happens when the URL was
+#      delivered via `openshell provider create --credential`; the provider
+#      framework wraps every credential as a placeholder that only HTTP L7
+#      inspection can resolve, and pg cannot use it).
+#   2. Uploaded plaintext file at /sandbox/db-url (via `openshell sandbox
+#      create --upload /tmp/db-url:/sandbox/db-url`). This is the only
+#      documented way to deliver a usable raw-TCP credential into the sandbox.
+#      --upload copies the source filename into the target directory, so
+#      either `/sandbox/db-url` (file) or `/sandbox/db-url/<name>` (dir) works.
 export DATABASE_URL="${DATABASE_URL:-${OPENERAL_DATABASE_URL:-}}"
+case "${DATABASE_URL:-}" in
+  ''|openshell:resolve:env:*)
+    if [ -f /sandbox/db-url ]; then
+      DATABASE_URL="$(cat /sandbox/db-url)"
+      export DATABASE_URL
+      echo "setup.sh: loaded DATABASE_URL from uploaded /sandbox/db-url"
+    elif [ -d /sandbox/db-url ]; then
+      # If the upload was a file, --upload put it inside the target dir.
+      first="$(find /sandbox/db-url -maxdepth 1 -type f | head -1)"
+      if [ -n "$first" ]; then
+        DATABASE_URL="$(cat "$first")"
+        export DATABASE_URL
+        echo "setup.sh: loaded DATABASE_URL from uploaded $first"
+      fi
+    fi
+    ;;
+esac
 
 # StringCost integration.
 #

@@ -26,7 +26,7 @@ echo "STRINGCOST_API_KEY=${STRINGCOST_API_KEY:+(set)}"
 
 - `ANTHROPIC_API_KEY` is required; if missing, stop and ask the user to `export ANTHROPIC_API_KEY='sk-ant-...'`.
 - `STRINGCOST_API_KEY` is optional — enables cost tracking.
-- External `DATABASE_URL` is NOT supported (OpenShell's HTTP-only proxy cannot route PostgreSQL; workspace persistence uses embedded PGlite inside the sandbox).
+- `DATABASE_URL` (Supabase / Neon / RDS) is optional — enables cross-sandbox persistence. It must be delivered via `openshell sandbox create --upload` (plaintext file); the provider framework wraps credentials as placeholders that pg cannot resolve.
 
 ### Step 2: Start the OpenShell gateway if it's not running
 
@@ -47,6 +47,13 @@ if [ -n "${STRINGCOST_API_KEY:-}" ]; then
     --credential "STRINGCOST_API_KEY=$STRINGCOST_API_KEY" 2>/dev/null || true
   PROVIDERS="$PROVIDERS --provider stringcost"
 fi
+
+UPLOAD_ARGS=""
+if [ -n "${DATABASE_URL:-}" ]; then
+  printf '%s' "$DATABASE_URL" > /tmp/db-url
+  chmod 600 /tmp/db-url
+  UPLOAD_ARGS="--upload /tmp/db-url"
+fi
 ```
 
 ### Step 4: Create the sandbox from the published image
@@ -54,16 +61,19 @@ fi
 ```bash
 openshell sandbox create \
   --from ghcr.io/sandys/openeral/sandbox:just-bash \
+  $UPLOAD_ARGS \
   $PROVIDERS --auto-providers \
   -- /opt/openeral/setup.sh
 ```
 
-`--auto-providers` creates the `claude` provider from the local `ANTHROPIC_API_KEY`. The `db` and `stringcost` providers created in Step 3 are attached. `setup.sh` inside the sandbox then runs migrations, seeds the workspace, starts the daemon, and exec's `claude`.
+`--auto-providers` creates the `claude` provider from the local `ANTHROPIC_API_KEY`. The `stringcost` provider from Step 3 is attached. `DATABASE_URL`, if present, is delivered as a plaintext file via `--upload`; `setup.sh` reads `/sandbox/db-url` and pg tunnels through OpenShell's HTTP CONNECT proxy to Supabase.
 
 ## What happens after launch
 
 - Claude Code starts with `HOME` pointing to the isolated sandbox workspace.
-- **Workspace persistence**: embedded PGlite runs in-process. Files Claude writes survive restarts/reconnects within the sandbox's lifetime; they are lost when the sandbox is deleted. External PostgreSQL (Supabase/Neon/RDS) is not supported — OpenShell's proxy is HTTP-only, PostgreSQL's raw-TCP wire protocol has no route out.
+- **Workspace persistence**:
+  - Without `DATABASE_URL`: embedded PGlite runs in-process. Files survive restarts/reconnects within the sandbox's lifetime; lost when the sandbox is deleted.
+  - With `DATABASE_URL` delivered via `--upload /tmp/db-url`: pg tunnels through OpenShell's HTTP CONNECT proxy (via `openeral-js/src/db/http-connect-socket.ts`) to Supabase / Neon / RDS. Workspace survives sandbox delete and is shared across machines. The host must be allowlisted in the image's `postgres` network policy — common Supabase poolers are pre-allowlisted.
 - **With `STRINGCOST_API_KEY`**: Claude's API calls route through StringCost. A permanent presign is created on first launch and reused on every subsequent one.
 
 ## Managing a running sandbox
