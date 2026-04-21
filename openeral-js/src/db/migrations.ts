@@ -138,6 +138,29 @@ export async function runMigrations(pool: DbPool): Promise<void> {
         CREATE INDEX IF NOT EXISTS idx_api_cache_created
             ON _openeral.api_cache (created_at)
       `);
+
+      // V6: grant read access to Supabase's built-in dashboard/API roles so
+      // `_openeral.*` rows are visible in the Table Editor and via PostgREST.
+      // On non-Supabase PostgreSQL these roles don't exist; the GRANT fails
+      // with `role "..." does not exist` and we ignore it — strictly a
+      // visibility fix for Supabase-hosted databases.
+      for (const role of ['service_role', 'dashboard_user', 'authenticated', 'anon']) {
+        try {
+          await client.query(`GRANT USAGE ON SCHEMA _openeral TO ${role}`);
+        } catch (err) {
+          if ((err as { code?: string }).code !== '42704') throw err; // undefined_object
+        }
+      }
+      for (const role of ['service_role', 'dashboard_user']) {
+        try {
+          await client.query(`GRANT SELECT ON ALL TABLES IN SCHEMA _openeral TO ${role}`);
+          await client.query(
+            `ALTER DEFAULT PRIVILEGES IN SCHEMA _openeral GRANT SELECT ON TABLES TO ${role}`,
+          );
+        } catch (err) {
+          if ((err as { code?: string }).code !== '42704') throw err;
+        }
+      }
     } finally {
       await client.query(`SELECT pg_advisory_unlock(1330795854)`);
     }
