@@ -204,3 +204,61 @@ bash tests/test_sandbox_e2e.sh
 bash tests/test_setup_e2e.sh
 ANTHROPIC_API_KEY='...' DATABASE_URL='...' bash tests/test_claude_e2e.sh
 ```
+
+---
+
+## Architecture
+
+```
+  ┌─────────────────────── Sandbox ─────────────────────────┐
+  │  $HOME = isolated workspace                                │
+  │  Claude Code (Read, Write, Edit, Bash, Glob, Grep)         │
+  │                      │                                     │
+  │                 file watcher                               │
+  │                      │                                     │
+  │  openeral-js sync ───▼──────────────────────────────────┐  │
+  │  PGlite (default)  OR  pg.Pool wrapped in a CONNECT-    │  │
+  │                         tunneled Duplex (with --upload) │  │
+  │  ───────────────────────────────────────────────────────┘  │
+  └────────────────────────┬───────────────────────────────────┘
+                           │  (all egress via OpenShell HTTP CONNECT proxy)
+          ┌────────────────┼────────────────┐
+          ▼                ▼                ▼
+   api.anthropic.com   StringCost      Supabase pg wire protocol
+   (x-api-key          (cost tracking  (CONNECT tunnel; pg negotiates
+    placeholder         proxy)          its own TLS end-to-end)
+    resolved at proxy)
+```
+
+Every outbound connection from the sandbox goes through OpenShell's HTTP CONNECT proxy at `10.200.0.1:3128` — kernel-level iptables reject any other TCP.
+
+### How pg reaches Supabase
+
+pg doesn't speak HTTP CONNECT. `openeral-js/src/db/http-connect-socket.ts` wraps a raw `net.Socket` in a `Duplex`: when pg calls `.connect(port, host)`, the Duplex dials the proxy, writes `CONNECT host:port HTTP/1.1`, waits for `200 Connection Established`, and only then emits `'connect'` upward. pg's own TLS handshake runs end-to-end inside the tunnel, so Supabase credentials never reach the proxy.
+
+### Why credentials come through `--upload`, not `--provider`
+
+OpenShell's `SecretResolver` unconditionally wraps every provider credential as an `openshell:resolve:env:*` placeholder that is only rewritten when the HTTP proxy terminates TLS and inspects request headers. pg uses raw TCP, so it can't resolve placeholders — it would try to literally connect to a host named `openshell:resolve:env:DATABASE_URL`.
+
+`openshell sandbox create --upload <file>` is the one channel that delivers bytes verbatim. `setup.sh` reads `/sandbox/db-url` at startup, exports `DATABASE_URL`, and everything downstream sees the real URL.
+
+### Custom PostgreSQL hosts
+
+The shipped `policy.yaml` allowlists common Supabase pooler regions under the `postgres` network policy. To add a host (different region, Neon, RDS, self-hosted), append its `host:port` entry and rebuild:
+
+```yaml
+# sandboxes/openeral/policy.yaml
+network_policies:
+  postgres:
+    endpoints:
+      - { host: your-host.example.com, port: 5432, tls: skip }
+      - { host: your-host.example.com, port: 6543, tls: skip }
+    binaries:
+      - { path: /usr/bin/node }
+```
+
+Then rebuild and push the image (or use `--dev` with a locally-tagged image).
+
+### `_openeral` schema on Supabase
+
+Migration V6 grants `USAGE` on the schema to `service_role, dashboard_user, authenticated, anon` and `SELECT` on all tables to `service_role, dashboard_user`. Without these, the Supabase Table Editor shows the schema but none of its rows — the tables are owned by `postgres` and only readable there. The V6 grants wrap each role in a try/catch on `42704` (undefined role) so the migration still succeeds on non-Supabase databases where those roles don't exist.
