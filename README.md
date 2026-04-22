@@ -115,4 +115,4 @@ The `HOME=/home/agent` prefix is required — SSH drops you into the base image'
 
 ## Under the hood & contributing
 
-Architecture, sandbox internals (HTTP CONNECT tunneling, credential injection, allowlist rebuild), local dev with `npx openeral`, and the test suite → [BUILD.md](./BUILD.md).
+Architecture, sandbox internals (HTTP CONNECT tunneling, credential injection, allowlist rebuild), local dev, and the test suite → [BUILD.md](./BUILD.md).

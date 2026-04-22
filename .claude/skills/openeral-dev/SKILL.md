@@ -25,7 +25,8 @@ openeral-js/src/
   workspace-fs/workspace-fs.ts # WorkspaceFs: read-write → workspace_files table
   db/queries.ts               # All SQL (introspection, rows, stats, indexes)
   db/workspace-queries.ts     # Workspace CRUD
-  db/migrations.ts            # V1-V4 schema migrations
+  db/migrations.ts            # V1-V6 schema migrations (incl. Supabase-role grants)
+  db/http-connect-socket.ts   # Duplex wrapper: pg over HTTP CONNECT proxy
   safety.ts                   # Command analysis via just-bash parse() AST
   shell.ts                    # createOpeneralShell(), createToolHandler()
 
@@ -41,7 +42,7 @@ sandboxes/openeral/
 ```bash
 cd openeral-js
 pnpm install && pnpm build
-pnpm check                                      # typecheck + 29 lints + 78 unit tests
+pnpm check                                      # typecheck + structural lints + unit tests
 DATABASE_URL='...' node test-integration.mjs     # integration against live PostgreSQL
 DATABASE_URL='...' node test-memory-refresh.mjs  # memory refresh persistence
 DATABASE_URL='...' bash ../tests/test_sandbox_e2e.sh   # Docker image verification
@@ -68,4 +69,4 @@ Key rules: imports resolve, exports match, just-bash >=2.x, PgFs throws EROFS, n
 
 ## Migrations
 
-Auto-run in `createOpeneralShell()` and CLI. Schema: `_openeral` with tables `workspace_config`, `workspace_files`, `schema_version`, `mount_log`, `cache_hints`. Must be idempotent.
+Auto-run in `createOpeneralShell()` and CLI. Schema: `_openeral` with tables `workspace_config`, `workspace_files`, `schema_version`, `mount_log`, `cache_hints`, `optimization_metrics`, `api_cache`. V6 grants `USAGE` + `SELECT` to Supabase roles (`service_role`, `dashboard_user`, `authenticated`, `anon`) — wrapped in try/catch on `42704` so non-Supabase PostgreSQL still runs cleanly. Must be idempotent.
