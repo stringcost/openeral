@@ -28,10 +28,17 @@ RUN chmod a+rx /opt/openeral/openeral-bash.mjs \
 # Rename real bash so openeral-bash can fall back to it for interactive use
 RUN cp /bin/bash /bin/bash.real
 
-# Setup script (entry point for sandbox create)
+# Setup script (entry point for sandbox create).
+#
+# Users invoke this as the trailing command of `openshell sandbox create`.
+# OpenShell doesn't honour Docker ENTRYPOINT/CMD — the image's native entry is
+# overridden by openshell's own supervisor, and an empty trailing command just
+# leaves the pod asleep. Shipping a short /usr/local/bin/openeral shim lets the
+# end-user command end in `-- openeral` instead of `-- /opt/openeral/setup.sh`.
 COPY sandboxes/openeral/setup.sh /opt/openeral/setup.sh
 RUN chmod 755 /opt/openeral/setup.sh \
-    && chown sandbox:sandbox /opt/openeral/setup.sh
+    && chown sandbox:sandbox /opt/openeral/setup.sh \
+    && ln -sf /opt/openeral/setup.sh /usr/local/bin/openeral
 
 # Override the upstream base policy
 COPY sandboxes/openeral/policy.yaml /etc/openshell/policy.yaml

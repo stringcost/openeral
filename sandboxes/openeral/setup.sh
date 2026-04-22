@@ -3,7 +3,9 @@ set -euo pipefail
 
 # setup.sh — OpenEral sandbox entry point
 #
-# Called by: openshell sandbox create ... -- /opt/openeral/setup.sh
+# Called by: openshell sandbox create ... -- openeral
+# (or, equivalently, -- /opt/openeral/setup.sh — the `openeral` name is a
+# /usr/local/bin shim installed in the Dockerfile.)
 #
 # Steps:
 #   1. Run database migrations

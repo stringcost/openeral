@@ -21,7 +21,7 @@ openshell provider create \
 openshell sandbox create \
   --from ghcr.io/sandys/openeral/sandbox:just-bash \
   --provider db --provider claude --auto-providers \
-  -- /opt/openeral/setup.sh
+  -- openeral
 ```
 
 ## What setup.sh does

@@ -27,7 +27,7 @@ openshell gateway start
 openshell sandbox create \
   --from ghcr.io/sandys/openeral/sandbox:just-bash \
   --provider claude --auto-providers \
-  -- /opt/openeral/setup.sh
+  -- openeral
 ```
 
 `--auto-providers` reads `ANTHROPIC_API_KEY` from your local environment, creates an OpenShell `claude` provider, and attaches it to the sandbox. Claude Code launches inside with an isolated `$HOME`. Files you create are kept inside the workspace for the duration of the sandbox. No local database required — OpenEral uses an embedded PGlite inside the sandbox.
@@ -54,7 +54,7 @@ openshell sandbox create \
   --from ghcr.io/sandys/openeral/sandbox:just-bash \
   --upload /tmp/db-url \
   --provider claude --auto-providers \
-  -- /opt/openeral/setup.sh
+  -- openeral
 ```
 
 `setup.sh` reads `/sandbox/db-url` on startup, exports `DATABASE_URL`, and migrations + the workspace sync layer all go through the CONNECT-tunnelled pg connection. Claude inside the sandbox can also run `pg "SELECT ..."` directly.
@@ -81,7 +81,7 @@ openshell provider create --name stringcost --type generic \
 openshell sandbox create \
   --from ghcr.io/sandys/openeral/sandbox:just-bash \
   --provider claude --provider stringcost --auto-providers \
-  -- /opt/openeral/setup.sh
+  -- openeral
 ```
 
 `setup.sh` inside the sandbox creates a permanent StringCost presign (never expires, unlimited uses) on first launch, stores it inside the workspace, and reuses it on every subsequent launch. Claude's traffic then routes through the presign URL automatically.

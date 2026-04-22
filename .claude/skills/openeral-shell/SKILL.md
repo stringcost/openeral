@@ -63,7 +63,7 @@ openshell sandbox create \
   --from ghcr.io/sandys/openeral/sandbox:just-bash \
   $UPLOAD_ARGS \
   $PROVIDERS --auto-providers \
-  -- /opt/openeral/setup.sh
+  -- openeral
 ```
 
 `--auto-providers` creates the `claude` provider from the local `ANTHROPIC_API_KEY`. The `stringcost` provider from Step 3 is attached. `DATABASE_URL`, if present, is delivered as a plaintext file via `--upload`; `setup.sh` reads `/sandbox/db-url` and pg tunnels through OpenShell's HTTP CONNECT proxy to Supabase.
