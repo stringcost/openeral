@@ -43,7 +43,7 @@ mkdir -p "$OPENERAL_DATA_DIR"
 # getDatabaseConnection() picks it up over PGlite.
 #
 # Resolution order:
-#   1. DATABASE_URL / OPENERAL_DATABASE_URL already set in env — use it,
+#   1. DATABASE_URL / OPENERAL_DATABASE_URL / POSTGRES_URL already set in env — use it,
 #      unless it's an OpenShell placeholder (which happens when the URL was
 #      delivered via `openshell provider create --credential`; the provider
 #      framework wraps every credential as a placeholder that only HTTP L7
@@ -53,7 +53,7 @@ mkdir -p "$OPENERAL_DATA_DIR"
 #      documented way to deliver a usable raw-TCP credential into the sandbox.
 #      --upload copies the source filename into the target directory, so
 #      either `/sandbox/db-url` (file) or `/sandbox/db-url/<name>` (dir) works.
-export DATABASE_URL="${DATABASE_URL:-${OPENERAL_DATABASE_URL:-}}"
+export DATABASE_URL="${DATABASE_URL:-${OPENERAL_DATABASE_URL:-${POSTGRES_URL:-}}}"
 case "${DATABASE_URL:-}" in
   ''|openshell:resolve:env:*)
     if [ -f /sandbox/db-url ]; then
@@ -75,19 +75,47 @@ esac
 # StringCost integration.
 #
 # Priority:
-#   1. STRINGCOST_PROXY_URL already set → use it verbatim.
+#   1. STRINGCOST_PROXY_URL already set → normalize and use it.
 #   2. STRINGCOST_PROXY_URL stored from previous session in /home/agent/.openeral/presign.json → reuse.
 #   3. STRINGCOST_API_KEY + ANTHROPIC_API_KEY present → create a new permanent presign
 #      (expires_in=-1, max_uses=-1, cost_limit=$10), store in workspace, reuse on next launch.
 STRINGCOST_PRESIGN_FILE=/home/agent/.openeral/presign.json
 
+normalize_stringcost_proxy_url() {
+  node -e '
+const raw = (process.argv[1] || "").trim();
+if (!raw) process.exit(0);
+
+try {
+  const url = new URL(raw);
+  url.pathname = url.pathname.replace(/\/v1\/.*$/, "");
+  url.search = "";
+  url.hash = "";
+  const normalized = url.toString().replace(/\/$/, "");
+  if (!/^https:\/\/proxy\.stringcost\.com\/stringcost-proxy\/t\/[^/]+$/.test(normalized)) {
+    throw new Error("unexpected StringCost proxy URL shape");
+  }
+  process.stdout.write(normalized);
+} catch (err) {
+  process.stderr.write((err && err.message) || String(err));
+  process.exit(1);
+}
+' "$1"
+}
+
+if [ -n "${STRINGCOST_PROXY_URL:-}" ]; then
+  STRINGCOST_PROXY_URL="$(normalize_stringcost_proxy_url "$STRINGCOST_PROXY_URL" 2>/dev/null || true)"
+  export STRINGCOST_PROXY_URL
+fi
+
 if [ -z "${STRINGCOST_PROXY_URL:-}" ] && [ -f "$STRINGCOST_PRESIGN_FILE" ]; then
-  STRINGCOST_PROXY_URL="$(node -e "
+  STRINGCOST_STORED_URL="$(node -e "
 try {
   const d = JSON.parse(require('fs').readFileSync(process.argv[1], 'utf8'));
   if (d && d.url) process.stdout.write(d.url);
 } catch {}
 " "$STRINGCOST_PRESIGN_FILE" 2>/dev/null || true)"
+  STRINGCOST_PROXY_URL="$(normalize_stringcost_proxy_url "$STRINGCOST_STORED_URL" 2>/dev/null || true)"
   if [ -n "$STRINGCOST_PROXY_URL" ]; then
     echo "setup.sh: reusing stored StringCost presign from $STRINGCOST_PRESIGN_FILE"
     export STRINGCOST_PROXY_URL
@@ -97,8 +125,10 @@ fi
 if [ -z "${STRINGCOST_PROXY_URL:-}" ] && [ -n "${STRINGCOST_API_KEY:-}" ] && [ -n "${ANTHROPIC_API_KEY:-}" ]; then
   echo "setup.sh: creating a permanent StringCost presign..."
   mkdir -p "$(dirname "$STRINGCOST_PRESIGN_FILE")"
+  STRINGCOST_PRESIGN_ERR=/tmp/openeral-stringcost-presign.err
+  rm -f "$STRINGCOST_PRESIGN_ERR"
   set +e
-  STRINGCOST_PROXY_URL="$(node -e "
+  STRINGCOST_FULL_PRESIGN_URL="$(NODE_NO_WARNINGS=1 node -e "
 const fetch = globalThis.fetch;
 (async () => {
   const controller = new AbortController();
@@ -141,17 +171,26 @@ const fetch = globalThis.fetch;
     process.exit(1);
   }
 })();
-" "$STRINGCOST_PRESIGN_FILE" 2>&1)"
+" "$STRINGCOST_PRESIGN_FILE" 2>"$STRINGCOST_PRESIGN_ERR")"
   rc=$?
+  if [ $rc -eq 0 ] && [ -n "$STRINGCOST_FULL_PRESIGN_URL" ]; then
+    STRINGCOST_PROXY_URL="$(normalize_stringcost_proxy_url "$STRINGCOST_FULL_PRESIGN_URL" 2>"$STRINGCOST_PRESIGN_ERR")"
+    rc=$?
+  else
+    STRINGCOST_PROXY_URL=""
+  fi
   set -e
   if [ $rc -eq 0 ] && [ -n "$STRINGCOST_PROXY_URL" ]; then
     echo "setup.sh: presign stored at $STRINGCOST_PRESIGN_FILE"
     export STRINGCOST_PROXY_URL
   else
     echo "setup.sh: presign creation failed — continuing without StringCost" >&2
-    echo "  detail: $STRINGCOST_PROXY_URL" >&2
+    if [ -s "$STRINGCOST_PRESIGN_ERR" ]; then
+      echo "  detail: $(cat "$STRINGCOST_PRESIGN_ERR")" >&2
+    fi
     STRINGCOST_PROXY_URL=""
   fi
+  rm -f "$STRINGCOST_PRESIGN_ERR"
 fi
 
 # Apply proxy to Claude Code settings if we have one

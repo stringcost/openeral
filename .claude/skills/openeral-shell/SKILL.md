@@ -9,7 +9,7 @@ argument-hint: [optional: workspace ID]
 
 # OpenEral Shell
 
-Launch Claude Code inside an OpenShell sandbox, from the published image `ghcr.io/sandys/openeral/sandbox:just-bash`. No local clone or build required.
+Launch Claude Code inside an OpenShell sandbox, from the published image `ghcr.io/sandys/openeral/sandbox:just-bash`. No local clone or source build required.
 
 ## Instructions
 
@@ -22,11 +22,13 @@ which docker    || echo "MISSING docker"
 which openshell || echo "MISSING openshell — install: https://github.com/NVIDIA/OpenShell-Community"
 echo "ANTHROPIC_API_KEY=${ANTHROPIC_API_KEY:+(set)}"
 echo "STRINGCOST_API_KEY=${STRINGCOST_API_KEY:+(set)}"
+echo "DATABASE_URL=${DATABASE_URL:+(set)}"
+echo "POSTGRES_URL=${POSTGRES_URL:+(set)}"
 ```
 
 - `ANTHROPIC_API_KEY` is required; if missing, stop and ask the user to `export ANTHROPIC_API_KEY='sk-ant-...'`.
 - `STRINGCOST_API_KEY` is optional — enables cost tracking.
-- `DATABASE_URL` (Supabase / Neon / RDS) is optional — enables cross-sandbox persistence. It must be delivered via `openshell sandbox create --upload` (plaintext file); the provider framework wraps credentials as placeholders that pg cannot resolve.
+- `DATABASE_URL` or `POSTGRES_URL` (Supabase / Neon / RDS) is optional — enables cross-sandbox persistence. It must be delivered via `openshell sandbox create --upload` (plaintext file); the provider framework wraps credentials as placeholders that pg cannot resolve.
 
 ### Step 2: Start the OpenShell gateway if it's not running
 
@@ -37,44 +39,48 @@ openshell gateway info >/dev/null 2>&1 || openshell gateway start
 
 ### Step 3: Create providers
 
-`--auto-providers` only auto-creates providers whose name matches a recognized type (`claude`, `openai`, `anthropic`, `nvidia`, etc.). Generic providers like `db` and `stringcost` must be created explicitly.
+`--auto-providers` creates the `claude` provider from the local `ANTHROPIC_API_KEY`. The optional generic `stringcost` provider must be created explicitly. Do not create a generic database provider; upload the connection string file instead.
 
 ```bash
 PROVIDERS="--provider claude"   # claude is auto-created from ANTHROPIC_API_KEY
 
 if [ -n "${STRINGCOST_API_KEY:-}" ]; then
   openshell provider create --name stringcost --type generic \
-    --credential "STRINGCOST_API_KEY=$STRINGCOST_API_KEY" 2>/dev/null || true
+    --credential "STRINGCOST_API_KEY=$STRINGCOST_API_KEY" \
+    || openshell provider update stringcost \
+      --credential "STRINGCOST_API_KEY=$STRINGCOST_API_KEY"
   PROVIDERS="$PROVIDERS --provider stringcost"
 fi
 
 UPLOAD_ARGS=""
+DATABASE_URL="${DATABASE_URL:-${POSTGRES_URL:-}}"
 if [ -n "${DATABASE_URL:-}" ]; then
-  printf '%s' "$DATABASE_URL" > /tmp/db-url
-  chmod 600 /tmp/db-url
-  UPLOAD_ARGS="--upload /tmp/db-url"
+  printf '%s' "$DATABASE_URL" > /tmp/openeral-db-url
+  chmod 600 /tmp/openeral-db-url
+  UPLOAD_ARGS="--upload /tmp/openeral-db-url:/sandbox/db-url"
 fi
 ```
 
 ### Step 4: Create the sandbox from the published image
 
 ```bash
-openshell sandbox create \
+openshell sandbox create --tty \
   --from ghcr.io/sandys/openeral/sandbox:just-bash \
   $UPLOAD_ARGS \
   $PROVIDERS --auto-providers \
   -- openeral
 ```
 
-`--auto-providers` creates the `claude` provider from the local `ANTHROPIC_API_KEY`. The `stringcost` provider from Step 3 is attached. `DATABASE_URL`, if present, is delivered as a plaintext file via `--upload`; `setup.sh` reads `/sandbox/db-url` and pg tunnels through OpenShell's HTTP CONNECT proxy to Supabase.
+The `stringcost` provider from Step 3 is attached only when `STRINGCOST_API_KEY` is set. The database URL, if present, is delivered as a plaintext file via `--upload`; `setup.sh` reads `/sandbox/db-url` and pg tunnels through OpenShell's HTTP CONNECT proxy to Supabase.
 
 ## What happens after launch
 
 - Claude Code starts with `HOME` pointing to the isolated sandbox workspace.
 - **Workspace persistence**:
   - Without `DATABASE_URL`: embedded PGlite runs in-process. Files survive restarts/reconnects within the sandbox's lifetime; lost when the sandbox is deleted.
-  - With `DATABASE_URL` delivered via `--upload /tmp/db-url`: pg tunnels through OpenShell's HTTP CONNECT proxy (via `openeral-js/src/db/http-connect-socket.ts`) to Supabase / Neon / RDS. Workspace survives sandbox delete and is shared across machines. The host must be allowlisted in the image's `postgres` network policy — common Supabase poolers are pre-allowlisted.
+  - With `DATABASE_URL` or `POSTGRES_URL` delivered via `--upload /tmp/openeral-db-url:/sandbox/db-url`: pg tunnels through OpenShell's HTTP CONNECT proxy (via `openeral-js/src/db/http-connect-socket.ts`) to Supabase / Neon / RDS. Workspace survives sandbox delete and is shared across machines. The host must be allowlisted in the image's `postgres` network policy — common Supabase poolers are pre-allowlisted.
 - **With `STRINGCOST_API_KEY`**: Claude's API calls route through StringCost. A permanent presign is created on first launch and reused on every subsequent one.
+- **First Claude launch**: Claude Code may ask for theme, security acknowledgement, trust for `/sandbox`, and API usage billing. This is expected first-run setup.
 
 ## Managing a running sandbox
 

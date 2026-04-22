@@ -13,7 +13,7 @@ When editing user docs, **never add `npx`/`pnpm`/`npm install` commands to `READ
 ```bash
 cd openeral-js
 pnpm install && pnpm build
-pnpm check                    # typecheck + 29 lints + 78 unit tests
+pnpm check                    # typecheck + 29 lints + 108 unit tests
 
 # Integration (requires PostgreSQL)
 DATABASE_URL='...' node test-integration.mjs

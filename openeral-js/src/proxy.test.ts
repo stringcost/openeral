@@ -87,3 +87,17 @@ describe('setup.sh Socket.dev integration', () => {
     expect(setup).toMatch(/if \[ -n "\$\{SOCKET_TOKEN:-\}"/);
   });
 });
+
+describe('setup.sh StringCost integration', () => {
+  it('normalizes presign URLs before writing Claude settings', () => {
+    expect(setup).toContain('normalize_stringcost_proxy_url');
+    expect(setup).toContain('url.pathname = url.pathname.replace(/\\/v1\\/.*$/, "");');
+    expect(setup).toContain('s.env.ANTHROPIC_BASE_URL = process.env.STRINGCOST_PROXY_URL');
+  });
+
+  it('keeps Node warnings out of ANTHROPIC_BASE_URL', () => {
+    expect(setup).toContain('NODE_NO_WARNINGS=1 node');
+    expect(setup).toContain('2>"$STRINGCOST_PRESIGN_ERR"');
+    expect(setup).not.toContain('2>&1)"');
+  });
+});

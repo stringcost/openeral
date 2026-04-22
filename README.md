@@ -1,118 +1,135 @@
 # OpenEral
 
-Run Claude Code in an isolated sandbox — one command, no local build.
+Run Claude Code inside an isolated OpenShell sandbox using the published image:
 
-All commands use the published image `ghcr.io/sandys/openeral/sandbox:just-bash`. If you want to build from source, run the test suite, or understand the internals, see [BUILD.md](./BUILD.md).
+```text
+ghcr.io/sandys/openeral/sandbox:just-bash
+```
 
----
+No local source checkout or JavaScript toolchain is required for the normal user flow. Contributor workflows live in [BUILD.md](./BUILD.md).
 
 ## Prerequisites
 
-- Docker running locally
-- [`openshell` CLI](https://github.com/NVIDIA/OpenShell-Community)
-- Anthropic API key (`sk-ant-…`)
+- Docker is running.
+- The [`openshell` CLI](https://github.com/NVIDIA/OpenShell-Community) is installed.
+- `ANTHROPIC_API_KEY` is set in the shell where you run `openshell`.
 
----
+If you keep credentials in `.env`, load them first:
 
-## 1. Run it
+```bash
+set -a
+source .env
+set +a
+```
+
+## Start Claude Code
 
 ```bash
 export ANTHROPIC_API_KEY='sk-ant-...'
+
 openshell gateway start
-openshell sandbox create \
+
+openshell sandbox create --tty \
   --from ghcr.io/sandys/openeral/sandbox:just-bash \
   --provider claude --auto-providers \
   -- openeral
 ```
 
-Claude Code launches inside a sandbox with its own `$HOME`. Files stay there for the sandbox's lifetime — delete the sandbox and they're gone.
+The first Claude Code launch may ask you to choose a theme, accept the security notice, trust `/sandbox`, and confirm API usage billing. After that, Claude opens with `HOME=/home/agent` inside the sandbox.
 
-That's the whole happy path. The next two sections are opt-in upgrades.
+Without PostgreSQL, OpenEral uses embedded PGlite under `/home/agent/.openeral/data`. That state lives for the sandbox lifetime and is removed when you delete the sandbox.
 
----
+## Add PostgreSQL Persistence
 
-## 2. Keep your work across sandboxes
+Use this when you want files and Claude memory to survive sandbox deletion or follow you across machines.
 
-Point openeral at any PostgreSQL and your workspace is persisted outside the sandbox. Next time you launch — same machine or another — it picks up where you left off.
+For Supabase, use the pooler connection string from **Project Settings -> Database -> Connection pooler**. It looks like:
 
-Grab a connection string from **Supabase Dashboard → Project Settings → Database → Connection pooler** (either `5432` or `6543`), then:
+```text
+postgresql://postgres.PROJECT:PASSWORD@aws-0-REGION.pooler.supabase.com:6543/postgres
+```
+
+Run:
 
 ```bash
 export ANTHROPIC_API_KEY='sk-ant-...'
-DB_URL='postgresql://postgres.PROJECT:PASSWORD@aws-0-REGION.pooler.supabase.com:6543/postgres'
+export DATABASE_URL='postgresql://...'
 
-printf '%s' "$DB_URL" > /tmp/db-url && chmod 600 /tmp/db-url
+# Compatibility with .env files that use POSTGRES_URL.
+export DATABASE_URL="${DATABASE_URL:-${POSTGRES_URL:-}}"
 
-openshell sandbox create \
+printf '%s' "$DATABASE_URL" > /tmp/openeral-db-url
+chmod 600 /tmp/openeral-db-url
+
+openshell sandbox create --tty \
   --from ghcr.io/sandys/openeral/sandbox:just-bash \
-  --upload /tmp/db-url \
+  --upload /tmp/openeral-db-url:/sandbox/db-url \
   --provider claude --auto-providers \
   -- openeral
+
+rm -f /tmp/openeral-db-url
 ```
 
-One new flag: `--upload /tmp/db-url`. On first launch openeral creates the `_openeral` schema and seeds your workspace; every future sandbox that uploads the same file sees the same data.
+OpenEral reads `/sandbox/db-url`, creates the `_openeral` schema, runs migrations, and seeds the workspace. In Supabase, switch the Table Editor schema selector to `_openeral` to inspect the rows.
 
-> The Supabase Table Editor shows `public` by default — switch the schema selector to `_openeral` to see your workspace rows.
+Do not pass the database URL through an OpenShell generic provider. PostgreSQL is raw TCP, so the credential must be delivered by `--upload`.
 
-Neon, RDS, or self-hosted PostgreSQL works the same. The shipped image allowlists common Supabase pooler regions; other hosts need a quick rebuild — see [BUILD.md](./BUILD.md#custom-postgresql-hosts).
+## Add StringCost Tracking
 
----
-
-## 3. Track API cost
-
-Route Claude's traffic through [StringCost](https://stringcost.com) for per-session token and cost metering.
+StringCost is optional. It routes Claude API calls through a presigned proxy URL for token and cost metering.
 
 ```bash
 export ANTHROPIC_API_KEY='sk-ant-...'
 export STRINGCOST_API_KEY='sk-st-...'
 
 openshell provider create --name stringcost --type generic \
-  --credential "STRINGCOST_API_KEY=$STRINGCOST_API_KEY"
+  --credential "STRINGCOST_API_KEY=$STRINGCOST_API_KEY" \
+  || openshell provider update stringcost \
+    --credential "STRINGCOST_API_KEY=$STRINGCOST_API_KEY"
 
-openshell sandbox create \
+openshell sandbox create --tty \
   --from ghcr.io/sandys/openeral/sandbox:just-bash \
   --provider claude --provider stringcost --auto-providers \
   -- openeral
 ```
 
-On first launch openeral creates a permanent presign and stores it in the workspace. Every subsequent launch reuses it.
+On first launch, OpenEral creates a permanent StringCost presign and stores it under `/home/agent/.openeral/presign.json`. Later launches reuse it.
 
----
-
-## Managing a running sandbox
+## Manage Sandboxes
 
 ```bash
-openshell sandbox list                            # what's running
-openshell sandbox connect <name>                  # interactive shell
-openshell sandbox delete <name>                   # stop and remove
+openshell sandbox list
+openshell sandbox connect <name>
+openshell sandbox delete <name>
 ```
 
-Run a one-off command (e.g. refresh Claude's memory files from the workspace):
+Run one-off commands through SSH config:
 
 ```bash
-openshell sandbox ssh-config <name> > /tmp/sb-cfg
-ssh -F /tmp/sb-cfg openshell-<name> \
+openshell sandbox ssh-config <name> > /tmp/openeral-sandbox-ssh
+
+ssh -F /tmp/openeral-sandbox-ssh openshell-<name> \
   'HOME=/home/agent node /opt/openeral/dist/bin/openeral.js memory refresh'
 ```
 
-The `HOME=/home/agent` prefix is required — SSH drops you into the base image's `/sandbox`, but openeral's state lives in `/home/agent`.
-
----
+Keep the `HOME=/home/agent` prefix. OpenShell SSH starts in `/sandbox`, while OpenEral state lives under `/home/agent`.
 
 ## Troubleshooting
 
-**"No active gateway"** — run `openshell gateway start` first.
+**No active gateway** - run `openshell gateway start`.
 
-**Claude exits with "authentication failed"** — set `ANTHROPIC_API_KEY` in the shell you run `openshell sandbox create` in; the key must start with `sk-ant-`.
+**Claude exits with `Input must be provided either through stdin or as a prompt argument`** - the command was run without an interactive terminal. Use a real terminal and keep `--tty` in the command.
 
-**Files gone after `sandbox delete`** — step 2 (`--upload /tmp/db-url`) wasn't used, so state lived in the sandbox's embedded PGlite.
+**Claude says authentication failed** - set `ANTHROPIC_API_KEY` in the same shell that runs `openshell sandbox create`.
 
-**Migration fails with `tunnel to ... denied — 403`** — your Supabase pooler host isn't in the image's allowlist; see [BUILD.md](./BUILD.md#custom-postgresql-hosts).
+**Claude says credit balance is too low** - the Anthropic account for that key needs credits or billing enabled.
 
-**Migration fails with `EAI_AGAIN`** — you tried `--provider db --credential DATABASE_URL=…` instead of `--upload /tmp/db-url`. Raw-TCP credentials have to come through the upload path.
+**Files disappear after `sandbox delete`** - PostgreSQL persistence was not enabled. Use the `/sandbox/db-url` upload flow above.
 
----
+**Migration fails with `tunnel to ... denied - 403`** - the PostgreSQL host is not allowlisted in the image policy. Common Supabase pooler hosts are included. Other hosts require a custom image; see [BUILD.md](./BUILD.md#custom-postgresql-hosts).
 
-## Under the hood & contributing
+**Migration fails with `EAI_AGAIN` or a placeholder-looking database URL** - do not use a generic `db` provider for PostgreSQL. Upload the connection string file with `--upload /tmp/openeral-db-url:/sandbox/db-url`.
 
-Architecture, sandbox internals (HTTP CONNECT tunneling, credential injection, allowlist rebuild), local dev, and the test suite → [BUILD.md](./BUILD.md).
+## Contributing
+
+Architecture, image customization, source-development workflows, and tests are documented in [BUILD.md](./BUILD.md).

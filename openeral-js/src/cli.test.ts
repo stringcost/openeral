@@ -137,6 +137,17 @@ describe('openeral-shell skill shape', () => {
   });
 });
 
+describe('CLI launch database handling', () => {
+  const cliSource = readFileSync(join(__dirname, 'cli.ts'), 'utf8');
+
+  it('uploads PostgreSQL credentials instead of using a generic db provider', () => {
+    expect(cliSource).toContain(':/sandbox/db-url');
+    expect(cliSource).toContain('POSTGRES_URL');
+    expect(cliSource).not.toMatch(/sandboxArgs\.push\('--provider', 'db'\)/);
+    expect(cliSource).not.toMatch(/'provider', 'create', '--name', 'db'/);
+  });
+});
+
 describe('CLI argument parsing', () => {
   it('parses memory refresh options', () => {
     const parsed = parseCliArgs([

@@ -1,40 +1,60 @@
-# OpenEral Sandbox
+# OpenEral Sandbox Image
 
-OpenShell sandbox image for running Claude Code with persistent PostgreSQL-backed home directory.
+This directory contains the OpenShell sandbox image used by the end-user command in the repository README.
 
-Uses **stock OpenShell** — no custom cluster or gateway images needed.
+Published image:
 
-## Build
-
-```bash
-docker build -f sandboxes/openeral/Dockerfile -t ghcr.io/sandys/openeral/sandbox:just-bash .
+```text
+ghcr.io/sandys/openeral/sandbox:just-bash
 ```
 
-## Launch
+## Build Locally
+
+```bash
+docker build -f sandboxes/openeral/Dockerfile -t openeral-sandbox:local .
+```
+
+## Launch From The Published Image
 
 ```bash
 openshell gateway start
 
-openshell provider create \
-  --name db --type generic --credential DATABASE_URL
-
-openshell sandbox create \
+openshell sandbox create --tty \
   --from ghcr.io/sandys/openeral/sandbox:just-bash \
-  --provider db --provider claude --auto-providers \
+  --provider claude --auto-providers \
   -- openeral
 ```
 
-## What setup.sh does
+## Launch With PostgreSQL Persistence
 
-1. Runs `_openeral` schema migrations against `$DATABASE_URL` (injected by provider)
-2. Seeds the workspace (keyed to `$OPENSHELL_SANDBOX_ID`)
-3. Starts the `openeral-bash` daemon (just-bash shell on Unix socket)
-4. Launches Claude Code with `HOME=/home/agent SHELL=/usr/local/bin/openeral-bash`
+PostgreSQL credentials must be uploaded as a plaintext file. Do not use a generic OpenShell provider for `DATABASE_URL`; provider placeholders are for HTTP credential injection and are not usable by raw PostgreSQL clients.
 
-## Image contents
+```bash
+printf '%s' "$DATABASE_URL" > /tmp/openeral-db-url
+chmod 600 /tmp/openeral-db-url
 
-- Node.js 22 LTS (via NodeSource)
-- openeral-js (compiled TypeScript at `/opt/openeral/dist/`)
-- `openeral-bash.mjs` — daemon/client bridge for Claude Code's bash tool
-- `setup.sh` — sandbox entry point
-- `policy.yaml` — network policy at `/etc/openshell/policy.yaml`
+openshell sandbox create --tty \
+  --from ghcr.io/sandys/openeral/sandbox:just-bash \
+  --upload /tmp/openeral-db-url:/sandbox/db-url \
+  --provider claude --auto-providers \
+  -- openeral
+
+rm -f /tmp/openeral-db-url
+```
+
+## What `setup.sh` Does
+
+1. Resolves persistence from `DATABASE_URL`, `OPENERAL_DATABASE_URL`, `POSTGRES_URL`, or uploaded `/sandbox/db-url`.
+2. Creates a normalized StringCost proxy config when `STRINGCOST_API_KEY` is attached.
+3. Runs `_openeral` schema migrations.
+4. Seeds the workspace keyed by `$OPENSHELL_SANDBOX_ID`.
+5. Starts the `openeral-bash` daemon.
+6. Launches Claude Code with `HOME=/home/agent` and `SHELL=/usr/local/bin/openeral-bash`.
+
+## Image Contents
+
+- Node.js 22 LTS.
+- OpenEral compiled into `/opt/openeral/dist/`.
+- `openeral-bash.mjs`, the daemon/client bridge for Claude Code's bash tool.
+- `setup.sh`, the sandbox entry point.
+- `policy.yaml`, the OpenShell network policy at `/etc/openshell/policy.yaml`.

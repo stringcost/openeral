@@ -24,3 +24,7 @@ dist/
 
 # Build artifacts
 *.tar
+
+# Editor swap files
+*.swp
+*.swo

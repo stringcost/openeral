@@ -36,8 +36,8 @@
  */
 
 import { spawn, spawnSync } from 'node:child_process';
-import { homedir } from 'node:os';
-import { mkdirSync, writeFileSync, readFileSync, existsSync, chmodSync, copyFileSync } from 'node:fs';
+import { homedir, tmpdir } from 'node:os';
+import { mkdirSync, writeFileSync, readFileSync, existsSync, chmodSync, copyFileSync, rmSync } from 'node:fs';
 import { join, dirname } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
@@ -82,6 +82,18 @@ function saveStoredPresign(url: string, apiKey?: string): void {
   } catch {
     // Ignore chmod errors on platforms that don't support it
   }
+}
+
+function stringCostProxyBaseUrl(presignUrl: string): string {
+  const url = new URL(presignUrl.trim());
+  url.pathname = url.pathname.replace(/\/v1\/.*$/, '');
+  url.search = '';
+  url.hash = '';
+  const normalized = url.toString().replace(/\/$/, '');
+  if (!/^https:\/\/proxy\.stringcost\.com\/stringcost-proxy\/t\/[^/]+$/.test(normalized)) {
+    throw new Error('Unexpected StringCost presign URL shape');
+  }
+  return normalized;
 }
 
 /**
@@ -1266,7 +1278,7 @@ async function cmdPresignRenew(): Promise<void> {
 
   try {
     const fullUrl = await createPresignUrl(anthropicKey, stringcostKey);
-    const baseUrl = fullUrl.replace(/\/v1\/.*$/, '');
+    const baseUrl = stringCostProxyBaseUrl(fullUrl);
 
     // 1. Store in openeral's own config (include the API key so skill downloads
     //    work automatically on future runs without the env var being set)
@@ -1556,7 +1568,7 @@ async function launchViaSandbox(workspaceId: string, claudeArgs: string[], devMo
   const storedPresign = loadStoredPresign();
   if (storedPresign) {
     // Reuse the stored permanent presign — no env vars required
-    stringcostUrl = storedPresign.url.replace(/\/v1\/.*$/, '');
+    stringcostUrl = stringCostProxyBaseUrl(storedPresign.url);
     process.stderr.write('\x1b[32m✓ Using stored StringCost presign\x1b[0m\n');
     process.stderr.write(`\x1b[2m  Proxy URL: ${stringcostUrl}\x1b[0m\n`);
   } else {
@@ -1579,7 +1591,7 @@ async function launchViaSandbox(workspaceId: string, claudeArgs: string[], devMo
     try {
       const fullUrl = await createPresignUrl(anthropicKey, stringcostKey);
       saveStoredPresign(fullUrl, stringcostKey);
-      stringcostUrl = fullUrl.replace(/\/v1\/.*$/, '');
+      stringcostUrl = stringCostProxyBaseUrl(fullUrl);
       process.stderr.write('\x1b[32m✓ StringCost presign created and stored (expires_in=-1, max_uses=-1, cost_limit=$10)\x1b[0m\n');
     } catch (err) {
       const error = err instanceof Error ? err : new Error(String(err));
@@ -1591,8 +1603,9 @@ async function launchViaSandbox(workspaceId: string, claudeArgs: string[], devMo
   // Build `openshell sandbox create` arguments.
   // --name   maps to OPENSHELL_SANDBOX_ID inside the container, which
   //          setup.sh uses as the workspace ID.
-  // --auto-providers  creates/resolves named providers automatically from
-  //          the current environment (DATABASE_URL → db).
+  // --auto-providers creates/resolves named LLM providers automatically.
+  // PostgreSQL credentials are uploaded as a file because OpenShell generic
+  // provider placeholders are not usable by raw TCP clients like pg.
   // When a presign is in use we do NOT include --provider claude: the sandbox
   // authenticates via the presign URL written to ~/.claude/settings.json and
   // must never see ANTHROPIC_API_KEY.
@@ -1607,8 +1620,17 @@ async function launchViaSandbox(workspaceId: string, claudeArgs: string[], devMo
     sandboxArgs.push('--provider', 'claude');
   }
 
-  if (process.env.DATABASE_URL) {
-    sandboxArgs.push('--provider', 'db');
+  const dbUrl = process.env.DATABASE_URL || process.env.POSTGRES_URL || '';
+  let dbUploadPath: string | undefined;
+  if (dbUrl) {
+    dbUploadPath = join(tmpdir(), `openeral-db-url-${process.pid}-${Date.now()}`);
+    writeFileSync(dbUploadPath, dbUrl, { mode: 0o600 });
+    try {
+      chmodSync(dbUploadPath, 0o600);
+    } catch {
+      // Ignore chmod errors on platforms that don't support it.
+    }
+    sandboxArgs.push('--upload', `${dbUploadPath}:/sandbox/db-url`);
   }
 
   sandboxArgs.push('--auto-providers');
@@ -1648,7 +1670,23 @@ set -e
 OPENERAL_DIR=/opt/openeral
 
 export WORKSPACE_ID="\${OPENSHELL_SANDBOX_ID:-default}"
-export DATABASE_URL="\${DATABASE_URL:-\${OPENERAL_DATABASE_URL:-}}"
+export DATABASE_URL="\${DATABASE_URL:-\${OPENERAL_DATABASE_URL:-\${POSTGRES_URL:-}}}"
+case "\${DATABASE_URL:-}" in
+  ''|openshell:resolve:env:*)
+    if [ -f /sandbox/db-url ]; then
+      DATABASE_URL="$(cat /sandbox/db-url)"
+      export DATABASE_URL
+      echo "setup: loaded DATABASE_URL from uploaded /sandbox/db-url"
+    elif [ -d /sandbox/db-url ]; then
+      first="$(find /sandbox/db-url -maxdepth 1 -type f | head -1)"
+      if [ -n "$first" ]; then
+        DATABASE_URL="$(cat "$first")"
+        export DATABASE_URL
+        echo "setup: loaded DATABASE_URL from uploaded $first"
+      fi
+    fi
+    ;;
+esac
 
 # Guard against literal placeholder strings that openshell may inject when a
 # generic provider credential expansion fails (e.g. the literal text
@@ -1667,7 +1705,7 @@ if [ -n "\${DATABASE_URL:-}" ]; then
       ;;
     *)
       echo "setup: error: DATABASE_URL does not look like a valid PostgreSQL URL (got: \${DATABASE_URL})." >&2
-      echo "setup: error: The openshell db provider may have injected a placeholder. Run with OPENERAL_AUTO_FIX_TLS=1 to refresh credentials." >&2
+      echo "setup: error: deliver PostgreSQL credentials via /sandbox/db-url upload, not a generic provider placeholder." >&2
       exit 1
       ;;
   esac
@@ -1816,8 +1854,7 @@ exec env -u ANTHROPIC_API_KEY HOME=/home/agent SHELL=/usr/local/bin/openeral-bas
   // A bad URL causes the migration step inside the sandbox to fail, which puts
   // the sandbox pod into a crash-restart loop that manifests as TLS errors.
   // Catching it here gives a clear, actionable error message.
-  if (process.env.DATABASE_URL) {
-    const dbUrl = process.env.DATABASE_URL;
+  if (dbUrl) {
     process.stderr.write('\x1b[2mopeneral: verifying database connection...\x1b[0m\n');
 
     // Warn early if the URL uses localhost — that address refers to the sandbox
@@ -1846,6 +1883,9 @@ exec env -u ANTHROPIC_API_KEY HOME=/home/agent SHELL=/usr/local/bin/openeral-bas
         '  3. The server pg_hba.conf allows connections from this host\n' +
         '  4. Firewall/network allows TCP to the DB port\n'
       );
+      if (dbUploadPath) {
+        try { rmSync(dbUploadPath, { force: true }); } catch {}
+      }
       process.exit(1);
     }
     process.stderr.write(`\x1b[32m✓ Database reachable (${result.latency}ms)\x1b[0m\n`);
@@ -1873,28 +1913,6 @@ exec env -u ANTHROPIC_API_KEY HOME=/home/agent SHELL=/usr/local/bin/openeral-bas
       process.stderr.write('\x1b[32m✓ Claude provider registered\x1b[0m\n');
     }
     // Non-zero exit is expected when the provider already exists — that's fine.
-  }
-
-  // db provider — injects DATABASE_URL into the sandbox (optional).
-  // Always delete-then-create so the stored credential reflects the CURRENT
-  // DATABASE_URL value.  Simply calling `provider create` on an existing
-  // provider is a no-op (non-zero exit silently ignored), so a changed URL
-  // would never be propagated — causing migrations to run against a stale URL.
-  if (process.env.DATABASE_URL) {
-    // Delete any existing provider (ignore errors — it may not exist yet)
-    spawnSync('openshell', ['provider', 'delete', '--name', 'db'],
-      { stdio: 'pipe', timeout: 10000 });
-
-    const dbProvider = spawnSync('openshell', [
-      'provider', 'create', '--name', 'db', '--type', 'generic', '--credential', 'DATABASE_URL',
-    ], { stdio: 'pipe', timeout: 30000 });
-
-    if (dbProvider.status === 0) {
-      process.stderr.write('\x1b[32m✓ Database provider registered\x1b[0m\n');
-    } else {
-      const dbErr = (dbProvider.stderr ?? Buffer.from('')).toString().trim();
-      process.stderr.write(`\x1b[33mwarn: database provider registration returned non-zero${dbErr ? ': ' + dbErr : ''}\x1b[0m\n`);
-    }
   }
 
   process.stderr.write(
@@ -1927,12 +1945,18 @@ exec env -u ANTHROPIC_API_KEY HOME=/home/agent SHELL=/usr/local/bin/openeral-bas
 
   child.on('error', (err: NodeJS.ErrnoException) => {
     clearTimeout(startupWarnTimer);
+    if (dbUploadPath) {
+      try { rmSync(dbUploadPath, { force: true }); } catch {}
+    }
     process.stderr.write(`\x1b[31merror: ${err.message}\x1b[0m\n`);
     process.exit(1);
   });
 
   child.on('exit', (code) => {
     clearTimeout(startupWarnTimer);
+    if (dbUploadPath) {
+      try { rmSync(dbUploadPath, { force: true }); } catch {}
+    }
     process.exit(code ?? 0);
   });
 
