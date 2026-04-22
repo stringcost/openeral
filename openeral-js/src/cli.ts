@@ -1842,10 +1842,28 @@ if ! command -v claude >/dev/null 2>&1; then
 fi
 
 echo "setup: launching Claude Code..."
-# Always strip ANTHROPIC_API_KEY — the sandbox uses the presign stored in
-# ~/.claude/settings.json (written above). The raw API key must never reach
-# Claude Code inside the sandbox or it will prompt the user to choose a key.
-exec env -u ANTHROPIC_API_KEY HOME=/home/agent SHELL=/usr/local/bin/openeral-bash claude "$@"
+# Strip ANTHROPIC_API_KEY — the sandbox authenticates via the presign proxy,
+# and the raw API key must never reach Claude Code or it will prompt the user
+# to choose a key.
+#
+# When a proxy is in use, export ANTHROPIC_BASE_URL / ANTHROPIC_AUTH_TOKEN here
+# instead of relying on settings.json alone: Claude Code reads these from
+# process.env at startup for auth-mode selection, so settings-only delivery
+# lands it in "API Usage Billing" mode against any stale URL on disk.
+# stringcostUrl was normalized by stringCostProxyBaseUrl() on the host.
+if [ -n "\${STRINGCOST_PROXY_URL:-}" ]; then
+  exec env -u ANTHROPIC_API_KEY \
+    HOME=/home/agent \
+    SHELL=/usr/local/bin/openeral-bash \
+    ANTHROPIC_BASE_URL="\${STRINGCOST_PROXY_URL}" \
+    ANTHROPIC_AUTH_TOKEN=dummy \
+    claude "$@"
+else
+  exec env -u ANTHROPIC_API_KEY \
+    HOME=/home/agent \
+    SHELL=/usr/local/bin/openeral-bash \
+    claude "$@"
+fi
 `;
 
   sandboxArgs.push('--', 'bash', '-c', setupScript, '--', ...claudeArgs);

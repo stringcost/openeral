@@ -353,12 +353,23 @@ if ! command -v claude >/dev/null 2>&1; then
   echo "setup.sh: Claude CLI installed"
 fi
 
-# Launch Claude Code with persistent home
+# Launch Claude Code with persistent home.
+#
+# Claude Code reads ANTHROPIC_BASE_URL / ANTHROPIC_AUTH_TOKEN from process.env
+# at startup for auth-mode selection; ~/.claude/settings.json is only
+# consulted afterward. Delivering the proxy config via settings.json alone
+# lands Claude in "API Usage Billing" mode against any stale URL on disk —
+# which, if that URL still has the presign's /v1/messages suffix, produces a
+# doubled /v1/messages/v1/messages path against StringCost. Export the vars
+# here so the proxy is picked up at the auth-selection step.
+# STRINGCOST_PROXY_URL was normalized by normalize_stringcost_proxy_url above.
 echo "setup.sh: launching Claude Code..."
 if [ -n "${STRINGCOST_PROXY_URL:-}" ]; then
   exec env -u ANTHROPIC_API_KEY \
     HOME=/home/agent \
     SHELL=/usr/local/bin/openeral-bash \
+    ANTHROPIC_BASE_URL="$STRINGCOST_PROXY_URL" \
+    ANTHROPIC_AUTH_TOKEN=dummy \
     claude "$@"
 else
   exec env \

@@ -100,4 +100,14 @@ describe('setup.sh StringCost integration', () => {
     expect(setup).toContain('2>"$STRINGCOST_PRESIGN_ERR"');
     expect(setup).not.toContain('2>&1)"');
   });
+
+  it('exports ANTHROPIC_BASE_URL/AUTH_TOKEN to Claude Code at exec time', () => {
+    // Claude Code reads these from process.env at startup for auth-mode
+    // selection; settings.json alone isn't consulted in time.  Without the
+    // exported env var, the fallback URL in settings.json wins and produces
+    // doubled /v1/messages paths against StringCost.
+    const execBlock = setup.slice(setup.indexOf('launching Claude Code'));
+    expect(execBlock).toMatch(/ANTHROPIC_BASE_URL="\$STRINGCOST_PROXY_URL"/);
+    expect(execBlock).toMatch(/ANTHROPIC_AUTH_TOKEN=dummy/);
+  });
 });
