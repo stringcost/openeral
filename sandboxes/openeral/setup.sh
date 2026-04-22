@@ -363,6 +363,9 @@ fi
 # doubled /v1/messages/v1/messages path against StringCost. Export the vars
 # here so the proxy is picked up at the auth-selection step.
 # STRINGCOST_PROXY_URL was normalized by normalize_stringcost_proxy_url above.
+#
+# Only the proxy path strips ANTHROPIC_API_KEY. With no proxy, preserve the key
+# injected by the claude provider so direct Anthropic authentication works.
 echo "setup.sh: launching Claude Code..."
 if [ -n "${STRINGCOST_PROXY_URL:-}" ]; then
   exec env -u ANTHROPIC_API_KEY \

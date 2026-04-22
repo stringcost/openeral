@@ -1842,15 +1842,15 @@ if ! command -v claude >/dev/null 2>&1; then
 fi
 
 echo "setup: launching Claude Code..."
-# Strip ANTHROPIC_API_KEY — the sandbox authenticates via the presign proxy,
-# and the raw API key must never reach Claude Code or it will prompt the user
-# to choose a key.
-#
 # When a proxy is in use, export ANTHROPIC_BASE_URL / ANTHROPIC_AUTH_TOKEN here
 # instead of relying on settings.json alone: Claude Code reads these from
 # process.env at startup for auth-mode selection, so settings-only delivery
 # lands it in "API Usage Billing" mode against any stale URL on disk.
 # stringcostUrl was normalized by stringCostProxyBaseUrl() on the host.
+#
+# Only the proxy path strips ANTHROPIC_API_KEY. In the direct-auth path,
+# preserve the key injected by the claude provider so the documented
+# non-StringCost flow can authenticate normally.
 if [ -n "\${STRINGCOST_PROXY_URL:-}" ]; then
   exec env -u ANTHROPIC_API_KEY \
     HOME=/home/agent \
@@ -1859,7 +1859,7 @@ if [ -n "\${STRINGCOST_PROXY_URL:-}" ]; then
     ANTHROPIC_AUTH_TOKEN=dummy \
     claude "$@"
 else
-  exec env -u ANTHROPIC_API_KEY \
+  exec env \
     HOME=/home/agent \
     SHELL=/usr/local/bin/openeral-bash \
     claude "$@"
