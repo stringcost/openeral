@@ -47,6 +47,11 @@ PROVIDERS="--provider claude"   # claude is auto-created from ANTHROPIC_API_KEY
 OPENERAL_INPUT=""
 UPLOAD_ARGS=""
 
+cleanup_openeral_input() {
+  [ -z "$OPENERAL_INPUT" ] || rm -rf "$OPENERAL_INPUT"
+}
+trap cleanup_openeral_input EXIT
+
 ensure_input_dir() {
   if [ -z "$OPENERAL_INPUT" ]; then
     OPENERAL_INPUT="$(mktemp -d)"
@@ -97,6 +102,9 @@ openshell sandbox create --tty \
   $UPLOAD_ARGS \
   $PROVIDERS --auto-providers \
   -- openeral
+
+cleanup_openeral_input
+trap - EXIT
 ```
 
 The `stringcost` provider from Step 3 is attached only when `STRINGCOST_API_KEY` is set. The upload directory is used because OpenShell accepts one `--upload` flag; `setup.sh` reads `/sandbox/openeral-input/db-url` and `/sandbox/openeral-input/presign.json` when present.

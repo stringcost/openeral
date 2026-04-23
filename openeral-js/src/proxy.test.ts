@@ -122,6 +122,8 @@ describe('setup.sh StringCost integration', () => {
     expect(setup).toMatch(/raw\.match\(\/https:\\\/\\\/proxy\\\.stringcost\\\.com\\\/stringcost-proxy\\\/t\\\/\[\^\\s/);
     expect(setup).toContain('const candidate = match ? match[0] : raw;');
     expect(setup).toContain('const url = new URL(candidate);');
+    expect(setup).toContain('normalize_stringcost_proxy_url_or_warn');
+    expect(setup).toContain('setup.sh: ignoring invalid StringCost proxy URL from');
   });
 
   it('supports uploaded StringCost presigns for OpenShell placeholder-safe launches', () => {

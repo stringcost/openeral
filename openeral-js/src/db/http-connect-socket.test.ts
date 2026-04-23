@@ -13,7 +13,10 @@ import {
  *   - writes back a configurable status line
  *   - on 200, echoes any further client bytes back
  */
-function createFakeProxy(status: string): Promise<{
+function createFakeProxy(
+  status: string,
+  onEstablished?: (sock: Socket) => void,
+): Promise<{
   server: Server;
   port: number;
   lastTarget: () => string | null;
@@ -34,6 +37,7 @@ function createFakeProxy(status: string): Promise<{
         sock.write(`${status}\r\n\r\n`);
         if (status.startsWith('HTTP/1.1 200')) {
           sock.on('data', (d) => sock.write(d));
+          onEstablished?.(sock);
         } else {
           sock.end();
         }
@@ -146,6 +150,44 @@ describe('createTunneledSocket', () => {
     await connected;
     expect(proxy.lastTarget()).toBe('pooler.example.com:6543');
     socket.destroy();
+  });
+
+  it('rejects missing target host instead of connecting to localhost', () => {
+    const socket = createTunneledSocket({
+      proxyUrl: 'http://127.0.0.1:3128',
+    });
+    expect(() => socket.connect(5432)).toThrow(/target host is required/);
+
+    const objectSocket = createTunneledSocket({
+      proxyUrl: 'http://127.0.0.1:3128',
+    });
+    expect(() => (objectSocket as any).connect({ port: 5432 })).toThrow(
+      /target host is required/,
+    );
+  });
+
+  it('emits close once when the proxy socket closes', async () => {
+    proxy = await createFakeProxy('HTTP/1.1 200 Connection Established', (sock) => {
+      setTimeout(() => sock.end(), 10);
+    });
+    const socket = createTunneledSocket({
+      proxyUrl: `http://127.0.0.1:${proxy.port}`,
+    });
+
+    let closeCount = 0;
+    const closed = new Promise<void>((resolve) => {
+      socket.on('close', () => {
+        closeCount += 1;
+        setTimeout(resolve, 20);
+      });
+    });
+    const connected = new Promise<void>((resolve) => socket.once('connect', () => resolve()));
+
+    socket.connect(5432, 'target.example.com');
+    await connected;
+    await closed;
+
+    expect(closeCount).toBe(1);
   });
 
   it('hides CONNECT headers from listeners registered AFTER connect (pg contract)', async () => {

@@ -114,8 +114,28 @@ try {
 ' "$1"
 }
 
+normalize_stringcost_proxy_url_or_warn() {
+  local source="$1"
+  local raw="$2"
+  local err=/tmp/openeral-stringcost-normalize.err
+  local normalized
+  rm -f "$err"
+  if normalized="$(normalize_stringcost_proxy_url "$raw" 2>"$err")"; then
+    rm -f "$err"
+    printf '%s' "$normalized"
+    return 0
+  fi
+  if [ -n "$raw" ]; then
+    local detail=""
+    [ -s "$err" ] && detail=": $(cat "$err")"
+    echo "setup.sh: ignoring invalid StringCost proxy URL from $source$detail" >&2
+  fi
+  rm -f "$err"
+  return 0
+}
+
 if [ -n "${STRINGCOST_PROXY_URL:-}" ]; then
-  STRINGCOST_PROXY_URL="$(normalize_stringcost_proxy_url "$STRINGCOST_PROXY_URL" 2>/dev/null || true)"
+  STRINGCOST_PROXY_URL="$(normalize_stringcost_proxy_url_or_warn "STRINGCOST_PROXY_URL" "$STRINGCOST_PROXY_URL")"
   export STRINGCOST_PROXY_URL
 fi
 
@@ -148,7 +168,7 @@ try {
   }
 } catch {}
 " "$STRINGCOST_UPLOAD_FILE" 2>/dev/null || true)"
-    STRINGCOST_PROXY_URL="$(normalize_stringcost_proxy_url "$STRINGCOST_UPLOADED_URL" 2>/dev/null || true)"
+    STRINGCOST_PROXY_URL="$(normalize_stringcost_proxy_url_or_warn "$STRINGCOST_UPLOAD_FILE" "$STRINGCOST_UPLOADED_URL")"
     if [ -n "$STRINGCOST_PROXY_URL" ]; then
       echo "setup.sh: using uploaded StringCost presign from $STRINGCOST_UPLOAD_FILE"
       export STRINGCOST_PROXY_URL
@@ -163,7 +183,7 @@ try {
   if (d && d.url) process.stdout.write(d.url);
 } catch {}
 " "$STRINGCOST_PRESIGN_FILE" 2>/dev/null || true)"
-  STRINGCOST_PROXY_URL="$(normalize_stringcost_proxy_url "$STRINGCOST_STORED_URL" 2>/dev/null || true)"
+  STRINGCOST_PROXY_URL="$(normalize_stringcost_proxy_url_or_warn "$STRINGCOST_PRESIGN_FILE" "$STRINGCOST_STORED_URL")"
   if [ -n "$STRINGCOST_PROXY_URL" ]; then
     echo "setup.sh: reusing stored StringCost presign from $STRINGCOST_PRESIGN_FILE"
     export STRINGCOST_PROXY_URL

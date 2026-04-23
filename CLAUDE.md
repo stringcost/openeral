@@ -13,7 +13,7 @@ When editing user docs, **never add `npx`/`pnpm`/`npm install` commands to `READ
 ```bash
 cd openeral-js
 pnpm install && pnpm build
-pnpm check                    # typecheck + 29 lints + 108 unit tests
+pnpm check                    # typecheck + 30 lints + 117 unit tests
 
 # Integration (requires PostgreSQL)
 DATABASE_URL='...' node test-integration.mjs
@@ -40,7 +40,7 @@ DATABASE_URL='...' ANTHROPIC_API_KEY='...' bash ../tests/test_claude_e2e.sh
   - `src/safety.ts` — command safety analysis via just-bash parse() AST
   - `src/shell.ts` — createOpeneralShell(), createToolHandler()
   - `src/index.ts` — public API
-  - `lint.mjs` — 29 structural lint rules
+  - `lint.mjs` — 30 structural lint rules
 - `sandboxes/openeral/` — OpenShell sandbox image (stock base, no FUSE)
   - `Dockerfile` — Node.js + openeral-js on stock OpenShell base
   - `openeral-bash.mjs` — daemon/client bridge for custom agents

@@ -71,7 +71,7 @@ openshell sandbox create --tty \
 rm -f /tmp/openeral-db-url
 ```
 
-OpenEral reads `/sandbox/db-url`, creates the `_openeral` schema, runs migrations, and seeds the workspace. In Supabase, switch the Table Editor schema selector to `_openeral` to inspect the rows.
+For PostgreSQL-only launches, OpenEral reads `/sandbox/db-url`, creates the `_openeral` schema, runs migrations, and seeds the workspace. In Supabase, switch the Table Editor schema selector to `_openeral` to inspect the rows.
 
 Do not pass the database URL through an OpenShell generic provider. PostgreSQL is raw TCP, so the credential must be delivered by `--upload`.
 
@@ -84,6 +84,8 @@ export ANTHROPIC_API_KEY='sk-ant-...'
 export STRINGCOST_API_KEY='sk-st-...'
 
 OPENERAL_INPUT="$(mktemp -d)"
+cleanup_openeral_input() { rm -rf "$OPENERAL_INPUT"; }
+trap cleanup_openeral_input EXIT
 
 curl -fsS https://app.stringcost.com/v1/presign \
   -H "Authorization: Bearer $STRINGCOST_API_KEY" \
@@ -118,10 +120,13 @@ openshell sandbox create --tty \
   --provider claude --provider stringcost --auto-providers \
   -- openeral
 
-rm -rf "$OPENERAL_INPUT"
+cleanup_openeral_input
+trap - EXIT
 ```
 
 Create the presign on the host. Inside OpenShell, provider secrets are placeholders; they work for HTTP headers but not as JSON body values for StringCost's `client_api_key`.
+
+When using PostgreSQL and StringCost together, put both `db-url` and `presign.json` in the same `$OPENERAL_INPUT` directory and upload it to `/sandbox/openeral-input` as shown above. OpenShell accepts only one `--upload` flag.
 
 ## Manage Sandboxes
 
@@ -152,11 +157,11 @@ Keep the `HOME=/home/agent` prefix. OpenShell SSH starts in `/sandbox`, while Op
 
 **Claude says credit balance is too low** - the Anthropic account for that key needs credits or billing enabled.
 
-**Files disappear after `sandbox delete`** - PostgreSQL persistence was not enabled. Use the `/sandbox/db-url` upload flow above.
+**Files disappear after `sandbox delete`** - PostgreSQL persistence was not enabled. Use the PostgreSQL upload flow above, or include `db-url` in `/sandbox/openeral-input` when also using StringCost.
 
 **Migration fails with `tunnel to ... denied - 403`** - the PostgreSQL host is not allowlisted in the image policy. Common Supabase pooler hosts are included. Other hosts require a custom image; see [BUILD.md](./BUILD.md#custom-postgresql-hosts).
 
-**Migration fails with `EAI_AGAIN` or a placeholder-looking database URL** - do not use a generic `db` provider for PostgreSQL. Upload the connection string file with `--upload /tmp/openeral-db-url:/sandbox/db-url`.
+**Migration fails with `EAI_AGAIN` or a placeholder-looking database URL** - do not use a generic `db` provider for PostgreSQL. Upload the connection string file as `/sandbox/db-url`, or as `/sandbox/openeral-input/db-url` when also using StringCost.
 
 ## Contributing
 

@@ -50,7 +50,7 @@ DATABASE_URL='...' bash ../tests/test_setup_e2e.sh     # setup.sh flow inside co
 DATABASE_URL='...' ANTHROPIC_API_KEY='...' bash ../tests/test_claude_e2e.sh  # real Claude Code via Run:/Bash writes in isolated HOME
 ```
 
-## Structural Lints (lint.mjs — 29 rules)
+## Structural Lints (lint.mjs — 30 rules)
 
 Key rules: imports resolve, exports match, just-bash >=2.x, PgFs throws EROFS, no write-back buffering, no FUSE in Dockerfile, no hardcoded credentials, sync persists deletions, sync preserves modes, exclude uses exact matching, syncToFs prunes stale files, syncToFs prunes before creating, pruneLocal handles type conflicts, README includes build steps, migrations use advisory lock, skill checks node_modules, no fork-specific policy fields (secret_injection/egress_via), Socket.dev endpoint has TLS terminate.
 

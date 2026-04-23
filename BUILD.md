@@ -144,10 +144,10 @@ Launches Claude Code through the built binary, has it write a file, deletes the 
 
 ## Custom agents (library usage)
 
-For agents with a single bash tool (not the Claude Code CLI), you can use the just-bash virtual filesystem directly:
+For agents with a single bash tool (not the Claude Code CLI), you can use the just-bash virtual filesystem directly from a cloned repo after `pnpm build`:
 
 ```typescript
-import { createOpeneralShell, createToolHandler } from 'openeral-js'
+import { createOpeneralShell, createToolHandler } from './openeral-js/dist/index.js'
 
 const shell = await createOpeneralShell({
   connectionString: process.env.DATABASE_URL,
@@ -240,7 +240,9 @@ pg doesn't speak HTTP CONNECT. `openeral-js/src/db/http-connect-socket.ts` wraps
 
 OpenShell's `SecretResolver` unconditionally wraps every provider credential as an `openshell:resolve:env:*` placeholder that is only rewritten when the HTTP proxy terminates TLS and inspects request headers. pg uses raw TCP, so it can't resolve placeholders — it would try to literally connect to a host named `openshell:resolve:env:DATABASE_URL`.
 
-`openshell sandbox create --upload <file>` is the one channel that delivers bytes verbatim. `setup.sh` reads `/sandbox/db-url` at startup, exports `DATABASE_URL`, and everything downstream sees the real URL.
+`openshell sandbox create --upload <path>` is the one channel that delivers bytes verbatim. For PostgreSQL-only launches, `setup.sh` reads `/sandbox/db-url`; for combined PostgreSQL + StringCost launches, it reads `/sandbox/openeral-input/db-url`. It exports `DATABASE_URL`, and everything downstream sees the real URL.
+
+`createPool()` does not set pg's `ssl` option. The tested Supabase pooler flow works with the current connection string and CONNECT tunnel; PostgreSQL deployments that require explicit pg TLS settings need future pool configuration support.
 
 ### Custom PostgreSQL hosts
 
@@ -251,8 +253,8 @@ The shipped `policy.yaml` allowlists common Supabase pooler regions under the `p
 network_policies:
   postgres:
     endpoints:
-      - { host: your-host.example.com, port: 5432, tls: skip }
-      - { host: your-host.example.com, port: 6543, tls: skip }
+      - { host: your-host.example.com, port: 5432 }
+      - { host: your-host.example.com, port: 6543 }
     binaries:
       - { path: /usr/bin/node }
 ```

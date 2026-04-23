@@ -11,12 +11,11 @@
  * further inspection. That relay carries anything: pg wire protocol, its
  * end-to-end TLS handshake with Supabase, everything.
  *
- * This module produces a `net.Socket` whose `.connect(port, host)` transparently
- * routes through the proxy. It's designed to match pg 8.20's `stream` option
- * contract: the factory returns a **synchronous** Socket, pg then calls
- * `setNoDelay(true)` and `.connect(port, host)` on it, and pg's `'connect'`
- * listener fires only after the tunnel is established. No Promise-returning
- * API (pg doesn't await the factory result).
+ * This module returns a synchronous stream object that pg treats like a
+ * `net.Socket`, but internally it is a `Duplex` wrapped around a private raw
+ * Socket. pg then calls `setNoDelay(true)` and `.connect(port, host)` on it,
+ * and pg's `'connect'` listener fires only after the tunnel is established.
+ * No Promise-returning API (pg doesn't await the factory result).
  */
 
 import { Socket } from 'node:net';
@@ -89,9 +88,13 @@ class TunneledSocket extends Duplex {
     this.raw.on('data', (chunk: Buffer) => this.onRawData(chunk));
     this.raw.on('error', (err) => this.destroy(err));
     this.raw.on('close', (hadErr) => {
-      // Propagate close to the Duplex. push(null) signals EOF on the readable side.
-      if (!this.destroyed) this.push(null);
-      this.emit('close', hadErr);
+      // Let Duplex own its lifecycle events. Manually emitting 'close' here
+      // races with autoDestroy and can double-notify pg's Client.
+      if (!this.destroyed) {
+        this.destroy(
+          hadErr ? new Error('http-connect-socket: proxy socket closed with error') : undefined,
+        );
+      }
     });
     this.raw.on('end', () => this.push(null));
   }
@@ -123,11 +126,11 @@ class TunneledSocket extends Duplex {
   connect(...args: unknown[]): this {
     if (typeof args[0] === 'number') {
       this.targetPort = args[0];
-      this.targetHost = typeof args[1] === 'string' ? args[1] : 'localhost';
+      this.targetHost = requireTargetHost(args[1]);
     } else if (typeof args[0] === 'object' && args[0] !== null) {
       const opt = args[0] as { port: number; host?: string };
       this.targetPort = opt.port;
-      this.targetHost = opt.host ?? 'localhost';
+      this.targetHost = requireTargetHost(opt.host);
     } else {
       throw new Error(`http-connect-socket: unsupported connect() arguments`);
     }
@@ -215,6 +218,13 @@ class TunneledSocket extends Duplex {
     // its wire protocol, which flows through _write → raw socket.
     this.emit('connect');
   }
+}
+
+function requireTargetHost(host: unknown): string {
+  if (typeof host !== 'string' || host.length === 0) {
+    throw new Error('http-connect-socket: target host is required for CONNECT tunnel');
+  }
+  return host;
 }
 
 /**
