@@ -112,19 +112,50 @@ describe('setup.sh StringCost integration', () => {
   });
 
   it('keeps Node warnings out of ANTHROPIC_BASE_URL', () => {
+    expect(setup).toContain('export NODE_NO_WARNINGS="${NODE_NO_WARNINGS:-1}"');
     expect(setup).toContain('NODE_NO_WARNINGS=1 node');
     expect(setup).toContain('2>"$STRINGCOST_PRESIGN_ERR"');
     expect(setup).not.toContain('2>&1)"');
   });
 
-  it('exports ANTHROPIC_BASE_URL/AUTH_TOKEN to Claude Code at exec time', () => {
+  it('extracts StringCost URLs from noisy presign output', () => {
+    expect(setup).toMatch(/raw\.match\(\/https:\\\/\\\/proxy\\\.stringcost\\\.com\\\/stringcost-proxy\\\/t\\\/\[\^\\s/);
+    expect(setup).toContain('const candidate = match ? match[0] : raw;');
+    expect(setup).toContain('const url = new URL(candidate);');
+  });
+
+  it('supports uploaded StringCost presigns for OpenShell placeholder-safe launches', () => {
+    expect(setup).toContain('/sandbox/openeral-input/presign.json');
+    expect(setup).toContain('setup.sh: using uploaded StringCost presign');
+    expect(setup).toContain('skipping StringCost presign creation because ANTHROPIC_API_KEY is an OpenShell placeholder');
+  });
+
+  it('supports bundled upload inputs for OpenShell single-upload launches', () => {
+    expect(setup).toContain('/sandbox/openeral-input/db-url');
+    expect(setup).toContain('find /sandbox/openeral-input -type f -name db-url');
+  });
+
+  it('exports ANTHROPIC_BASE_URL to Claude Code at exec time', () => {
     // Claude Code reads these from process.env at startup for auth-mode
     // selection; settings.json alone isn't consulted in time.  Without the
     // exported env var, the fallback URL in settings.json wins and produces
     // doubled /v1/messages paths against StringCost.
     const execBlock = setup.slice(setup.indexOf('launching Claude Code'));
     expect(execBlock).toMatch(/ANTHROPIC_BASE_URL="\$STRINGCOST_PROXY_URL"/);
-    expect(execBlock).toMatch(/ANTHROPIC_AUTH_TOKEN=dummy/);
+    expect(execBlock).not.toMatch(/-u ANTHROPIC_API_KEY/);
+    expect(execBlock).toMatch(/-u STRINGCOST_API_KEY/);
+    expect(execBlock).toMatch(/-u ANTHROPIC_AUTH_TOKEN/);
+  });
+
+  it('does not persist API keys in Claude settings', () => {
+    const setupProxyBlock = launchBlock(setup, 'setup.sh: launching Claude Code');
+    const cliProxyBlock = launchBlock(cli, 'setup: launching Claude Code');
+    expect(setupProxyBlock).not.toMatch(/-u ANTHROPIC_API_KEY/);
+    expect(cliProxyBlock).not.toMatch(/-u ANTHROPIC_API_KEY/);
+    expect(setup).toContain('delete s.env.ANTHROPIC_API_KEY');
+    expect(setup).toContain('delete s.env.ANTHROPIC_AUTH_TOKEN');
+    expect(cli).toContain('delete s.env.ANTHROPIC_API_KEY');
+    expect(cli).toContain('delete s.env.ANTHROPIC_AUTH_TOKEN');
   });
 
   it('preserves ANTHROPIC_API_KEY in setup.sh direct-auth launches', () => {

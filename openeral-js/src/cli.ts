@@ -1791,7 +1791,8 @@ let s = {};
 try { s = JSON.parse(fs.readFileSync(file, 'utf8')); } catch(e) {}
 if (!s.env) s.env = {};
 s.env.ANTHROPIC_BASE_URL = process.env.STRINGCOST_PROXY_URL;
-s.env.ANTHROPIC_AUTH_TOKEN = 'dummy';
+delete s.env.ANTHROPIC_API_KEY;
+delete s.env.ANTHROPIC_AUTH_TOKEN;
 fs.mkdirSync('/home/agent/.claude', {recursive: true});
 fs.writeFileSync(file, JSON.stringify(s, null, 2));
 console.log('setup: StringCost proxy written to ~/.claude/settings.json');
@@ -1848,15 +1849,16 @@ echo "setup: launching Claude Code..."
 # lands it in "API Usage Billing" mode against any stale URL on disk.
 # stringcostUrl was normalized by stringCostProxyBaseUrl() on the host.
 #
-# Only the proxy path strips ANTHROPIC_API_KEY. In the direct-auth path,
-# preserve the key injected by the claude provider so the documented
-# non-StringCost flow can authenticate normally.
+# The proxy path preserves ANTHROPIC_API_KEY from the claude provider for
+# Claude Code's local auth-mode selection and request signing. Do not write that
+# key to settings.json; settings only stores the proxy base URL. STRINGCOST_API_KEY
+# is only needed for presign creation, so remove it before handing control to
+# Claude Code.
 if [ -n "\${STRINGCOST_PROXY_URL:-}" ]; then
-  exec env -u ANTHROPIC_API_KEY \
+  exec env -u STRINGCOST_API_KEY -u ANTHROPIC_AUTH_TOKEN \
     HOME=/home/agent \
     SHELL=/usr/local/bin/openeral-bash \
     ANTHROPIC_BASE_URL="\${STRINGCOST_PROXY_URL}" \
-    ANTHROPIC_AUTH_TOKEN=dummy \
     claude "$@"
 else
   exec env \

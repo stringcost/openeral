@@ -12,6 +12,7 @@ No local source checkout or JavaScript toolchain is required for the normal user
 
 - Docker is running.
 - The [`openshell` CLI](https://github.com/NVIDIA/OpenShell-Community) is installed.
+- `curl` is available for creating the optional StringCost presign.
 - `ANTHROPIC_API_KEY` is set in the shell where you run `openshell`.
 
 If you keep credentials in `.env`, load them first:
@@ -82,6 +83,30 @@ StringCost is optional. It routes Claude API calls through a presigned proxy URL
 export ANTHROPIC_API_KEY='sk-ant-...'
 export STRINGCOST_API_KEY='sk-st-...'
 
+OPENERAL_INPUT="$(mktemp -d)"
+
+curl -fsS https://app.stringcost.com/v1/presign \
+  -H "Authorization: Bearer $STRINGCOST_API_KEY" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "provider": "anthropic",
+    "client_api_key": "'"$ANTHROPIC_API_KEY"'",
+    "path": ["/v1/messages"],
+    "expires_in": -1,
+    "max_uses": -1,
+    "cost_limit": 10000000,
+    "tags": ["openeral"]
+  }' \
+  > "$OPENERAL_INPUT/presign.json"
+
+# Optional: combine PostgreSQL persistence in the same upload.
+export DATABASE_URL="${DATABASE_URL:-${POSTGRES_URL:-}}"
+if [ -n "${DATABASE_URL:-}" ]; then
+  printf '%s' "$DATABASE_URL" > "$OPENERAL_INPUT/db-url"
+fi
+
+chmod -R go-rwx "$OPENERAL_INPUT"
+
 openshell provider create --name stringcost --type generic \
   --credential "STRINGCOST_API_KEY=$STRINGCOST_API_KEY" \
   || openshell provider update stringcost \
@@ -89,11 +114,14 @@ openshell provider create --name stringcost --type generic \
 
 openshell sandbox create --tty \
   --from ghcr.io/sandys/openeral/sandbox:just-bash \
+  --upload "$OPENERAL_INPUT:/sandbox/openeral-input" \
   --provider claude --provider stringcost --auto-providers \
   -- openeral
+
+rm -rf "$OPENERAL_INPUT"
 ```
 
-On first launch, OpenEral creates a permanent StringCost presign and stores it under `/home/agent/.openeral/presign.json`. Later launches reuse it.
+Create the presign on the host. Inside OpenShell, provider secrets are placeholders; they work for HTTP headers but not as JSON body values for StringCost's `client_api_key`.
 
 ## Manage Sandboxes
 

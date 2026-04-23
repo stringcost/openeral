@@ -13,6 +13,11 @@ set -euo pipefail
 #   3. Start openeral-bash daemon
 #   4. Exec Claude Code
 
+# OpenShell's Node HTTP proxy path currently emits an experimental Undici warning
+# in some environments. Keep setup output clean and, more importantly, keep
+# warning text out of shell-captured values such as the StringCost presign URL.
+export NODE_NO_WARNINGS="${NODE_NO_WARNINGS:-1}"
+
 # Use /opt/openeral directly if accessible, otherwise copy to /home/agent
 if [ -r /opt/openeral/dist/db/embedded.js ]; then
   OPENERAL_DIR=/opt/openeral
@@ -56,18 +61,21 @@ mkdir -p "$OPENERAL_DATA_DIR"
 export DATABASE_URL="${DATABASE_URL:-${OPENERAL_DATABASE_URL:-${POSTGRES_URL:-}}}"
 case "${DATABASE_URL:-}" in
   ''|openshell:resolve:env:*)
+    DB_URL_FILE=""
     if [ -f /sandbox/db-url ]; then
-      DATABASE_URL="$(cat /sandbox/db-url)"
-      export DATABASE_URL
-      echo "setup.sh: loaded DATABASE_URL from uploaded /sandbox/db-url"
+      DB_URL_FILE=/sandbox/db-url
     elif [ -d /sandbox/db-url ]; then
-      # If the upload was a file, --upload put it inside the target dir.
-      first="$(find /sandbox/db-url -maxdepth 1 -type f | head -1)"
-      if [ -n "$first" ]; then
-        DATABASE_URL="$(cat "$first")"
-        export DATABASE_URL
-        echo "setup.sh: loaded DATABASE_URL from uploaded $first"
-      fi
+      DB_URL_FILE="$(find /sandbox/db-url -maxdepth 2 -type f -name db-url | head -1)"
+      [ -n "$DB_URL_FILE" ] || DB_URL_FILE="$(find /sandbox/db-url -maxdepth 1 -type f | head -1)"
+    elif [ -f /sandbox/openeral-input/db-url ]; then
+      DB_URL_FILE=/sandbox/openeral-input/db-url
+    elif [ -d /sandbox/openeral-input ]; then
+      DB_URL_FILE="$(find /sandbox/openeral-input -type f -name db-url | head -1)"
+    fi
+    if [ -n "$DB_URL_FILE" ]; then
+      DATABASE_URL="$(cat "$DB_URL_FILE")"
+      export DATABASE_URL
+      echo "setup.sh: loaded DATABASE_URL from uploaded $DB_URL_FILE"
     fi
     ;;
 esac
@@ -76,8 +84,9 @@ esac
 #
 # Priority:
 #   1. STRINGCOST_PROXY_URL already set → normalize and use it.
-#   2. STRINGCOST_PROXY_URL stored from previous session in /home/agent/.openeral/presign.json → reuse.
-#   3. STRINGCOST_API_KEY + ANTHROPIC_API_KEY present → create a new permanent presign
+#   2. Uploaded presign JSON or URL under /sandbox/openeral-input → normalize and use it.
+#   3. STRINGCOST_PROXY_URL stored from previous session in /home/agent/.openeral/presign.json → reuse.
+#   4. STRINGCOST_API_KEY + raw ANTHROPIC_API_KEY present → create a new permanent presign
 #      (expires_in=-1, max_uses=-1, cost_limit=$10), store in workspace, reuse on next launch.
 STRINGCOST_PRESIGN_FILE=/home/agent/.openeral/presign.json
 
@@ -87,7 +96,9 @@ const raw = (process.argv[1] || "").trim();
 if (!raw) process.exit(0);
 
 try {
-  const url = new URL(raw);
+  const match = raw.match(/https:\/\/proxy\.stringcost\.com\/stringcost-proxy\/t\/[^\s"'\''<>]+/);
+  const candidate = match ? match[0] : raw;
+  const url = new URL(candidate);
   url.pathname = url.pathname.replace(/\/v1\/.*$/, "");
   url.search = "";
   url.hash = "";
@@ -108,6 +119,43 @@ if [ -n "${STRINGCOST_PROXY_URL:-}" ]; then
   export STRINGCOST_PROXY_URL
 fi
 
+if [ -z "${STRINGCOST_PROXY_URL:-}" ]; then
+  STRINGCOST_UPLOAD_FILE=""
+  for candidate in \
+    /sandbox/stringcost-presign \
+    /sandbox/stringcost-url \
+    /sandbox/openeral-input/presign.json \
+    /sandbox/openeral-input/stringcost-url
+  do
+    if [ -f "$candidate" ]; then
+      STRINGCOST_UPLOAD_FILE="$candidate"
+      break
+    fi
+  done
+  if [ -z "$STRINGCOST_UPLOAD_FILE" ] && [ -d /sandbox/openeral-input ]; then
+    STRINGCOST_UPLOAD_FILE="$(find /sandbox/openeral-input -type f \( -name presign.json -o -name stringcost-url \) | head -1)"
+  fi
+  if [ -n "$STRINGCOST_UPLOAD_FILE" ]; then
+    STRINGCOST_UPLOADED_URL="$(node -e "
+try {
+  const raw = require('fs').readFileSync(process.argv[1], 'utf8').trim();
+  if (!raw) process.exit(0);
+  try {
+    const d = JSON.parse(raw);
+    process.stdout.write((d && d.url) || '');
+  } catch {
+    process.stdout.write(raw);
+  }
+} catch {}
+" "$STRINGCOST_UPLOAD_FILE" 2>/dev/null || true)"
+    STRINGCOST_PROXY_URL="$(normalize_stringcost_proxy_url "$STRINGCOST_UPLOADED_URL" 2>/dev/null || true)"
+    if [ -n "$STRINGCOST_PROXY_URL" ]; then
+      echo "setup.sh: using uploaded StringCost presign from $STRINGCOST_UPLOAD_FILE"
+      export STRINGCOST_PROXY_URL
+    fi
+  fi
+fi
+
 if [ -z "${STRINGCOST_PROXY_URL:-}" ] && [ -f "$STRINGCOST_PRESIGN_FILE" ]; then
   STRINGCOST_STORED_URL="$(node -e "
 try {
@@ -123,6 +171,11 @@ try {
 fi
 
 if [ -z "${STRINGCOST_PROXY_URL:-}" ] && [ -n "${STRINGCOST_API_KEY:-}" ] && [ -n "${ANTHROPIC_API_KEY:-}" ]; then
+  case "${ANTHROPIC_API_KEY:-}" in
+    openshell:resolve:env:*)
+      echo "setup.sh: skipping StringCost presign creation because ANTHROPIC_API_KEY is an OpenShell placeholder; upload a host-created presign.json to /sandbox/openeral-input instead" >&2
+      ;;
+    *)
   echo "setup.sh: creating a permanent StringCost presign..."
   mkdir -p "$(dirname "$STRINGCOST_PRESIGN_FILE")"
   STRINGCOST_PRESIGN_ERR=/tmp/openeral-stringcost-presign.err
@@ -191,6 +244,8 @@ const fetch = globalThis.fetch;
     STRINGCOST_PROXY_URL=""
   fi
   rm -f "$STRINGCOST_PRESIGN_ERR"
+      ;;
+  esac
 fi
 
 # Apply proxy to Claude Code settings if we have one
@@ -203,7 +258,8 @@ let s = {};
 try { s = JSON.parse(fs.readFileSync(file, 'utf8')); } catch(e) {}
 if (!s.env) s.env = {};
 s.env.ANTHROPIC_BASE_URL = process.env.STRINGCOST_PROXY_URL;
-s.env.ANTHROPIC_AUTH_TOKEN = 'dummy';
+delete s.env.ANTHROPIC_API_KEY;
+delete s.env.ANTHROPIC_AUTH_TOKEN;
 fs.mkdirSync('/home/agent/.claude', {recursive: true});
 fs.writeFileSync(file, JSON.stringify(s, null, 2));
 console.log('setup.sh: StringCost proxy written to ~/.claude/settings.json');
@@ -364,15 +420,17 @@ fi
 # here so the proxy is picked up at the auth-selection step.
 # STRINGCOST_PROXY_URL was normalized by normalize_stringcost_proxy_url above.
 #
-# Only the proxy path strips ANTHROPIC_API_KEY. With no proxy, preserve the key
-# injected by the claude provider so direct Anthropic authentication works.
+# The proxy path preserves ANTHROPIC_API_KEY from the claude provider for
+# Claude Code's local auth-mode selection and request signing. Do not write that
+# key to settings.json; settings only stores the proxy base URL. STRINGCOST_API_KEY
+# is only needed for presign creation, so remove it before handing control to
+# Claude Code.
 echo "setup.sh: launching Claude Code..."
 if [ -n "${STRINGCOST_PROXY_URL:-}" ]; then
-  exec env -u ANTHROPIC_API_KEY \
+  exec env -u STRINGCOST_API_KEY -u ANTHROPIC_AUTH_TOKEN \
     HOME=/home/agent \
     SHELL=/usr/local/bin/openeral-bash \
     ANTHROPIC_BASE_URL="$STRINGCOST_PROXY_URL" \
-    ANTHROPIC_AUTH_TOKEN=dummy \
     claude "$@"
 else
   exec env \

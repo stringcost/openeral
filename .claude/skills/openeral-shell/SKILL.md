@@ -20,6 +20,7 @@ When this skill is invoked, execute the steps below. Do not just show documentat
 ```bash
 which docker    || echo "MISSING docker"
 which openshell || echo "MISSING openshell — install: https://github.com/NVIDIA/OpenShell-Community"
+which curl      || echo "MISSING curl"
 echo "ANTHROPIC_API_KEY=${ANTHROPIC_API_KEY:+(set)}"
 echo "STRINGCOST_API_KEY=${STRINGCOST_API_KEY:+(set)}"
 echo "DATABASE_URL=${DATABASE_URL:+(set)}"
@@ -39,12 +40,35 @@ openshell gateway info >/dev/null 2>&1 || openshell gateway start
 
 ### Step 3: Create providers
 
-`--auto-providers` creates the `claude` provider from the local `ANTHROPIC_API_KEY`. The optional generic `stringcost` provider must be created explicitly. Do not create a generic database provider; upload the connection string file instead.
+`--auto-providers` creates the `claude` provider from the local `ANTHROPIC_API_KEY`. The optional generic `stringcost` provider must be created explicitly so the StringCost policy is attached. Create the StringCost presign on the host and upload it; inside OpenShell, provider secrets are placeholders and cannot be used as JSON body values for StringCost's `client_api_key`. Do not create a generic database provider; upload the connection string file instead.
 
 ```bash
 PROVIDERS="--provider claude"   # claude is auto-created from ANTHROPIC_API_KEY
+OPENERAL_INPUT=""
+UPLOAD_ARGS=""
+
+ensure_input_dir() {
+  if [ -z "$OPENERAL_INPUT" ]; then
+    OPENERAL_INPUT="$(mktemp -d)"
+  fi
+}
 
 if [ -n "${STRINGCOST_API_KEY:-}" ]; then
+  ensure_input_dir
+  curl -fsS https://app.stringcost.com/v1/presign \
+    -H "Authorization: Bearer $STRINGCOST_API_KEY" \
+    -H "Content-Type: application/json" \
+    -d '{
+      "provider": "anthropic",
+      "client_api_key": "'"$ANTHROPIC_API_KEY"'",
+      "path": ["/v1/messages"],
+      "expires_in": -1,
+      "max_uses": -1,
+      "cost_limit": 10000000,
+      "tags": ["openeral"]
+    }' \
+    > "$OPENERAL_INPUT/presign.json"
+
   openshell provider create --name stringcost --type generic \
     --credential "STRINGCOST_API_KEY=$STRINGCOST_API_KEY" \
     || openshell provider update stringcost \
@@ -52,12 +76,16 @@ if [ -n "${STRINGCOST_API_KEY:-}" ]; then
   PROVIDERS="$PROVIDERS --provider stringcost"
 fi
 
-UPLOAD_ARGS=""
 DATABASE_URL="${DATABASE_URL:-${POSTGRES_URL:-}}"
 if [ -n "${DATABASE_URL:-}" ]; then
-  printf '%s' "$DATABASE_URL" > /tmp/openeral-db-url
-  chmod 600 /tmp/openeral-db-url
-  UPLOAD_ARGS="--upload /tmp/openeral-db-url:/sandbox/db-url"
+  ensure_input_dir
+  printf '%s' "$DATABASE_URL" > "$OPENERAL_INPUT/db-url"
+  chmod 600 "$OPENERAL_INPUT/db-url"
+fi
+
+if [ -n "$OPENERAL_INPUT" ]; then
+  chmod -R go-rwx "$OPENERAL_INPUT"
+  UPLOAD_ARGS="--upload $OPENERAL_INPUT:/sandbox/openeral-input"
 fi
 ```
 
@@ -71,15 +99,15 @@ openshell sandbox create --tty \
   -- openeral
 ```
 
-The `stringcost` provider from Step 3 is attached only when `STRINGCOST_API_KEY` is set. The database URL, if present, is delivered as a plaintext file via `--upload`; `setup.sh` reads `/sandbox/db-url` and pg tunnels through OpenShell's HTTP CONNECT proxy to Supabase.
+The `stringcost` provider from Step 3 is attached only when `STRINGCOST_API_KEY` is set. The upload directory is used because OpenShell accepts one `--upload` flag; `setup.sh` reads `/sandbox/openeral-input/db-url` and `/sandbox/openeral-input/presign.json` when present.
 
 ## What happens after launch
 
 - Claude Code starts with `HOME` pointing to the isolated sandbox workspace.
 - **Workspace persistence**:
   - Without `DATABASE_URL`: embedded PGlite runs in-process. Files survive restarts/reconnects within the sandbox's lifetime; lost when the sandbox is deleted.
-  - With `DATABASE_URL` or `POSTGRES_URL` delivered via `--upload /tmp/openeral-db-url:/sandbox/db-url`: pg tunnels through OpenShell's HTTP CONNECT proxy (via `openeral-js/src/db/http-connect-socket.ts`) to Supabase / Neon / RDS. Workspace survives sandbox delete and is shared across machines. The host must be allowlisted in the image's `postgres` network policy — common Supabase poolers are pre-allowlisted.
-- **With `STRINGCOST_API_KEY`**: Claude's API calls route through StringCost. A permanent presign is created on first launch and reused on every subsequent one.
+  - With `DATABASE_URL` or `POSTGRES_URL` delivered via `/sandbox/openeral-input/db-url`: pg tunnels through OpenShell's HTTP CONNECT proxy (via `openeral-js/src/db/http-connect-socket.ts`) to Supabase / Neon / RDS. Workspace survives sandbox delete and is shared across machines. The host must be allowlisted in the image's `postgres` network policy — common Supabase poolers are pre-allowlisted.
+- **With `STRINGCOST_API_KEY`**: Claude's API calls route through the uploaded StringCost presign for billing and usage metering.
 - **First Claude launch**: Claude Code may ask for theme, security acknowledgement, trust for `/sandbox`, and API usage billing. This is expected first-run setup.
 
 ## Managing a running sandbox
