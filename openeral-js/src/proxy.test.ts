@@ -92,11 +92,35 @@ describe('proxy policy (PROXY-PLAN compliance)', () => {
     expect(socketBlock).toContain('/usr/bin/node');
   });
 
-  it('allows the Supabase ap-southeast-2 pooler variants used by current projects', () => {
-    expect(policy).toContain('aws-0-ap-southeast-2.pooler.supabase.com, port: 5432');
-    expect(policy).toContain('aws-0-ap-southeast-2.pooler.supabase.com, port: 6543');
-    expect(policy).toContain('aws-1-ap-southeast-2.pooler.supabase.com, port: 5432');
-    expect(policy).toContain('aws-1-ap-southeast-2.pooler.supabase.com, port: 6543');
+  it('allows all current Supabase AWS pooler regions on both pooler ports', () => {
+    // Keep in sync with Supabase Platform > Regions.
+    const regions = [
+      'us-west-1',
+      'us-west-2',
+      'us-east-1',
+      'us-east-2',
+      'ca-central-1',
+      'eu-west-1',
+      'eu-west-2',
+      'eu-west-3',
+      'eu-central-1',
+      'eu-central-2',
+      'eu-north-1',
+      'ap-south-1',
+      'ap-southeast-1',
+      'ap-northeast-1',
+      'ap-northeast-2',
+      'ap-southeast-2',
+      'sa-east-1',
+    ];
+
+    for (const region of regions) {
+      for (const shard of ['aws-0', 'aws-1']) {
+        for (const port of [5432, 6543]) {
+          expect(policy).toContain(`${shard}-${region}.pooler.supabase.com, port: ${port}`);
+        }
+      }
+    }
   });
 });
 
