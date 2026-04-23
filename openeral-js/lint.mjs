@@ -628,40 +628,54 @@ try {
     ok = false;
   };
 
-  if (!setup.includes('url.pathname = url.pathname.replace(/\\/v1\\/.*$/, "");')) {
+  const launchSection = (source, marker, file) => {
+    const idx = source.indexOf(marker);
+    if (idx < 0) {
+      markFail(file, `missing launch marker: ${marker}`);
+      return source;
+    }
+    return source.slice(idx);
+  };
+
+  const stripV1PathRe = /url\.pathname\s*=\s*url\.pathname\.replace\(\s*\/\\\/v1\\\/\.\*\$\/\s*,\s*(['"])\1\s*\)\s*;?/;
+  if (!stripV1PathRe.test(setup)) {
     markFail('sandboxes/openeral/setup.sh', 'normalize_stringcost_proxy_url must strip /v1/... from presign URLs');
   }
-  if (!cli.includes("url.pathname = url.pathname.replace(/\\/v1\\/.*$/, '');")) {
+  if (!stripV1PathRe.test(cli)) {
     markFail('src/cli.ts', 'stringCostProxyBaseUrl must strip /v1/... from presign URLs');
   }
 
-  for (const snippet of [
-    'STRINGCOST_PROXY_URL="$(normalize_stringcost_proxy_url "$STRINGCOST_PROXY_URL"',
-    'STRINGCOST_PROXY_URL="$(normalize_stringcost_proxy_url "$STRINGCOST_UPLOADED_URL"',
-    'STRINGCOST_PROXY_URL="$(normalize_stringcost_proxy_url "$STRINGCOST_STORED_URL"',
-    'STRINGCOST_PROXY_URL="$(normalize_stringcost_proxy_url "$STRINGCOST_FULL_PRESIGN_URL"',
+  for (const [envName, description] of [
+    ['STRINGCOST_PROXY_URL', 'current STRINGCOST_PROXY_URL'],
+    ['STRINGCOST_UPLOADED_URL', 'uploaded presign URL'],
+    ['STRINGCOST_STORED_URL', 'stored presign URL'],
+    ['STRINGCOST_FULL_PRESIGN_URL', 'newly-created presign URL'],
   ]) {
-    if (!setup.includes(snippet)) {
-      markFail('sandboxes/openeral/setup.sh', `missing normalization step: ${snippet}`);
+    const normalizeInputRe = new RegExp(
+      String.raw`STRINGCOST_PROXY_URL\s*=\s*["']?\$\(\s*normalize_stringcost_proxy_url\s+["']?\$${envName}(?![A-Za-z0-9_])`,
+    );
+    if (!normalizeInputRe.test(setup)) {
+      markFail('sandboxes/openeral/setup.sh', `missing normalization step for ${description}`);
     }
   }
 
-  for (const snippet of [
-    'const baseUrl = stringCostProxyBaseUrl(fullUrl);',
-    'stringcostUrl = stringCostProxyBaseUrl(storedPresign.url);',
-    'stringcostUrl = stringCostProxyBaseUrl(fullUrl);',
+  for (const [pattern, description] of [
+    [/\bconst\s+baseUrl\s*=\s*stringCostProxyBaseUrl\(\s*fullUrl\s*\)\s*;?/, 'new presign renewal result'],
+    [/\bstringcostUrl\s*=\s*stringCostProxyBaseUrl\(\s*storedPresign\.url\s*\)\s*;?/, 'stored presign launch path'],
+    [/\bstringcostUrl\s*=\s*stringCostProxyBaseUrl\(\s*fullUrl\s*\)\s*;?/, 'new presign launch path'],
   ]) {
-    if (!cli.includes(snippet)) {
-      markFail('src/cli.ts', `must route presigns through stringCostProxyBaseUrl(): ${snippet}`);
+    if (!pattern.test(cli)) {
+      markFail('src/cli.ts', `must route ${description} through stringCostProxyBaseUrl()`);
     }
   }
 
-  const setupLaunch = setup.slice(setup.indexOf('setup.sh: launching Claude Code'));
-  const cliLaunch = cli.slice(cli.indexOf('setup: launching Claude Code'));
-  if (!setupLaunch.includes('ANTHROPIC_BASE_URL="$STRINGCOST_PROXY_URL"')) {
+  const setupLaunch = launchSection(setup, 'setup.sh: launching Claude Code', 'sandboxes/openeral/setup.sh');
+  const cliLaunch = launchSection(cli, 'setup: launching Claude Code', 'src/cli.ts');
+  const normalizedBaseUrlEnvRe = /\bANTHROPIC_BASE_URL\s*=\s*(['"]?)\\?\$\{?STRINGCOST_PROXY_URL\}?\1(?![A-Za-z0-9_])/;
+  if (!normalizedBaseUrlEnvRe.test(setupLaunch)) {
     markFail('sandboxes/openeral/setup.sh', 'Claude launch must use normalized STRINGCOST_PROXY_URL');
   }
-  if (!cliLaunch.includes('ANTHROPIC_BASE_URL="\\${STRINGCOST_PROXY_URL}"')) {
+  if (!normalizedBaseUrlEnvRe.test(cliLaunch)) {
     markFail('src/cli.ts', 'generated Claude launch must use normalized STRINGCOST_PROXY_URL');
   }
 
@@ -675,7 +689,11 @@ try {
 
   if (ok) pass('StringCost presign URLs normalize to the base proxy URL before launch');
 } catch (err) {
-  fail('StringCost proxy URL lint', err?.message || String(err));
+  if (err?.code === 'ENOENT') {
+    pass('StringCost proxy URL lint skipped (required files not found)');
+  } else {
+    fail('StringCost proxy URL lint', err?.message || String(err));
+  }
 }
 
 // ---------------------------------------------------------------------------

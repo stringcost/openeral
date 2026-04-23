@@ -139,20 +139,20 @@ describe('setup.sh StringCost integration', () => {
 
   it('prevents doubled /v1/messages when a live presign URL includes beta query params', () => {
     const baseUrl = normalizeWithSetup(
-      'https://proxy.stringcost.com/stringcost-proxy/t/test.jwt.token/v1/messages?beta=true',
+      'https://proxy.stringcost.com/stringcost-proxy/t/example-presign-id/v1/messages?beta=true',
     );
 
-    expect(baseUrl).toBe('https://proxy.stringcost.com/stringcost-proxy/t/test.jwt.token');
+    expect(baseUrl).toBe('https://proxy.stringcost.com/stringcost-proxy/t/example-presign-id');
     expect(`${baseUrl}/v1/messages?beta=true`).not.toContain('/v1/messages/v1/messages');
   });
 
   it('extracts and normalizes StringCost URLs from noisy Claude/Node output', () => {
     const baseUrl = normalizeWithSetup(
       '(node:53) [UNDICI-ENVHTTPPROXYAGENT] Warning: EnvHttpProxyAgent is experimental\n' +
-        'https://proxy.stringcost.com/stringcost-proxy/t/test.jwt.token/v1/messages?beta=true',
+        'https://proxy.stringcost.com/stringcost-proxy/t/example-presign-id/v1/messages?beta=true',
     );
 
-    expect(baseUrl).toBe('https://proxy.stringcost.com/stringcost-proxy/t/test.jwt.token');
+    expect(baseUrl).toBe('https://proxy.stringcost.com/stringcost-proxy/t/example-presign-id');
   });
 
   it('keeps Node warnings out of ANTHROPIC_BASE_URL', () => {

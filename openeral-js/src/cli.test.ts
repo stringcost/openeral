@@ -151,21 +151,21 @@ describe('CLI launch database handling', () => {
 describe('StringCost presign URL normalization', () => {
   it('strips the presigned endpoint so Claude appends /v1/messages only once', () => {
     const baseUrl = stringCostProxyBaseUrl(
-      'https://proxy.stringcost.com/stringcost-proxy/t/test.jwt.token/v1/messages?beta=true',
+      'https://proxy.stringcost.com/stringcost-proxy/t/example-presign-id/v1/messages?beta=true',
     );
 
-    expect(baseUrl).toBe('https://proxy.stringcost.com/stringcost-proxy/t/test.jwt.token');
+    expect(baseUrl).toBe('https://proxy.stringcost.com/stringcost-proxy/t/example-presign-id');
     expect(`${baseUrl}/v1/messages?beta=true`).not.toContain('/v1/messages/v1/messages');
   });
 
   it('accepts an already-normalized proxy base URL', () => {
     expect(
-      stringCostProxyBaseUrl('https://proxy.stringcost.com/stringcost-proxy/t/test.jwt.token'),
-    ).toBe('https://proxy.stringcost.com/stringcost-proxy/t/test.jwt.token');
+      stringCostProxyBaseUrl('https://proxy.stringcost.com/stringcost-proxy/t/example-presign-id'),
+    ).toBe('https://proxy.stringcost.com/stringcost-proxy/t/example-presign-id');
   });
 
   it('rejects unexpected StringCost proxy URL shapes', () => {
-    expect(() => stringCostProxyBaseUrl('https://proxy.stringcost.com/stringcost-proxy/t/test.jwt.token/other')).toThrow(
+    expect(() => stringCostProxyBaseUrl('https://proxy.stringcost.com/stringcost-proxy/t/example-presign-id/other')).toThrow(
       /Unexpected StringCost presign URL shape/,
     );
     expect(() => stringCostProxyBaseUrl('https://api.anthropic.com/v1/messages')).toThrow(
