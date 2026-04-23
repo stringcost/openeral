@@ -613,6 +613,72 @@ try {
 }
 
 // ---------------------------------------------------------------------------
+// Lint 30: StringCost presign URLs must be normalized before Claude launch
+// Catches: passing .../v1/messages as ANTHROPIC_BASE_URL, which Claude then
+// appends to produce /v1/messages/v1/messages.
+// ---------------------------------------------------------------------------
+console.log('\n--- Lint: StringCost proxy URL is base-only ---');
+
+try {
+  const setup = readFileSync('../sandboxes/openeral/setup.sh', 'utf8');
+  const cli = readFileSync('src/cli.ts', 'utf8');
+  let ok = true;
+  const markFail = (file, message) => {
+    fail(file, message);
+    ok = false;
+  };
+
+  if (!setup.includes('url.pathname = url.pathname.replace(/\\/v1\\/.*$/, "");')) {
+    markFail('sandboxes/openeral/setup.sh', 'normalize_stringcost_proxy_url must strip /v1/... from presign URLs');
+  }
+  if (!cli.includes("url.pathname = url.pathname.replace(/\\/v1\\/.*$/, '');")) {
+    markFail('src/cli.ts', 'stringCostProxyBaseUrl must strip /v1/... from presign URLs');
+  }
+
+  for (const snippet of [
+    'STRINGCOST_PROXY_URL="$(normalize_stringcost_proxy_url "$STRINGCOST_PROXY_URL"',
+    'STRINGCOST_PROXY_URL="$(normalize_stringcost_proxy_url "$STRINGCOST_UPLOADED_URL"',
+    'STRINGCOST_PROXY_URL="$(normalize_stringcost_proxy_url "$STRINGCOST_STORED_URL"',
+    'STRINGCOST_PROXY_URL="$(normalize_stringcost_proxy_url "$STRINGCOST_FULL_PRESIGN_URL"',
+  ]) {
+    if (!setup.includes(snippet)) {
+      markFail('sandboxes/openeral/setup.sh', `missing normalization step: ${snippet}`);
+    }
+  }
+
+  for (const snippet of [
+    'const baseUrl = stringCostProxyBaseUrl(fullUrl);',
+    'stringcostUrl = stringCostProxyBaseUrl(storedPresign.url);',
+    'stringcostUrl = stringCostProxyBaseUrl(fullUrl);',
+  ]) {
+    if (!cli.includes(snippet)) {
+      markFail('src/cli.ts', `must route presigns through stringCostProxyBaseUrl(): ${snippet}`);
+    }
+  }
+
+  const setupLaunch = setup.slice(setup.indexOf('setup.sh: launching Claude Code'));
+  const cliLaunch = cli.slice(cli.indexOf('setup: launching Claude Code'));
+  if (!setupLaunch.includes('ANTHROPIC_BASE_URL="$STRINGCOST_PROXY_URL"')) {
+    markFail('sandboxes/openeral/setup.sh', 'Claude launch must use normalized STRINGCOST_PROXY_URL');
+  }
+  if (!cliLaunch.includes('ANTHROPIC_BASE_URL="\\${STRINGCOST_PROXY_URL}"')) {
+    markFail('src/cli.ts', 'generated Claude launch must use normalized STRINGCOST_PROXY_URL');
+  }
+
+  const badBaseUrlLine = /ANTHROPIC_BASE_URL\s*=.*(?:STRINGCOST_FULL_PRESIGN_URL|fullUrl|storedPresign\.url)/;
+  if (setup.split('\n').some(line => badBaseUrlLine.test(line))) {
+    markFail('sandboxes/openeral/setup.sh', 'ANTHROPIC_BASE_URL must not be assigned a full presign URL');
+  }
+  if (cli.split('\n').some(line => badBaseUrlLine.test(line))) {
+    markFail('src/cli.ts', 'ANTHROPIC_BASE_URL must not be assigned a full presign URL');
+  }
+
+  if (ok) pass('StringCost presign URLs normalize to the base proxy URL before launch');
+} catch (err) {
+  fail('StringCost proxy URL lint', err?.message || String(err));
+}
+
+// ---------------------------------------------------------------------------
 // Summary
 // ---------------------------------------------------------------------------
 

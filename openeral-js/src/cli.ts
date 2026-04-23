@@ -84,7 +84,7 @@ function saveStoredPresign(url: string, apiKey?: string): void {
   }
 }
 
-function stringCostProxyBaseUrl(presignUrl: string): string {
+export function stringCostProxyBaseUrl(presignUrl: string): string {
   const url = new URL(presignUrl.trim());
   url.pathname = url.pathname.replace(/\/v1\/.*$/, '');
   url.search = '';
