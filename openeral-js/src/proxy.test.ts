@@ -1,5 +1,6 @@
 import { describe, it, expect } from 'vitest';
 import { readFileSync } from 'node:fs';
+import { execFileSync } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
 import { dirname, join } from 'node:path';
 
@@ -22,6 +23,24 @@ function directAuthBranch(source: string, marker: string): string {
   const start = block.indexOf('\nelse\n');
   expect(start).toBeGreaterThanOrEqual(0);
   return block.slice(start);
+}
+
+function setupStringCostNormalizer(): string {
+  const marker = 'normalize_stringcost_proxy_url() {';
+  const start = setup.indexOf(marker);
+  expect(start).toBeGreaterThanOrEqual(0);
+  const endMarker = '\n\nif [ -n "${STRINGCOST_PROXY_URL:-}" ]; then';
+  const end = setup.indexOf(endMarker, start);
+  expect(end).toBeGreaterThan(start);
+  return setup.slice(start, end);
+}
+
+function normalizeWithSetup(input: string): string {
+  return execFileSync(
+    'bash',
+    ['-c', `${setupStringCostNormalizer()}\nnormalize_stringcost_proxy_url "$1"`, 'normalize-test', input],
+    { encoding: 'utf8' },
+  ).trim();
 }
 
 describe('proxy policy (PROXY-PLAN compliance)', () => {
@@ -72,6 +91,37 @@ describe('proxy policy (PROXY-PLAN compliance)', () => {
     expect(socketBlock).toContain('/usr/bin/npm');
     expect(socketBlock).toContain('/usr/bin/node');
   });
+
+  it('allows all current Supabase AWS pooler regions on both pooler ports', () => {
+    // Keep in sync with Supabase Platform > Regions.
+    const regions = [
+      'us-west-1',
+      'us-west-2',
+      'us-east-1',
+      'us-east-2',
+      'ca-central-1',
+      'eu-west-1',
+      'eu-west-2',
+      'eu-west-3',
+      'eu-central-1',
+      'eu-central-2',
+      'eu-north-1',
+      'ap-south-1',
+      'ap-southeast-1',
+      'ap-northeast-1',
+      'ap-northeast-2',
+      'ap-southeast-2',
+      'sa-east-1',
+    ];
+
+    for (const region of regions) {
+      for (const shard of ['aws-0', 'aws-1']) {
+        for (const port of [5432, 6543]) {
+          expect(policy).toContain(`${shard}-${region}.pooler.supabase.com, port: ${port}`);
+        }
+      }
+    }
+  });
 });
 
 describe('setup.sh Socket.dev integration', () => {
@@ -109,6 +159,24 @@ describe('setup.sh StringCost integration', () => {
     expect(setup).toContain('normalize_stringcost_proxy_url');
     expect(setup).toContain('url.pathname = url.pathname.replace(/\\/v1\\/.*$/, "");');
     expect(setup).toContain('s.env.ANTHROPIC_BASE_URL = process.env.STRINGCOST_PROXY_URL');
+  });
+
+  it('prevents doubled /v1/messages when a live presign URL includes beta query params', () => {
+    const baseUrl = normalizeWithSetup(
+      'https://proxy.stringcost.com/stringcost-proxy/t/example-presign-id/v1/messages?beta=true',
+    );
+
+    expect(baseUrl).toBe('https://proxy.stringcost.com/stringcost-proxy/t/example-presign-id');
+    expect(`${baseUrl}/v1/messages?beta=true`).not.toContain('/v1/messages/v1/messages');
+  });
+
+  it('extracts and normalizes StringCost URLs from noisy Claude/Node output', () => {
+    const baseUrl = normalizeWithSetup(
+      '(node:53) [UNDICI-ENVHTTPPROXYAGENT] Warning: EnvHttpProxyAgent is experimental\n' +
+        'https://proxy.stringcost.com/stringcost-proxy/t/example-presign-id/v1/messages?beta=true',
+    );
+
+    expect(baseUrl).toBe('https://proxy.stringcost.com/stringcost-proxy/t/example-presign-id');
   });
 
   it('keeps Node warnings out of ANTHROPIC_BASE_URL', () => {

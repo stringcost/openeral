@@ -5,7 +5,7 @@ import { join } from 'node:path';
 import { execFileSync, execSync } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
 import { dirname } from 'node:path';
-import { parseCliArgs, findRepoRoot } from './cli.js';
+import { parseCliArgs, findRepoRoot, stringCostProxyBaseUrl } from './cli.js';
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 
@@ -145,6 +145,32 @@ describe('CLI launch database handling', () => {
     expect(cliSource).toContain('POSTGRES_URL');
     expect(cliSource).not.toMatch(/sandboxArgs\.push\('--provider', 'db'\)/);
     expect(cliSource).not.toMatch(/'provider', 'create', '--name', 'db'/);
+  });
+});
+
+describe('StringCost presign URL normalization', () => {
+  it('strips the presigned endpoint so Claude appends /v1/messages only once', () => {
+    const baseUrl = stringCostProxyBaseUrl(
+      'https://proxy.stringcost.com/stringcost-proxy/t/example-presign-id/v1/messages?beta=true',
+    );
+
+    expect(baseUrl).toBe('https://proxy.stringcost.com/stringcost-proxy/t/example-presign-id');
+    expect(`${baseUrl}/v1/messages?beta=true`).not.toContain('/v1/messages/v1/messages');
+  });
+
+  it('accepts an already-normalized proxy base URL', () => {
+    expect(
+      stringCostProxyBaseUrl('https://proxy.stringcost.com/stringcost-proxy/t/example-presign-id'),
+    ).toBe('https://proxy.stringcost.com/stringcost-proxy/t/example-presign-id');
+  });
+
+  it('rejects unexpected StringCost proxy URL shapes', () => {
+    expect(() => stringCostProxyBaseUrl('https://proxy.stringcost.com/stringcost-proxy/t/example-presign-id/other')).toThrow(
+      /Unexpected StringCost presign URL shape/,
+    );
+    expect(() => stringCostProxyBaseUrl('https://api.anthropic.com/v1/messages')).toThrow(
+      /Unexpected StringCost presign URL shape/,
+    );
   });
 });
 

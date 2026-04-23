@@ -613,6 +613,90 @@ try {
 }
 
 // ---------------------------------------------------------------------------
+// Lint 30: StringCost presign URLs must be normalized before Claude launch
+// Catches: passing .../v1/messages as ANTHROPIC_BASE_URL, which Claude then
+// appends to produce /v1/messages/v1/messages.
+// ---------------------------------------------------------------------------
+console.log('\n--- Lint: StringCost proxy URL is base-only ---');
+
+try {
+  const setup = readFileSync('../sandboxes/openeral/setup.sh', 'utf8');
+  const cli = readFileSync('src/cli.ts', 'utf8');
+  let ok = true;
+  const markFail = (file, message) => {
+    fail(file, message);
+    ok = false;
+  };
+
+  const launchSection = (source, marker, file) => {
+    const idx = source.indexOf(marker);
+    if (idx < 0) {
+      markFail(file, `missing launch marker: ${marker}`);
+      return source;
+    }
+    return source.slice(idx);
+  };
+
+  const stripV1PathRe = /url\.pathname\s*=\s*url\.pathname\.replace\(\s*\/\\\/v1\\\/\.\*\$\/\s*,\s*(['"])\1\s*\)\s*;?/;
+  if (!stripV1PathRe.test(setup)) {
+    markFail('sandboxes/openeral/setup.sh', 'normalize_stringcost_proxy_url must strip /v1/... from presign URLs');
+  }
+  if (!stripV1PathRe.test(cli)) {
+    markFail('src/cli.ts', 'stringCostProxyBaseUrl must strip /v1/... from presign URLs');
+  }
+
+  for (const [envName, description] of [
+    ['STRINGCOST_PROXY_URL', 'current STRINGCOST_PROXY_URL'],
+    ['STRINGCOST_UPLOADED_URL', 'uploaded presign URL'],
+    ['STRINGCOST_STORED_URL', 'stored presign URL'],
+    ['STRINGCOST_FULL_PRESIGN_URL', 'newly-created presign URL'],
+  ]) {
+    const normalizeInputRe = new RegExp(
+      String.raw`STRINGCOST_PROXY_URL\s*=\s*["']?\$\(\s*normalize_stringcost_proxy_url\s+["']?\$${envName}(?![A-Za-z0-9_])`,
+    );
+    if (!normalizeInputRe.test(setup)) {
+      markFail('sandboxes/openeral/setup.sh', `missing normalization step for ${description}`);
+    }
+  }
+
+  for (const [pattern, description] of [
+    [/\bconst\s+baseUrl\s*=\s*stringCostProxyBaseUrl\(\s*fullUrl\s*\)\s*;?/, 'new presign renewal result'],
+    [/\bstringcostUrl\s*=\s*stringCostProxyBaseUrl\(\s*storedPresign\.url\s*\)\s*;?/, 'stored presign launch path'],
+    [/\bstringcostUrl\s*=\s*stringCostProxyBaseUrl\(\s*fullUrl\s*\)\s*;?/, 'new presign launch path'],
+  ]) {
+    if (!pattern.test(cli)) {
+      markFail('src/cli.ts', `must route ${description} through stringCostProxyBaseUrl()`);
+    }
+  }
+
+  const setupLaunch = launchSection(setup, 'setup.sh: launching Claude Code', 'sandboxes/openeral/setup.sh');
+  const cliLaunch = launchSection(cli, 'setup: launching Claude Code', 'src/cli.ts');
+  const normalizedBaseUrlEnvRe = /\bANTHROPIC_BASE_URL\s*=\s*(['"]?)\\?\$\{?STRINGCOST_PROXY_URL\}?\1(?![A-Za-z0-9_])/;
+  if (!normalizedBaseUrlEnvRe.test(setupLaunch)) {
+    markFail('sandboxes/openeral/setup.sh', 'Claude launch must use normalized STRINGCOST_PROXY_URL');
+  }
+  if (!normalizedBaseUrlEnvRe.test(cliLaunch)) {
+    markFail('src/cli.ts', 'generated Claude launch must use normalized STRINGCOST_PROXY_URL');
+  }
+
+  const badBaseUrlLine = /ANTHROPIC_BASE_URL\s*=.*(?:STRINGCOST_FULL_PRESIGN_URL|fullUrl|storedPresign\.url)/;
+  if (setup.split('\n').some(line => badBaseUrlLine.test(line))) {
+    markFail('sandboxes/openeral/setup.sh', 'ANTHROPIC_BASE_URL must not be assigned a full presign URL');
+  }
+  if (cli.split('\n').some(line => badBaseUrlLine.test(line))) {
+    markFail('src/cli.ts', 'ANTHROPIC_BASE_URL must not be assigned a full presign URL');
+  }
+
+  if (ok) pass('StringCost presign URLs normalize to the base proxy URL before launch');
+} catch (err) {
+  if (err?.code === 'ENOENT') {
+    pass('StringCost proxy URL lint skipped (required files not found)');
+  } else {
+    fail('StringCost proxy URL lint', err?.message || String(err));
+  }
+}
+
+// ---------------------------------------------------------------------------
 // Summary
 // ---------------------------------------------------------------------------
 
