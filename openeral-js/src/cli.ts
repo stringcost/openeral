@@ -1722,6 +1722,67 @@ fi
 
 mkdir -p /home/agent/.claude /home/agent/.claude/projects /home/agent/.openeral/data
 
+# Org skills are written after the workspace restore so syncToFs cannot prune
+# freshly downloaded host-side skills before Claude starts.
+
+# Stable PGlite data directory — must be set before starting the daemon so that
+# getDatabaseConnection() in embedded.js uses /home/agent regardless of what HOME
+# is set to in the sandbox process at daemon startup time.
+export OPENERAL_DATA_DIR="/home/agent/.openeral/data"
+
+echo "setup: running migrations..."
+node -e "
+  import('$OPENERAL_DIR/dist/db/embedded.js').then(async ({ getDatabaseConnection }) => {
+    const { runMigrations } = await import('$OPENERAL_DIR/dist/db/migrations.js');
+    const { pool } = await getDatabaseConnection();
+    await runMigrations(pool);
+    await pool.end();
+    console.log('setup: migrations complete');
+  }).catch(err => {
+    console.error('setup: migration failed:', err.message);
+    process.exit(1);
+  });
+"
+
+echo "setup: seeding workspace \$WORKSPACE_ID..."
+node -e "
+  import('$OPENERAL_DIR/dist/db/embedded.js').then(async ({ getDatabaseConnection }) => {
+    const ws = await import('$OPENERAL_DIR/dist/db/workspace-queries.js');
+    const { pool } = await getDatabaseConnection();
+    try {
+      await pool.query(
+        \\"INSERT INTO _openeral.workspace_config (id, display_name, config) VALUES (\\\\$1, \\\\$2, '{}'::jsonb) ON CONFLICT (id) DO NOTHING\\",
+        [process.env.WORKSPACE_ID, 'sandbox']
+      );
+    } catch {}
+    await ws.seedFromConfig(pool, process.env.WORKSPACE_ID, {
+      autoDirs: ['/', '/.claude', '/.claude/projects'],
+      seedFiles: {},
+    });
+    await pool.end();
+    console.log('setup: workspace seeded');
+  }).catch(err => {
+    console.error('setup: seed failed:', err.message);
+    process.exit(1);
+  });
+"
+
+echo "setup: restoring /home/agent from workspace..."
+node -e "
+  import('$OPENERAL_DIR/dist/db/embedded.js').then(async ({ getDatabaseConnection }) => {
+    const { syncToFs } = await import('$OPENERAL_DIR/dist/sync.js');
+    const { pool } = await getDatabaseConnection();
+    const count = await syncToFs(pool, process.env.WORKSPACE_ID, '/home/agent', {
+      excludeDirs: new Set(['node_modules', '.git', '.openeral'])
+    });
+    await pool.end();
+    console.log('setup: restored ' + count + ' workspace entr' + (count === 1 ? 'y' : 'ies'));
+  }).catch(err => {
+    console.error('setup: restore failed:', err.message);
+    process.exit(1);
+  });
+"
+
 ${skillsBase64 ? `# Write org skills downloaded from StringCost (base64-encoded JSON bundle)
 node -e "
 const s=JSON.parse(Buffer.from('${skillsBase64}','base64').toString());
@@ -1734,52 +1795,6 @@ s.forEach(function(x){
 console.log('setup: wrote '+s.length+' org skill'+(s.length===1?'':'s'));
 "
 ` : '# No org skills (STRINGCOST_API_KEY not set or bundle download skipped)'}
-
-# Stable PGlite data directory — must be set before starting the daemon so that
-# getDatabaseConnection() in embedded.js uses /home/agent regardless of what HOME
-# is set to in the sandbox process at daemon startup time.
-export OPENERAL_DATA_DIR="/home/agent/.openeral/data"
-
-if [ -n "\${DATABASE_URL:-}" ]; then
-  echo "setup: running migrations..."
-  node -e "
-    import('$OPENERAL_DIR/dist/db/pool.js').then(async ({ createPool }) => {
-      const { runMigrations } = await import('$OPENERAL_DIR/dist/db/migrations.js');
-      const pool = createPool(process.env.DATABASE_URL);
-      await runMigrations(pool);
-      await pool.end();
-      console.log('setup: migrations complete');
-    }).catch(err => {
-      console.error('setup: migration failed:', err.message);
-      process.exit(1);
-    });
-  "
-
-  echo "setup: seeding workspace \$WORKSPACE_ID..."
-  node -e "
-    import('$OPENERAL_DIR/dist/db/pool.js').then(async ({ createPool }) => {
-      const ws = await import('$OPENERAL_DIR/dist/db/workspace-queries.js');
-      const pool = createPool(process.env.DATABASE_URL);
-      try {
-        await pool.query(
-          \\"INSERT INTO _openeral.workspace_config (id, display_name, config) VALUES (\\\\$1, \\\\$2, '{}'::jsonb) ON CONFLICT (id) DO NOTHING\\",
-          [process.env.WORKSPACE_ID, 'sandbox']
-        );
-      } catch {}
-      await ws.seedFromConfig(pool, process.env.WORKSPACE_ID, {
-        autoDirs: ['/', '/.claude', '/.claude/projects'],
-        seedFiles: {},
-      });
-      await pool.end();
-      console.log('setup: workspace seeded');
-    }).catch(err => {
-      console.error('setup: seed failed:', err.message);
-      process.exit(1);
-    });
-  "
-else
-  echo "setup: no DATABASE_URL — running in local-only mode (no persistence)"
-fi
 
 # Write StringCost proxy config directly into Claude Code settings.json so
 # it takes effect regardless of how the sandbox injects environment variables.
@@ -1798,6 +1813,22 @@ fs.writeFileSync(file, JSON.stringify(s, null, 2));
 console.log('setup: StringCost proxy written to ~/.claude/settings.json');
 "
 fi
+
+echo "setup: flushing /home/agent to workspace..."
+node -e "
+  import('$OPENERAL_DIR/dist/db/embedded.js').then(async ({ getDatabaseConnection }) => {
+    const { syncFromFs } = await import('$OPENERAL_DIR/dist/sync.js');
+    const { pool } = await getDatabaseConnection();
+    const count = await syncFromFs(pool, process.env.WORKSPACE_ID, '/home/agent', {
+      excludeDirs: new Set(['node_modules', '.git', '.openeral'])
+    });
+    await pool.end();
+    console.log('setup: flushed ' + count + ' workspace entr' + (count === 1 ? 'y' : 'ies'));
+  }).catch(err => {
+    console.error('setup: flush failed:', err.message);
+    process.exit(1);
+  });
+"
 
 OPENERAL_NPMRC=/tmp/openeral-npmrc
 rm -f "$OPENERAL_NPMRC"

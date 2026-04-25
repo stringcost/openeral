@@ -154,6 +154,35 @@ describe('setup.sh Socket.dev integration', () => {
   });
 });
 
+describe('sandbox workspace persistence wiring', () => {
+  const bashBridge = readFileSync(join(repoRoot, 'sandboxes/openeral/openeral-bash.mjs'), 'utf8');
+
+  it('setup.sh restores and flushes the real Claude home', () => {
+    expect(setup).toContain("import('$OPENERAL_DIR/dist/sync.js')");
+    expect(setup).toContain('syncToFs(pool, process.env.WORKSPACE_ID');
+    expect(setup).toContain('syncFromFs(pool, process.env.WORKSPACE_ID');
+    expect(setup.indexOf('restoring /home/agent from workspace')).toBeLessThan(
+      setup.indexOf('starting openeral-bash daemon'),
+    );
+  });
+
+  it('CLI inline setup uses embedded or external PostgreSQL and restores home before launch', () => {
+    expect(cli).toContain("import('$OPENERAL_DIR/dist/db/embedded.js')");
+    expect(cli).toContain("import('$OPENERAL_DIR/dist/sync.js')");
+    expect(cli).toContain('syncToFs(pool, process.env.WORKSPACE_ID');
+    expect(cli).toContain('syncFromFs(pool, process.env.WORKSPACE_ID');
+    expect(cli).not.toContain('setup: no DATABASE_URL — running in local-only mode');
+  });
+
+  it('openeral-bash keeps virtual Bash writes and real file-tool writes in sync', () => {
+    expect(bashBridge).toContain("import('/opt/openeral/dist/sync.js')");
+    expect(bashBridge).toContain('syncFromFs(pool, workspaceId');
+    expect(bashBridge).toContain('syncToFs(pool, workspaceId');
+    expect(bashBridge).toContain('watchAndSync(pool, workspaceId');
+    expect(bashBridge).toContain('execCommandWithSync(shell, pool, workspaceId, command)');
+  });
+});
+
 describe('setup.sh StringCost integration', () => {
   it('normalizes presign URLs before writing Claude settings', () => {
     expect(setup).toContain('normalize_stringcost_proxy_url');

@@ -15,7 +15,7 @@ function nowNs(): bigint {
 }
 
 /** Default directories to skip — exact basename matches only. */
-const DEFAULT_EXCLUDE_DIRS = new Set(['node_modules', '.git']);
+const DEFAULT_EXCLUDE_DIRS = new Set(['node_modules', '.git', '.openeral']);
 
 function shouldExclude(name: string, excludeDirs: Set<string>): boolean {
   return excludeDirs.has(name);

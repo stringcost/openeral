@@ -63,6 +63,7 @@ printf '%s' "$DATABASE_URL" > /tmp/openeral-db-url
 chmod 600 /tmp/openeral-db-url
 
 openshell sandbox create --tty \
+  --name openeral-claude \
   --from ghcr.io/sandys/openeral/sandbox:just-bash \
   --upload /tmp/openeral-db-url:/sandbox/db-url \
   --provider claude --auto-providers \
@@ -72,6 +73,8 @@ rm -f /tmp/openeral-db-url
 ```
 
 OpenEral reads `/sandbox/db-url`, creates the `_openeral` schema, runs migrations, and seeds the workspace. In Supabase, switch the Table Editor schema selector to `_openeral` to inspect the rows.
+
+Reuse the same sandbox name on every machine. OpenEral uses the OpenShell sandbox ID as the workspace ID, so `--name openeral-claude` is what makes the same PostgreSQL-backed home restore after deletion or from another host.
 
 Do not pass the database URL through an OpenShell generic provider. PostgreSQL is raw TCP, so the credential must be delivered by `--upload`.
 

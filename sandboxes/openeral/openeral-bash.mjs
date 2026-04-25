@@ -24,6 +24,35 @@ import { createServer, createConnection } from 'node:net';
 import { existsSync, unlinkSync, chmodSync } from 'node:fs';
 
 const SOCKET_PATH = '/tmp/openeral-bash.sock';
+const HOME_DIR = process.env.OPENERAL_HOME || '/home/agent';
+const SYNC_EXCLUDE_DIRS = new Set(['node_modules', '.git', '.openeral']);
+
+async function syncFromRealFs(pool, workspaceId) {
+  try {
+    const { syncFromFs } = await import('/opt/openeral/dist/sync.js');
+    await syncFromFs(pool, workspaceId, HOME_DIR, { excludeDirs: SYNC_EXCLUDE_DIRS });
+  } catch (err) {
+    process.stderr.write(`openeral-bash: syncFromFs warning: ${err.message}\n`);
+  }
+}
+
+async function syncToRealFs(pool, workspaceId) {
+  try {
+    const { syncToFs } = await import('/opt/openeral/dist/sync.js');
+    await syncToFs(pool, workspaceId, HOME_DIR, { excludeDirs: SYNC_EXCLUDE_DIRS });
+  } catch (err) {
+    process.stderr.write(`openeral-bash: syncToFs warning: ${err.message}\n`);
+  }
+}
+
+async function execCommandWithSync(shell, pool, workspaceId, command) {
+  await syncFromRealFs(pool, workspaceId);
+  try {
+    return await shell.exec(command);
+  } finally {
+    await syncToRealFs(pool, workspaceId);
+  }
+}
 
 // ---------------------------------------------------------------------------
 // Daemon mode
@@ -43,6 +72,14 @@ async function startDaemon() {
     migrate: false, // setup.sh already ran migrations
     pool,
   });
+
+  let stopWatching = () => {};
+  try {
+    const { watchAndSync } = await import('/opt/openeral/dist/sync.js');
+    stopWatching = watchAndSync(pool, workspaceId, HOME_DIR, { excludeDirs: SYNC_EXCLUDE_DIRS });
+  } catch (err) {
+    process.stderr.write(`openeral-bash: watcher warning: ${err.message}\n`);
+  }
 
   // Clean up stale socket
   if (existsSync(SOCKET_PATH)) {
@@ -76,7 +113,7 @@ async function startDaemon() {
         return;
       }
 
-      shell.exec(command).then((result) => {
+      execCommandWithSync(shell, pool, workspaceId, command).then((result) => {
         conn.end(JSON.stringify({
           stdout: result.stdout,
           stderr: result.stderr,
@@ -101,12 +138,20 @@ async function startDaemon() {
   });
 
   // Graceful shutdown
+  let shuttingDown = false;
+  async function shutdown() {
+    if (shuttingDown) return;
+    shuttingDown = true;
+    stopWatching();
+    await syncFromRealFs(pool, workspaceId);
+    server.close();
+    try { unlinkSync(SOCKET_PATH); } catch {}
+    try { await pool.end(); } catch {}
+    process.exit(0);
+  }
+
   for (const sig of ['SIGTERM', 'SIGINT']) {
-    process.on(sig, () => {
-      server.close();
-      try { unlinkSync(SOCKET_PATH); } catch {}
-      process.exit(0);
-    });
+    process.on(sig, () => { void shutdown(); });
   }
 }
 
@@ -160,7 +205,11 @@ async function execStandalone(command) {
     pool,
   });
 
-  return shell.exec(command);
+  try {
+    return await execCommandWithSync(shell, pool, workspaceId, command);
+  } finally {
+    try { await pool.end(); } catch {}
+  }
 }
 
 // ---------------------------------------------------------------------------

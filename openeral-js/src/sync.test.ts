@@ -49,7 +49,7 @@ describe('sync.ts structural checks', () => {
   it('exclude uses exact directory name matching, not regex substring', () => {
     // Must use Set-based matching, not regex
     expect(syncSrc).toContain('DEFAULT_EXCLUDE_DIRS');
-    expect(syncSrc).toContain("new Set(['node_modules', '.git'])");
+    expect(syncSrc).toContain("new Set(['node_modules', '.git', '.openeral'])");
     // shouldExclude must use .has(), not .test()
     expect(syncSrc).toContain('excludeDirs.has(name)');
     // Must NOT have a regex-based exclude that would match .gitignore
