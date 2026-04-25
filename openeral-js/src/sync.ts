@@ -6,8 +6,8 @@
  * watchAndSync: continuous background sync via fs.watch
  */
 
-import { mkdirSync, writeFileSync, readFileSync, readdirSync, statSync, chmodSync, unlinkSync, rmSync, existsSync, watch } from 'node:fs';
-import { join, dirname, relative } from 'node:path';
+import { mkdirSync, writeFileSync, readFileSync, readdirSync, statSync, chmodSync, unlinkSync, rmSync, watch } from 'node:fs';
+import { join, dirname } from 'node:path';
 import type pg from 'pg';
 
 function nowNs(): bigint {
@@ -15,10 +15,135 @@ function nowNs(): bigint {
 }
 
 /** Default directories to skip — exact basename matches only. */
-const DEFAULT_EXCLUDE_DIRS = new Set(['node_modules', '.git', '.openeral']);
+export const DEFAULT_EXCLUDE_DIRS = new Set(['node_modules', '.git', '.openeral']);
+export const DEFAULT_EXCLUDE_FILES = new Set<string>();
+export const HOME_SYNC_EXCLUDE_DIRS = new Set([
+  ...DEFAULT_EXCLUDE_DIRS,
+  '.aws',
+  '.azure',
+  '.config',
+  '.docker',
+  '.gnupg',
+  '.kube',
+  '.npm',
+  '.ssh',
+]);
+export const HOME_SYNC_EXCLUDE_FILES = new Set([
+  '.bash_history',
+  '.git-credentials',
+  '.lesshst',
+  '.mysql_history',
+  '.netrc',
+  '.npmrc',
+  '.psql_history',
+  '.python_history',
+  '.wget-hsts',
+  '.zsh_history',
+]);
+export const HOME_SYNC_EXCLUDE_PATH_PREFIXES = ['/.local/share/keyrings'];
+export const HOME_SYNC_MAX_FILE_SIZE_BYTES = 1024 * 1024;
+
+export interface SyncOptions {
+  excludeDirs?: Set<string>;
+  excludeFiles?: Set<string>;
+  excludePathPrefixes?: string[];
+  maxFileSizeBytes?: number;
+  skipBinaryFiles?: boolean;
+  prune?: boolean;
+}
+
+interface ResolvedSyncOptions {
+  excludeDirs: Set<string>;
+  excludeFiles: Set<string>;
+  excludePathPrefixes: string[];
+  maxFileSizeBytes?: number;
+  skipBinaryFiles: boolean;
+  prune: boolean;
+}
+
+export interface SyncWatchHandle {
+  stop(): void;
+  isDirty(): boolean;
+  isWatching(): boolean;
+  markDirty(): void;
+  markClean(): void;
+  suspend<T>(fn: () => Promise<T>): Promise<T>;
+}
+
+export function createHomeSyncOptions(overrides: SyncOptions = {}): SyncOptions {
+  return {
+    excludeDirs: new Set([...HOME_SYNC_EXCLUDE_DIRS, ...(overrides.excludeDirs ?? [])]),
+    excludeFiles: new Set([...HOME_SYNC_EXCLUDE_FILES, ...(overrides.excludeFiles ?? [])]),
+    excludePathPrefixes: [...HOME_SYNC_EXCLUDE_PATH_PREFIXES, ...(overrides.excludePathPrefixes ?? [])],
+    maxFileSizeBytes: overrides.maxFileSizeBytes ?? HOME_SYNC_MAX_FILE_SIZE_BYTES,
+    skipBinaryFiles: overrides.skipBinaryFiles ?? true,
+    prune: overrides.prune ?? false,
+  };
+}
 
 function shouldExclude(name: string, excludeDirs: Set<string>): boolean {
   return excludeDirs.has(name);
+}
+
+function normalizeDbPath(path: string): string {
+  const normalized = path.replace(/\\/g, '/').replace(/\/+/g, '/');
+  if (!normalized || normalized === '/') return '/';
+  const trimmed = normalized.endsWith('/') ? normalized.slice(0, -1) : normalized;
+  return trimmed.startsWith('/') ? trimmed : `/${trimmed}`;
+}
+
+function splitDbPath(path: string): string[] {
+  return normalizeDbPath(path).split('/').filter(Boolean);
+}
+
+function hasExcludedPrefix(path: string, prefixes: string[]): boolean {
+  const normalized = normalizeDbPath(path);
+  return prefixes.some((prefix) => normalized === prefix || normalized.startsWith(`${prefix}/`));
+}
+
+function shouldExcludePath(path: string, opts: ResolvedSyncOptions, isDir?: boolean): boolean {
+  if (path === '/') return false;
+  if (hasExcludedPrefix(path, opts.excludePathPrefixes)) return true;
+
+  const segments = splitDbPath(path);
+  if (segments.some((segment) => shouldExclude(segment, opts.excludeDirs))) return true;
+
+  if (isDir !== true) {
+    const basename = segments[segments.length - 1];
+    if (opts.excludeFiles.has(basename)) return true;
+  }
+
+  return false;
+}
+
+function normalizeSyncOptions(opts?: SyncOptions): ResolvedSyncOptions {
+  return {
+    excludeDirs: opts?.excludeDirs ?? DEFAULT_EXCLUDE_DIRS,
+    excludeFiles: opts?.excludeFiles ?? DEFAULT_EXCLUDE_FILES,
+    excludePathPrefixes: (opts?.excludePathPrefixes ?? []).map(normalizeDbPath),
+    maxFileSizeBytes: opts?.maxFileSizeBytes,
+    skipBinaryFiles: opts?.skipBinaryFiles ?? false,
+    prune: opts?.prune ?? true,
+  };
+}
+
+function isBinaryContent(content: Buffer): boolean {
+  if (content.length === 0) return false;
+
+  const sample = content.subarray(0, Math.min(content.length, 8000));
+  let suspicious = 0;
+  for (const byte of sample) {
+    if (byte === 0) return true;
+    if ((byte < 7 || (byte > 14 && byte < 32) || byte === 127)) suspicious++;
+  }
+  return suspicious / sample.length > 0.3;
+}
+
+function formatSyncError(err: unknown, label: string): string {
+  const error = err instanceof Error ? err : new Error(String(err));
+  const code = err && typeof err === 'object' && 'code' in err && err.code ? ` code=${err.code}` : '';
+  const detail = `${label}: ${error.message}${code}`;
+  return error.stack ? `${detail}\n${error.stack}` : detail;
 }
 
 /**
@@ -30,15 +155,16 @@ export async function syncToFs(
   pool: pg.Pool,
   workspaceId: string,
   targetDir: string,
-  opts?: { excludeDirs?: Set<string> },
+  opts?: SyncOptions,
 ): Promise<number> {
-  const excludeDirs = opts?.excludeDirs ?? DEFAULT_EXCLUDE_DIRS;
+  const syncOpts = normalizeSyncOptions(opts);
 
-  const { rows } = await pool.query(
+  const { rows: allRows } = await pool.query(
     `SELECT path, is_dir, content, mode FROM _openeral.workspace_files
      WHERE workspace_id = $1 ORDER BY path`,
     [workspaceId],
   );
+  const rows = allRows.filter((row: any) => !shouldExcludePath(row.path as string, syncOpts, row.is_dir as boolean));
 
   const dbPaths = new Set(rows.map((r: any) => r.path as string));
   const dbTypes = new Map(rows.map((r: any) => [r.path as string, r.is_dir as boolean]));
@@ -47,7 +173,9 @@ export async function syncToFs(
   // Step 1: Prune stale local entries AND resolve type conflicts BEFORE creating.
   // A path that changed type (file↔dir) between sessions would cause EEXIST/EISDIR
   // if we tried to create first.
-  pruneLocal(targetDir, '/', dbPaths, dbTypes, excludeDirs);
+  if (syncOpts.prune) {
+    pruneLocal(targetDir, '/', dbPaths, dbTypes, syncOpts);
+  }
 
   // Step 2: Create directories (sorted by path ensures parents before children)
   for (const row of rows) {
@@ -84,7 +212,7 @@ function pruneLocal(
   dbParent: string,
   dbPaths: Set<string>,
   dbTypes: Map<string, boolean>,
-  excludeDirs: Set<string>,
+  opts: ResolvedSyncOptions,
 ): void {
   const fullDir = join(baseDir, dbParent);
   let entries: string[];
@@ -95,10 +223,9 @@ function pruneLocal(
   }
 
   for (const name of entries) {
-    if (shouldExclude(name, excludeDirs)) continue;
-
     const fullPath = join(fullDir, name);
     const dbPath = dbParent === '/' ? `/${name}` : `${dbParent}/${name}`;
+    if (shouldExcludePath(dbPath, opts)) continue;
 
     let st;
     try {
@@ -112,7 +239,7 @@ function pruneLocal(
 
     if (st.isDirectory()) {
       // Recurse first so children are cleaned before we potentially remove this dir
-      pruneLocal(baseDir, dbPath, dbPaths, dbTypes, excludeDirs);
+      pruneLocal(baseDir, dbPath, dbPaths, dbTypes, opts);
 
       if (!inDb) {
         // Stale directory — remove entirely
@@ -141,9 +268,9 @@ export async function syncFromFs(
   pool: pg.Pool,
   workspaceId: string,
   sourceDir: string,
-  opts?: { excludeDirs?: Set<string> },
+  opts?: SyncOptions,
 ): Promise<number> {
-  const excludeDirs = opts?.excludeDirs ?? DEFAULT_EXCLUDE_DIRS;
+  const syncOpts = normalizeSyncOptions(opts);
   const seenPaths = new Set<string>(['/']);
   let count = 0;
 
@@ -156,8 +283,6 @@ export async function syncFromFs(
     }
 
     for (const name of entries) {
-      if (shouldExclude(name, excludeDirs)) continue;
-
       const fullPath = join(dirPath, name);
       const dbPath = dbParent === '/' ? `/${name}` : `${dbParent}/${name}`;
 
@@ -168,10 +293,10 @@ export async function syncFromFs(
         continue;
       }
 
-      const now = nowNs();
-      seenPaths.add(dbPath);
-
       if (st.isDirectory()) {
+        if (shouldExcludePath(dbPath, syncOpts, true)) continue;
+        const now = nowNs();
+        seenPaths.add(dbPath);
         await pool.query(
           `INSERT INTO _openeral.workspace_files
            (workspace_id, path, parent_path, name, is_dir, content, mode, size, mtime_ns, ctime_ns, atime_ns, nlink, uid, gid)
@@ -182,7 +307,12 @@ export async function syncFromFs(
         count++;
         await walkDir(fullPath, dbPath);
       } else if (st.isFile()) {
+        if (shouldExcludePath(dbPath, syncOpts, false)) continue;
+        if (syncOpts.maxFileSizeBytes !== undefined && st.size > syncOpts.maxFileSizeBytes) continue;
         const content = readFileSync(fullPath);
+        if (syncOpts.skipBinaryFiles && isBinaryContent(content)) continue;
+        const now = nowNs();
+        seenPaths.add(dbPath);
         await pool.query(
           `INSERT INTO _openeral.workspace_files
            (workspace_id, path, parent_path, name, is_dir, content, mode, size, mtime_ns, ctime_ns, atime_ns, nlink, uid, gid)
@@ -226,53 +356,91 @@ export async function syncFromFs(
 
 /**
  * Watch a directory for changes and sync to PostgreSQL.
- * Returns a stop function.
+ * Returns a controller that exposes watcher dirty-state.
  */
 export function watchAndSync(
   pool: pg.Pool,
   workspaceId: string,
   dir: string,
-  opts?: { debounceMs?: number; excludeDirs?: Set<string> },
-): () => void {
+  opts?: SyncOptions & { debounceMs?: number },
+): SyncWatchHandle {
   const debounceMs = opts?.debounceMs ?? 2000;
-  const excludeDirs = opts?.excludeDirs ?? DEFAULT_EXCLUDE_DIRS;
+  const syncOpts = normalizeSyncOptions(opts);
   let timer: ReturnType<typeof setTimeout> | null = null;
   let syncing = false;
+  let dirty = false;
+  let suspended = 0;
+  let watching = false;
 
   const ac = new AbortController();
 
+  const markDirty = () => {
+    dirty = true;
+  };
+
+  const markClean = () => {
+    dirty = false;
+  };
+
+  const scheduleSync = () => {
+    if (timer) clearTimeout(timer);
+    timer = setTimeout(() => {
+      if (!dirty || syncing || suspended > 0) return;
+      syncing = true;
+      void syncFromFs(pool, workspaceId, dir, syncOpts).then(() => {
+        markClean();
+      }).catch((err: unknown) => {
+        process.stderr.write(`${formatSyncError(err, 'openeral: sync error')}\n`);
+      }).finally(() => {
+        syncing = false;
+      });
+    }, debounceMs);
+  };
+
   try {
     const watcher = watch(dir, { recursive: true, signal: ac.signal });
+    watching = true;
 
     watcher.on('change', (_event, filename) => {
-      if (typeof filename === 'string') {
-        // Check each path segment against excludeDirs
-        const segments = filename.split('/');
-        if (segments.some(s => shouldExclude(s, excludeDirs))) return;
-      }
-
-      // Debounce: wait for changes to settle before syncing
-      if (timer) clearTimeout(timer);
-      timer = setTimeout(async () => {
-        if (syncing) return;
-        syncing = true;
-        try {
-          await syncFromFs(pool, workspaceId, dir, { excludeDirs });
-        } catch (err: any) {
-          process.stderr.write(`openeral: sync error: ${err.message}\n`);
-        } finally {
-          syncing = false;
-        }
-      }, debounceMs);
+      if (suspended > 0) return;
+      if (typeof filename === 'string' && shouldExcludePath(filename, syncOpts)) return;
+      markDirty();
+      scheduleSync();
     });
 
-    watcher.on('error', () => {}); // ignore watcher errors
+    watcher.on('error', (err) => {
+      watching = false;
+      markDirty();
+      process.stderr.write(`${formatSyncError(err, 'openeral: watcher error')}\n`);
+    });
   } catch {
     // fs.watch may not support recursive on all platforms
   }
 
-  return () => {
-    ac.abort();
-    if (timer) clearTimeout(timer);
+  return {
+    stop() {
+      ac.abort();
+      if (timer) clearTimeout(timer);
+    },
+    isDirty() {
+      return dirty;
+    },
+    isWatching() {
+      return watching;
+    },
+    markDirty,
+    markClean,
+    async suspend<T>(fn: () => Promise<T>): Promise<T> {
+      suspended++;
+      if (timer) {
+        clearTimeout(timer);
+        timer = null;
+      }
+      try {
+        return await fn();
+      } finally {
+        suspended = Math.max(0, suspended - 1);
+      }
+    },
   };
 }

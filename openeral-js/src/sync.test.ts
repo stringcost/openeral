@@ -80,4 +80,40 @@ describe('sync.ts structural checks', () => {
     expect(syncSrc).toContain('dbIsDir === false');
     expect(syncSrc).toContain('dbIsDir === true');
   });
+
+  it('home sync policy excludes sensitive dirs, files, and keyrings', () => {
+    expect(syncSrc).toContain('HOME_SYNC_EXCLUDE_DIRS');
+    expect(syncSrc).toContain("'.ssh'");
+    expect(syncSrc).toContain("'.aws'");
+    expect(syncSrc).toContain("'.azure'");
+    expect(syncSrc).toContain("'.gnupg'");
+    expect(syncSrc).toContain("'.config'");
+    expect(syncSrc).toContain('HOME_SYNC_EXCLUDE_FILES');
+    expect(syncSrc).toContain("'.npmrc'");
+    expect(syncSrc).toContain("'.git-credentials'");
+    expect(syncSrc).toContain("'.netrc'");
+    expect(syncSrc).toContain("['/.local/share/keyrings']");
+  });
+
+  it('home sync policy disables pruning and caps persisted file size', () => {
+    expect(syncSrc).toContain('createHomeSyncOptions');
+    expect(syncSrc).toContain('HOME_SYNC_MAX_FILE_SIZE_BYTES');
+    expect(syncSrc).toContain('prune: overrides.prune ?? false');
+    expect(syncSrc).toContain('skipBinaryFiles: overrides.skipBinaryFiles ?? true');
+  });
+
+  it('syncFromFs can skip oversized and binary files', () => {
+    expect(syncSrc).toContain('syncOpts.maxFileSizeBytes');
+    expect(syncSrc).toContain('st.size > syncOpts.maxFileSizeBytes');
+    expect(syncSrc).toContain('isBinaryContent');
+    expect(syncSrc).toContain('syncOpts.skipBinaryFiles');
+  });
+
+  it('watchAndSync exposes dirty-state controls for sync fast paths', () => {
+    expect(syncSrc).toContain('export interface SyncWatchHandle');
+    expect(syncSrc).toContain('isDirty(): boolean');
+    expect(syncSrc).toContain('isWatching(): boolean');
+    expect(syncSrc).toContain('markClean(): void');
+    expect(syncSrc).toContain('async suspend<T>(');
+  });
 });

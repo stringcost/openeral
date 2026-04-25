@@ -361,11 +361,9 @@ node -e "
 echo "setup.sh: restoring /home/agent from workspace..."
 node -e "
   import('$OPENERAL_DIR/dist/db/embedded.js').then(async ({ getDatabaseConnection }) => {
-    const { syncToFs } = await import('$OPENERAL_DIR/dist/sync.js');
+    const { syncToFs, createHomeSyncOptions } = await import('$OPENERAL_DIR/dist/sync.js');
     const { pool } = await getDatabaseConnection();
-    const count = await syncToFs(pool, process.env.WORKSPACE_ID, '/home/agent', {
-      excludeDirs: new Set(['node_modules', '.git', '.openeral'])
-    });
+    const count = await syncToFs(pool, process.env.WORKSPACE_ID, '/home/agent', createHomeSyncOptions({ prune: false }));
     await pool.end();
     console.log('setup.sh: restored ' + count + ' workspace entr' + (count === 1 ? 'y' : 'ies'));
   }).catch(err => {
@@ -396,11 +394,9 @@ fi
 echo "setup.sh: flushing /home/agent to workspace..."
 node -e "
   import('$OPENERAL_DIR/dist/db/embedded.js').then(async ({ getDatabaseConnection }) => {
-    const { syncFromFs } = await import('$OPENERAL_DIR/dist/sync.js');
+    const { syncFromFs, createHomeSyncOptions } = await import('$OPENERAL_DIR/dist/sync.js');
     const { pool } = await getDatabaseConnection();
-    const count = await syncFromFs(pool, process.env.WORKSPACE_ID, '/home/agent', {
-      excludeDirs: new Set(['node_modules', '.git', '.openeral'])
-    });
+    const count = await syncFromFs(pool, process.env.WORKSPACE_ID, '/home/agent', createHomeSyncOptions());
     await pool.end();
     console.log('setup.sh: flushed ' + count + ' workspace entr' + (count === 1 ? 'y' : 'ies'));
   }).catch(err => {

@@ -161,6 +161,7 @@ describe('sandbox workspace persistence wiring', () => {
     expect(setup).toContain("import('$OPENERAL_DIR/dist/sync.js')");
     expect(setup).toContain('syncToFs(pool, process.env.WORKSPACE_ID');
     expect(setup).toContain('syncFromFs(pool, process.env.WORKSPACE_ID');
+    expect(setup).toContain('createHomeSyncOptions({ prune: false })');
     expect(setup.indexOf('restoring /home/agent from workspace')).toBeLessThan(
       setup.indexOf('starting openeral-bash daemon'),
     );
@@ -171,6 +172,7 @@ describe('sandbox workspace persistence wiring', () => {
     expect(cli).toContain("import('$OPENERAL_DIR/dist/sync.js')");
     expect(cli).toContain('syncToFs(pool, process.env.WORKSPACE_ID');
     expect(cli).toContain('syncFromFs(pool, process.env.WORKSPACE_ID');
+    expect(cli).toContain('createHomeSyncOptions({ prune: false })');
     expect(cli).not.toContain('setup: no DATABASE_URL — running in local-only mode');
   });
 
@@ -179,7 +181,12 @@ describe('sandbox workspace persistence wiring', () => {
     expect(bashBridge).toContain('syncFromFs(pool, workspaceId');
     expect(bashBridge).toContain('syncToFs(pool, workspaceId');
     expect(bashBridge).toContain('watchAndSync(pool, workspaceId');
-    expect(bashBridge).toContain('execCommandWithSync(shell, pool, workspaceId, command)');
+    expect(bashBridge).toContain('createHomeSyncOptions({ prune: true })');
+    expect(bashBridge).toContain('syncWatch.isDirty()');
+    expect(bashBridge).toContain('syncWatch.suspend');
+    expect(bashBridge).toContain('syncFromFs failed');
+    expect(bashBridge).toContain('syncToFs failed');
+    expect(bashBridge).toContain('execCommandWithSync(shell, pool, workspaceId, command, syncWatch)');
   });
 });
 
