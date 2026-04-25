@@ -42,7 +42,7 @@ Without PostgreSQL, OpenEral uses embedded PGlite under `/home/agent/.openeral/d
 
 ## Add PostgreSQL Persistence
 
-Use this when you want files and Claude memory to survive sandbox deletion or follow you across machines.
+Use this when you want workspace files and Claude memory to survive sandbox deletion or follow you across machines. Sensitive home credentials and config such as `.ssh`, `.aws`, `.git-credentials`, `.npmrc`, and keyrings are intentionally not persisted.
 
 For Supabase, use the pooler connection string from **Project Settings -> Database -> Connection pooler**. It looks like:
 
@@ -72,9 +72,9 @@ openshell sandbox create --tty \
 rm -f /tmp/openeral-db-url
 ```
 
-OpenEral reads `/sandbox/db-url`, creates the `_openeral` schema, runs migrations, and seeds the workspace. In Supabase, switch the Table Editor schema selector to `_openeral` to inspect the rows.
+OpenEral reads `/sandbox/db-url`, creates the `_openeral` schema, runs migrations, restores the persisted workspace into `/home/agent`, syncs changes during runtime, and does a final flush on shutdown. In Supabase, switch the Table Editor schema selector to `_openeral` to inspect the rows.
 
-Reuse the same sandbox name on every machine. OpenEral uses the OpenShell sandbox ID as the workspace ID, so `--name openeral-claude` is what makes the same PostgreSQL-backed home restore after deletion or from another host.
+Reuse the same sandbox name on every machine, and point it at the same `DATABASE_URL`. OpenEral uses the OpenShell sandbox ID as the workspace ID, so `--name openeral-claude` is what makes the same PostgreSQL-backed home restore after deletion or from another host.
 
 Do not pass the database URL through an OpenShell generic provider. PostgreSQL is raw TCP, so the credential must be delivered by `--upload`.
 

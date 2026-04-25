@@ -178,9 +178,9 @@ describe('sandbox workspace persistence wiring', () => {
 
   it('openeral-bash keeps virtual Bash writes and real file-tool writes in sync', () => {
     expect(bashBridge).toContain("import('/opt/openeral/dist/sync.js')");
-    expect(bashBridge).toContain('syncFromFs(pool, workspaceId');
+    expect(bashBridge).toContain('syncFromFs(pool, workspaceId, HOME_DIR, createHomeSyncOptions({ prune: true }))');
     expect(bashBridge).toContain('syncToFs(pool, workspaceId');
-    expect(bashBridge).toContain('watchAndSync(pool, workspaceId');
+    expect(bashBridge).toContain('watchAndSync(pool, workspaceId, HOME_DIR, createHomeSyncOptions({ prune: true }))');
     expect(bashBridge).toContain('createHomeSyncOptions({ prune: true })');
     expect(bashBridge).toContain('syncWatch.isDirty()');
     expect(bashBridge).toContain('syncWatch.suspend');

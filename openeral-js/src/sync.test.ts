@@ -12,8 +12,9 @@ describe('sync.ts structural checks', () => {
     expect(syncSrc).toContain('seenPaths.add(');
   });
 
-  it('syncFromFs deletes DB rows not seen on disk', () => {
+  it('syncFromFs can delete DB rows not seen on disk', () => {
     expect(syncSrc).toMatch(/DELETE FROM _openeral\.workspace_files/);
+    expect(syncSrc).toContain('if (syncOpts.prune)');
     expect(syncSrc).toContain('!seenPaths.has(');
   });
 
@@ -95,18 +96,18 @@ describe('sync.ts structural checks', () => {
     expect(syncSrc).toContain("['/.local/share/keyrings']");
   });
 
-  it('home sync policy disables pruning and caps persisted file size', () => {
+  it('home sync policy disables pruning without filtering by file size or type', () => {
     expect(syncSrc).toContain('createHomeSyncOptions');
-    expect(syncSrc).toContain('HOME_SYNC_MAX_FILE_SIZE_BYTES');
     expect(syncSrc).toContain('prune: overrides.prune ?? false');
-    expect(syncSrc).toContain('skipBinaryFiles: overrides.skipBinaryFiles ?? true');
+    expect(syncSrc).not.toContain('maxFileSizeBytes');
+    expect(syncSrc).not.toContain('skipBinaryFiles');
   });
 
-  it('syncFromFs can skip oversized and binary files', () => {
-    expect(syncSrc).toContain('syncOpts.maxFileSizeBytes');
-    expect(syncSrc).toContain('st.size > syncOpts.maxFileSizeBytes');
-    expect(syncSrc).toContain('isBinaryContent');
-    expect(syncSrc).toContain('syncOpts.skipBinaryFiles');
+  it('syncFromFs reads file content without size or binary cutoffs', () => {
+    expect(syncSrc).toContain('const content = readFileSync(fullPath);');
+    expect(syncSrc).not.toContain('isBinaryContent');
+    expect(syncSrc).not.toContain('syncOpts.maxFileSizeBytes');
+    expect(syncSrc).not.toContain('syncOpts.skipBinaryFiles');
   });
 
   it('watchAndSync exposes dirty-state controls for sync fast paths', () => {

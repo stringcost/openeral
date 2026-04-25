@@ -29,7 +29,7 @@ const syncModulePromise = import('/opt/openeral/dist/sync.js');
 
 async function syncFromRealFs(pool, workspaceId) {
   const { syncFromFs, createHomeSyncOptions } = await syncModulePromise;
-  return syncFromFs(pool, workspaceId, HOME_DIR, createHomeSyncOptions());
+  return syncFromFs(pool, workspaceId, HOME_DIR, createHomeSyncOptions({ prune: true }));
 }
 
 async function syncToRealFs(pool, workspaceId) {
@@ -125,7 +125,7 @@ async function startDaemon() {
   let syncWatch = null;
   try {
     const { watchAndSync, createHomeSyncOptions } = await syncModulePromise;
-    syncWatch = watchAndSync(pool, workspaceId, HOME_DIR, createHomeSyncOptions());
+    syncWatch = watchAndSync(pool, workspaceId, HOME_DIR, createHomeSyncOptions({ prune: true }));
   } catch (err) {
     process.stderr.write(`${formatError(err, 'openeral-bash: watcher failed')}\n`);
   }

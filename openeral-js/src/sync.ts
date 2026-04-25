@@ -41,14 +41,11 @@ export const HOME_SYNC_EXCLUDE_FILES = new Set([
   '.zsh_history',
 ]);
 export const HOME_SYNC_EXCLUDE_PATH_PREFIXES = ['/.local/share/keyrings'];
-export const HOME_SYNC_MAX_FILE_SIZE_BYTES = 1024 * 1024;
 
 export interface SyncOptions {
   excludeDirs?: Set<string>;
   excludeFiles?: Set<string>;
   excludePathPrefixes?: string[];
-  maxFileSizeBytes?: number;
-  skipBinaryFiles?: boolean;
   prune?: boolean;
 }
 
@@ -56,8 +53,6 @@ interface ResolvedSyncOptions {
   excludeDirs: Set<string>;
   excludeFiles: Set<string>;
   excludePathPrefixes: string[];
-  maxFileSizeBytes?: number;
-  skipBinaryFiles: boolean;
   prune: boolean;
 }
 
@@ -75,8 +70,6 @@ export function createHomeSyncOptions(overrides: SyncOptions = {}): SyncOptions 
     excludeDirs: new Set([...HOME_SYNC_EXCLUDE_DIRS, ...(overrides.excludeDirs ?? [])]),
     excludeFiles: new Set([...HOME_SYNC_EXCLUDE_FILES, ...(overrides.excludeFiles ?? [])]),
     excludePathPrefixes: [...HOME_SYNC_EXCLUDE_PATH_PREFIXES, ...(overrides.excludePathPrefixes ?? [])],
-    maxFileSizeBytes: overrides.maxFileSizeBytes ?? HOME_SYNC_MAX_FILE_SIZE_BYTES,
-    skipBinaryFiles: overrides.skipBinaryFiles ?? true,
     prune: overrides.prune ?? false,
   };
 }
@@ -121,22 +114,8 @@ function normalizeSyncOptions(opts?: SyncOptions): ResolvedSyncOptions {
     excludeDirs: opts?.excludeDirs ?? DEFAULT_EXCLUDE_DIRS,
     excludeFiles: opts?.excludeFiles ?? DEFAULT_EXCLUDE_FILES,
     excludePathPrefixes: (opts?.excludePathPrefixes ?? []).map(normalizeDbPath),
-    maxFileSizeBytes: opts?.maxFileSizeBytes,
-    skipBinaryFiles: opts?.skipBinaryFiles ?? false,
     prune: opts?.prune ?? true,
   };
-}
-
-function isBinaryContent(content: Buffer): boolean {
-  if (content.length === 0) return false;
-
-  const sample = content.subarray(0, Math.min(content.length, 8000));
-  let suspicious = 0;
-  for (const byte of sample) {
-    if (byte === 0) return true;
-    if ((byte < 7 || (byte > 14 && byte < 32) || byte === 127)) suspicious++;
-  }
-  return suspicious / sample.length > 0.3;
 }
 
 function formatSyncError(err: unknown, label: string): string {
@@ -262,7 +241,7 @@ function pruneLocal(
 
 /**
  * Scan a real directory and upsert all files into workspace_files.
- * Deletes DB rows for files that no longer exist on disk.
+ * Optionally deletes DB rows for files that no longer exist on disk.
  */
 export async function syncFromFs(
   pool: pg.Pool,
@@ -308,9 +287,7 @@ export async function syncFromFs(
         await walkDir(fullPath, dbPath);
       } else if (st.isFile()) {
         if (shouldExcludePath(dbPath, syncOpts, false)) continue;
-        if (syncOpts.maxFileSizeBytes !== undefined && st.size > syncOpts.maxFileSizeBytes) continue;
         const content = readFileSync(fullPath);
-        if (syncOpts.skipBinaryFiles && isBinaryContent(content)) continue;
         const now = nowNs();
         seenPaths.add(dbPath);
         await pool.query(
@@ -337,17 +314,19 @@ export async function syncFromFs(
 
   await walkDir(sourceDir, '/');
 
-  // Delete DB rows for files that no longer exist on disk
-  const { rows: dbRows } = await pool.query(
-    `SELECT path FROM _openeral.workspace_files WHERE workspace_id = $1 AND path != '/'`,
-    [workspaceId],
-  );
-  for (const row of dbRows) {
-    if (!seenPaths.has(row.path)) {
-      await pool.query(
-        `DELETE FROM _openeral.workspace_files WHERE workspace_id = $1 AND path = $2`,
-        [workspaceId, row.path],
-      );
+  if (syncOpts.prune) {
+    // Delete DB rows for files that no longer exist on disk
+    const { rows: dbRows } = await pool.query(
+      `SELECT path FROM _openeral.workspace_files WHERE workspace_id = $1 AND path != '/'`,
+      [workspaceId],
+    );
+    for (const row of dbRows) {
+      if (!seenPaths.has(row.path)) {
+        await pool.query(
+          `DELETE FROM _openeral.workspace_files WHERE workspace_id = $1 AND path = $2`,
+          [workspaceId, row.path],
+        );
+      }
     }
   }
 
