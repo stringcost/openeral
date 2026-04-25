@@ -24,6 +24,84 @@ import { createServer, createConnection } from 'node:net';
 import { existsSync, unlinkSync, chmodSync } from 'node:fs';
 
 const SOCKET_PATH = '/tmp/openeral-bash.sock';
+const HOME_DIR = process.env.OPENERAL_HOME || '/home/agent';
+const syncModulePromise = import('/opt/openeral/dist/sync.js');
+
+async function syncFromRealFs(pool, workspaceId) {
+  const { syncFromFs, createHomeSyncOptions } = await syncModulePromise;
+  return syncFromFs(pool, workspaceId, HOME_DIR, createHomeSyncOptions({ prune: true }));
+}
+
+async function syncToRealFs(pool, workspaceId) {
+  const { syncToFs, createHomeSyncOptions } = await syncModulePromise;
+  return syncToFs(pool, workspaceId, HOME_DIR, createHomeSyncOptions({ prune: true }));
+}
+
+function formatError(err, label) {
+  const error = err instanceof Error ? err : new Error(String(err));
+  const code = err && typeof err === 'object' && 'code' in err && err.code ? ` code=${err.code}` : '';
+  const detail = `${label}: ${error.message}${code}`;
+  return error.stack ? `${detail}\n${error.stack}` : detail;
+}
+
+function appendStderr(stderr, detail) {
+  if (!stderr) return `${detail}\n`;
+  return stderr.endsWith('\n') ? `${stderr}${detail}\n` : `${stderr}\n${detail}\n`;
+}
+
+async function execCommandWithSync(shell, pool, workspaceId, command, syncWatch = null) {
+  const shouldPreSync = !syncWatch || !syncWatch.isWatching() || syncWatch.isDirty();
+  if (shouldPreSync) {
+    try {
+      await syncFromRealFs(pool, workspaceId);
+      syncWatch?.markClean();
+    } catch (err) {
+      return {
+        stdout: '',
+        stderr: `${formatError(err, 'openeral-bash: syncFromFs failed')}\n`,
+        exitCode: 1,
+      };
+    }
+  }
+
+  let result;
+  let commandError = null;
+  try {
+    result = await shell.exec(command);
+  } catch (err) {
+    commandError = err;
+  }
+
+  let syncToError = null;
+  try {
+    if (syncWatch && syncWatch.isWatching()) {
+      await syncWatch.suspend(() => syncToRealFs(pool, workspaceId));
+      syncWatch.markClean();
+    } else {
+      await syncToRealFs(pool, workspaceId);
+    }
+  } catch (err) {
+    syncToError = err;
+  }
+
+  if (commandError) {
+    const detail = formatError(commandError, 'openeral-bash: command failed');
+    const stderr = syncToError
+      ? appendStderr(`${detail}\n`, formatError(syncToError, 'openeral-bash: syncToFs failed'))
+      : `${detail}\n`;
+    return { stdout: '', stderr, exitCode: 1 };
+  }
+
+  if (syncToError) {
+    return {
+      stdout: result.stdout,
+      stderr: appendStderr(result.stderr, formatError(syncToError, 'openeral-bash: syncToFs failed')),
+      exitCode: result.exitCode === 0 ? 1 : result.exitCode,
+    };
+  }
+
+  return result;
+}
 
 // ---------------------------------------------------------------------------
 // Daemon mode
@@ -43,6 +121,14 @@ async function startDaemon() {
     migrate: false, // setup.sh already ran migrations
     pool,
   });
+
+  let syncWatch = null;
+  try {
+    const { watchAndSync, createHomeSyncOptions } = await syncModulePromise;
+    syncWatch = watchAndSync(pool, workspaceId, HOME_DIR, createHomeSyncOptions({ prune: true }));
+  } catch (err) {
+    process.stderr.write(`${formatError(err, 'openeral-bash: watcher failed')}\n`);
+  }
 
   // Clean up stale socket
   if (existsSync(SOCKET_PATH)) {
@@ -76,7 +162,7 @@ async function startDaemon() {
         return;
       }
 
-      shell.exec(command).then((result) => {
+      execCommandWithSync(shell, pool, workspaceId, command, syncWatch).then((result) => {
         conn.end(JSON.stringify({
           stdout: result.stdout,
           stderr: result.stderr,
@@ -101,12 +187,24 @@ async function startDaemon() {
   });
 
   // Graceful shutdown
+  let shuttingDown = false;
+  async function shutdown() {
+    if (shuttingDown) return;
+    shuttingDown = true;
+    syncWatch?.stop();
+    try {
+      await syncFromRealFs(pool, workspaceId);
+    } catch (err) {
+      process.stderr.write(`${formatError(err, 'openeral-bash: shutdown syncFromFs failed')}\n`);
+    }
+    server.close();
+    try { unlinkSync(SOCKET_PATH); } catch {}
+    try { await pool.end(); } catch {}
+    process.exit(0);
+  }
+
   for (const sig of ['SIGTERM', 'SIGINT']) {
-    process.on(sig, () => {
-      server.close();
-      try { unlinkSync(SOCKET_PATH); } catch {}
-      process.exit(0);
-    });
+    process.on(sig, () => { void shutdown(); });
   }
 }
 
@@ -160,7 +258,11 @@ async function execStandalone(command) {
     pool,
   });
 
-  return shell.exec(command);
+  try {
+    return await execCommandWithSync(shell, pool, workspaceId, command);
+  } finally {
+    try { await pool.end(); } catch {}
+  }
 }
 
 // ---------------------------------------------------------------------------

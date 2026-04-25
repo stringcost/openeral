@@ -358,6 +358,53 @@ node -e "
   });
 "
 
+echo "setup.sh: restoring /home/agent from workspace..."
+node -e "
+  import('$OPENERAL_DIR/dist/db/embedded.js').then(async ({ getDatabaseConnection }) => {
+    const { syncToFs, createHomeSyncOptions } = await import('$OPENERAL_DIR/dist/sync.js');
+    const { pool } = await getDatabaseConnection();
+    const count = await syncToFs(pool, process.env.WORKSPACE_ID, '/home/agent', createHomeSyncOptions({ prune: false }));
+    await pool.end();
+    console.log('setup.sh: restored ' + count + ' workspace entr' + (count === 1 ? 'y' : 'ies'));
+  }).catch(err => {
+    console.error('setup.sh: restore failed:', err.message);
+    process.exit(1);
+  });
+"
+
+# Re-apply runtime settings after the restore step. syncToFs intentionally makes
+# PostgreSQL authoritative, so freshly generated settings must be written after it.
+if [ -n "${STRINGCOST_PROXY_URL:-}" ]; then
+  echo "setup.sh: writing StringCost proxy to ~/.claude/settings.json..."
+  node -e "
+const fs = require('fs');
+const file = '/home/agent/.claude/settings.json';
+let s = {};
+try { s = JSON.parse(fs.readFileSync(file, 'utf8')); } catch(e) {}
+if (!s.env) s.env = {};
+s.env.ANTHROPIC_BASE_URL = process.env.STRINGCOST_PROXY_URL;
+delete s.env.ANTHROPIC_API_KEY;
+delete s.env.ANTHROPIC_AUTH_TOKEN;
+fs.mkdirSync('/home/agent/.claude', {recursive: true});
+fs.writeFileSync(file, JSON.stringify(s, null, 2));
+console.log('setup.sh: StringCost proxy written to ~/.claude/settings.json');
+"
+fi
+
+echo "setup.sh: flushing /home/agent to workspace..."
+node -e "
+  import('$OPENERAL_DIR/dist/db/embedded.js').then(async ({ getDatabaseConnection }) => {
+    const { syncFromFs, createHomeSyncOptions } = await import('$OPENERAL_DIR/dist/sync.js');
+    const { pool } = await getDatabaseConnection();
+    const count = await syncFromFs(pool, process.env.WORKSPACE_ID, '/home/agent', createHomeSyncOptions());
+    await pool.end();
+    console.log('setup.sh: flushed ' + count + ' workspace entr' + (count === 1 ? 'y' : 'ies'));
+  }).catch(err => {
+    console.error('setup.sh: flush failed:', err.message);
+    process.exit(1);
+  });
+"
+
 # Configure Socket.dev registry if SOCKET_TOKEN provider is available.
 # The token value is a placeholder (openshell:resolve:env:SOCKET_TOKEN) —
 # the OpenShell proxy resolves it to the real token in auth headers.
