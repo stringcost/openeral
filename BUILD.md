@@ -181,7 +181,10 @@ openeral-js/                  # TypeScript package
 
 sandboxes/openeral/           # OpenShell sandbox image
   Dockerfile                  # Stock base + Node.js + openeral-js
-  setup.sh                    # Sandbox entry point
+  setup.sh                    # openeral/openeral-start sandbox entry point
+  openeral-bash.mjs           # daemon for pg, scoped sync, custom agents
+  openeral-claude.sh          # Claude wrapper for connected service sessions
+  pg-client.mjs               # pg helper for real-bash sessions
   policy.yaml                 # Network policy
 
 tests/                        # End-to-end test scripts
@@ -211,12 +214,11 @@ ANTHROPIC_API_KEY='...' DATABASE_URL='...' bash tests/test_claude_e2e.sh
 
 ```
   ┌─────────────────────── Sandbox ─────────────────────────┐
-  │  $HOME = isolated workspace                                │
-  │  Claude Code (Read, Write, Edit, Bash, Glob, Grep)         │
+  │  openeral-start keeps the sandbox alive                    │
   │                      │                                     │
-  │                 file watcher                               │
+  │  user connects and runs `claude` with real /bin/bash       │
   │                      │                                     │
-  │  openeral-js sync ───▼──────────────────────────────────┐  │
+  │  scoped watcher syncs .claude/.openeral only ───────────┐  │
   │  PGlite (default)  OR  pg.Pool wrapped in a CONNECT-    │  │
   │                         tunneled Duplex (with --upload) │  │
   │  ───────────────────────────────────────────────────────┘  │
@@ -230,7 +232,7 @@ ANTHROPIC_API_KEY='...' DATABASE_URL='...' bash tests/test_claude_e2e.sh
     resolved at proxy)
 ```
 
-Every outbound connection from the sandbox goes through OpenShell's HTTP CONNECT proxy at `10.200.0.1:3128` — kernel-level iptables reject any other TCP.
+Every outbound connection from the sandbox goes through OpenShell's HTTP CONNECT proxy at `10.200.0.1:3128` — kernel-level iptables reject any other TCP. The just-bash virtual `/db` and virtual `/home/agent` path remains available for custom agents through `createOpeneralShell()`, but Claude Code service mode uses real bash plus the `pg` helper.
 
 ### How pg reaches Supabase
 

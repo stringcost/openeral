@@ -32,8 +32,10 @@ openeral-js/src/
 
 sandboxes/openeral/
   Dockerfile                  # Stock OpenShell base + Node.js + openeral-js
-  openeral-bash.mjs           # Daemon/client bridge for custom agents
-  setup.sh                    # Sandbox entry point
+  openeral-bash.mjs           # Daemon/client bridge for pg, sync, custom agents
+  openeral-claude.sh          # Claude wrapper for connected service sessions
+  pg-client.mjs               # pg helper for real-bash Claude sessions
+  setup.sh                    # openeral/openeral-start sandbox entry point
   policy.yaml                 # Network policy
 ```
 
@@ -62,7 +64,8 @@ Key rules: imports resolve, exports match, just-bash >=2.x, PgFs throws EROFS, n
 - SQL uses `quoteIdent()` + `$N` params + `::text` casts
 - `pg` command: complex SQL must be double-quoted
 - Command safety: AST walk + regex fallback
-- Persistence is optional — CLI works without DATABASE_URL (local-only mode)
+- `openeral-start` is service mode: create sandbox, connect, run `claude`, exit with `/exit` or Ctrl-D, restart with `claude -c`
+- Persistence is optional — without DATABASE_URL, PGlite is scoped to the running sandbox lifetime
 - For repo-local automation, prefer `node dist/bin/openeral.js` after `pnpm build`
 - Real Claude persistence checks should use `Run:` Bash commands for `$HOME` paths; Claude file tools do not reliably expand shell variables inside the isolated home
 - Never hardcode credentials — always read from environment at runtime

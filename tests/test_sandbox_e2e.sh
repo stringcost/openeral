@@ -182,7 +182,33 @@ else
 fi
 
 echo ""
-echo "=== Test 9: user .npmrc is never touched ==="
+echo "=== Test 9: service-mode wrappers are present ==="
+out=$(run_in_image '
+  [ -x /usr/local/bin/openeral-start ] && echo "start-ok" || echo "start-missing"
+  [ -x /usr/local/bin/claude ] && echo "claude-wrapper-ok" || echo "claude-wrapper-missing"
+  [ -x /usr/local/bin/claude-real ] && echo "claude-real-ok" || echo "claude-real-missing"
+  [ -x /usr/local/bin/pg ] && echo "pg-ok" || echo "pg-missing"
+')
+if echo "$out" | grep -q 'start-ok' && echo "$out" | grep -q 'claude-wrapper-ok' && echo "$out" | grep -q 'claude-real-ok' && echo "$out" | grep -q 'pg-ok'; then
+  pass "service-mode wrappers present"
+else
+  fail "service-mode wrappers missing: $out"
+fi
+
+echo ""
+echo "=== Test 10: PGlite data dir is outside /home/agent and writable ==="
+out=$(run_in_image '
+  [ -d /var/lib/openeral/data ] && echo "data-dir-ok" || echo "data-dir-missing"
+  touch /var/lib/openeral/data/.permcheck && echo "data-write-ok" || echo "data-write-fail"
+')
+if echo "$out" | grep -q 'data-dir-ok' && echo "$out" | grep -q 'data-write-ok'; then
+  pass "PGlite data dir writable"
+else
+  fail "PGlite data dir not writable: $out"
+fi
+
+echo ""
+echo "=== Test 11: user .npmrc is never touched ==="
 out=$(run_in_image '
   # Create a user .npmrc
   echo "user-config=true" > /home/agent/.npmrc

@@ -80,4 +80,19 @@ describe('sync.ts structural checks', () => {
     expect(syncSrc).toContain('dbIsDir === false');
     expect(syncSrc).toContain('dbIsDir === true');
   });
+
+  it('supports scoped pathPrefix sync without changing legacy no-prefix behavior', () => {
+    expect(syncSrc).toContain('normalizePathPrefix');
+    expect(syncSrc).toContain('opts?.pathPrefix');
+    expect(syncSrc).toContain('path = $2 OR path LIKE $3');
+    expect(syncSrc).toContain('pruneLocal(targetDir, pathPrefix');
+    expect(syncSrc).toContain('pathPrefix === \'/\'');
+  });
+
+  it('watchAndSync passes pathPrefix through to syncFromFs', () => {
+    const watchBody = syncSrc.slice(syncSrc.indexOf('export function watchAndSync'));
+    expect(watchBody).toContain('const pathPrefix = normalizePathPrefix(opts?.pathPrefix)');
+    expect(watchBody).toContain('watchDir');
+    expect(watchBody).toContain('syncFromFs(pool, workspaceId, dir, { excludeDirs, pathPrefix })');
+  });
 });

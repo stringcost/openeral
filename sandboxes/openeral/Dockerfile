@@ -1,4 +1,4 @@
-# OpenEral sandbox — persistent /home/agent + read-only /db via just-bash
+# OpenEral sandbox — Claude service runtime + optional PostgreSQL persistence
 #
 # Uses stock OpenShell (no custom cluster or gateway images needed).
 # All filesystem virtualization happens in userspace via openeral-js.
@@ -20,10 +20,25 @@ RUN cd /opt/openeral && npm install && npm run build && npm prune --omit=dev \
     && chmod -R a+rX /opt/openeral \
     && chown -R sandbox:sandbox /opt/openeral
 
-# openeral-bash: drop-in bash replacement routed through just-bash
+# Preinstall Claude Code so service-mode users do not pay npm install latency
+# after connecting. Preserve the real binary behind the OpenEral wrapper.
+RUN npm install -g @anthropic-ai/claude-code \
+    && CLAUDE_BIN="$(command -v claude)" \
+    && if [ "$CLAUDE_BIN" = "/usr/local/bin/claude" ]; then \
+         mv /usr/local/bin/claude /usr/local/bin/claude-real; \
+       else \
+         ln -sf "$CLAUDE_BIN" /usr/local/bin/claude-real; \
+       fi
+
+# openeral-bash: daemon/client bridge for pg, service-mode sync, and custom agents
 COPY --chown=sandbox:sandbox sandboxes/openeral/openeral-bash.mjs /opt/openeral/openeral-bash.mjs
 RUN chmod a+rx /opt/openeral/openeral-bash.mjs \
     && ln -sf /opt/openeral/openeral-bash.mjs /usr/local/bin/openeral-bash
+
+# Runtime wrappers used by service mode.
+COPY sandboxes/openeral/openeral-claude.sh /usr/local/bin/claude
+COPY sandboxes/openeral/pg-client.mjs /usr/local/bin/pg
+RUN chmod 755 /usr/local/bin/claude /usr/local/bin/pg
 
 # Rename real bash so openeral-bash can fall back to it for interactive use
 RUN cp /bin/bash /bin/bash.real
@@ -34,11 +49,13 @@ RUN cp /bin/bash /bin/bash.real
 # OpenShell doesn't honour Docker ENTRYPOINT/CMD — the image's native entry is
 # overridden by openshell's own supervisor, and an empty trailing command just
 # leaves the pod asleep. Shipping a short /usr/local/bin/openeral shim lets the
-# end-user command end in `-- openeral` instead of `-- /opt/openeral/setup.sh`.
+# end-user command end in `-- openeral-start` (service mode) or `-- openeral`
+# (legacy one-shot mode) instead of `-- /opt/openeral/setup.sh`.
 COPY sandboxes/openeral/setup.sh /opt/openeral/setup.sh
 RUN chmod 755 /opt/openeral/setup.sh \
     && chown sandbox:sandbox /opt/openeral/setup.sh \
-    && ln -sf /opt/openeral/setup.sh /usr/local/bin/openeral
+    && ln -sf /opt/openeral/setup.sh /usr/local/bin/openeral \
+    && ln -sf /opt/openeral/setup.sh /usr/local/bin/openeral-start
 
 # Override the upstream base policy
 COPY sandboxes/openeral/policy.yaml /etc/openshell/policy.yaml
@@ -46,5 +63,6 @@ COPY sandboxes/openeral/policy.yaml /etc/openshell/policy.yaml
 # Skills for Claude Code
 COPY .claude/skills/ /sandbox/.skills/
 
-# Workspace directory — must be owned by sandbox user so setup.sh can write .npmrc
-RUN mkdir -p /home/agent && chown sandbox:sandbox /home/agent
+# Workspace and embedded database directories.
+RUN mkdir -p /home/agent /var/lib/openeral/data \
+    && chown -R sandbox:sandbox /home/agent /var/lib/openeral

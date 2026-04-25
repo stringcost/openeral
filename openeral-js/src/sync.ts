@@ -7,7 +7,7 @@
  */
 
 import { mkdirSync, writeFileSync, readFileSync, readdirSync, statSync, chmodSync, unlinkSync, rmSync, existsSync, watch } from 'node:fs';
-import { join, dirname, relative } from 'node:path';
+import { join, dirname } from 'node:path';
 import type pg from 'pg';
 
 function nowNs(): bigint {
@@ -21,6 +21,34 @@ function shouldExclude(name: string, excludeDirs: Set<string>): boolean {
   return excludeDirs.has(name);
 }
 
+function normalizePathPrefix(pathPrefix?: string): string {
+  if (!pathPrefix || pathPrefix === '/') return '/';
+  const withLeadingSlash = pathPrefix.startsWith('/') ? pathPrefix : `/${pathPrefix}`;
+  return withLeadingSlash.replace(/\/+$/g, '') || '/';
+}
+
+function parentPathOf(path: string): string {
+  if (path === '/') return '';
+  const idx = path.lastIndexOf('/');
+  return idx <= 0 ? '/' : path.slice(0, idx);
+}
+
+function nameOf(path: string): string {
+  if (path === '/') return '';
+  return path.slice(path.lastIndexOf('/') + 1);
+}
+
+async function ensureDirRow(pool: pg.Pool, workspaceId: string, path: string, mode = 0o40755): Promise<void> {
+  const now = nowNs();
+  await pool.query(
+    `INSERT INTO _openeral.workspace_files
+     (workspace_id, path, parent_path, name, is_dir, content, mode, size, mtime_ns, ctime_ns, atime_ns, nlink, uid, gid)
+     VALUES ($1, $2, $3, $4, true, NULL, $5, 0, $6, $6, $6, 2, 1000, 1000)
+     ON CONFLICT (workspace_id, path) DO NOTHING`,
+    [workspaceId, path, parentPathOf(path), nameOf(path), mode, now.toString()],
+  );
+}
+
 /**
  * Dump all workspace_files rows to a real directory.
  * Creates directories and writes file content, preserving stored modes.
@@ -30,15 +58,20 @@ export async function syncToFs(
   pool: pg.Pool,
   workspaceId: string,
   targetDir: string,
-  opts?: { excludeDirs?: Set<string> },
+  opts?: { excludeDirs?: Set<string>; pathPrefix?: string },
 ): Promise<number> {
   const excludeDirs = opts?.excludeDirs ?? DEFAULT_EXCLUDE_DIRS;
+  const pathPrefix = normalizePathPrefix(opts?.pathPrefix);
+  const query = pathPrefix === '/'
+    ? `SELECT path, is_dir, content, mode FROM _openeral.workspace_files
+       WHERE workspace_id = $1 ORDER BY path`
+    : `SELECT path, is_dir, content, mode FROM _openeral.workspace_files
+       WHERE workspace_id = $1 AND (path = $2 OR path LIKE $3) ORDER BY path`;
+  const params = pathPrefix === '/'
+    ? [workspaceId]
+    : [workspaceId, pathPrefix, `${pathPrefix}/%`];
 
-  const { rows } = await pool.query(
-    `SELECT path, is_dir, content, mode FROM _openeral.workspace_files
-     WHERE workspace_id = $1 ORDER BY path`,
-    [workspaceId],
-  );
+  const { rows } = await pool.query(query, params);
 
   const dbPaths = new Set(rows.map((r: any) => r.path as string));
   const dbTypes = new Map(rows.map((r: any) => [r.path as string, r.is_dir as boolean]));
@@ -47,7 +80,7 @@ export async function syncToFs(
   // Step 1: Prune stale local entries AND resolve type conflicts BEFORE creating.
   // A path that changed type (file↔dir) between sessions would cause EEXIST/EISDIR
   // if we tried to create first.
-  pruneLocal(targetDir, '/', dbPaths, dbTypes, excludeDirs);
+  pruneLocal(targetDir, pathPrefix, dbPaths, dbTypes, excludeDirs);
 
   // Step 2: Create directories (sorted by path ensures parents before children)
   for (const row of rows) {
@@ -141,10 +174,11 @@ export async function syncFromFs(
   pool: pg.Pool,
   workspaceId: string,
   sourceDir: string,
-  opts?: { excludeDirs?: Set<string> },
+  opts?: { excludeDirs?: Set<string>; pathPrefix?: string },
 ): Promise<number> {
   const excludeDirs = opts?.excludeDirs ?? DEFAULT_EXCLUDE_DIRS;
-  const seenPaths = new Set<string>(['/']);
+  const pathPrefix = normalizePathPrefix(opts?.pathPrefix);
+  const seenPaths = new Set<string>(['/', pathPrefix]);
   let count = 0;
 
   async function walkDir(dirPath: string, dbParent: string): Promise<void> {
@@ -196,22 +230,23 @@ export async function syncFromFs(
   }
 
   // Ensure root exists
-  const now = nowNs();
-  await pool.query(
-    `INSERT INTO _openeral.workspace_files
-     (workspace_id, path, parent_path, name, is_dir, content, mode, size, mtime_ns, ctime_ns, atime_ns, nlink, uid, gid)
-     VALUES ($1, '/', '', '', true, NULL, $2, 0, $3, $3, $3, 2, 1000, 1000)
-     ON CONFLICT (workspace_id, path) DO NOTHING`,
-    [workspaceId, 0o40755, now.toString()],
-  );
+  await ensureDirRow(pool, workspaceId, '/');
+  if (pathPrefix !== '/') {
+    await ensureDirRow(pool, workspaceId, pathPrefix);
+  }
 
-  await walkDir(sourceDir, '/');
+  const walkRoot = pathPrefix === '/' ? sourceDir : join(sourceDir, pathPrefix);
+  await walkDir(walkRoot, pathPrefix);
 
   // Delete DB rows for files that no longer exist on disk
-  const { rows: dbRows } = await pool.query(
-    `SELECT path FROM _openeral.workspace_files WHERE workspace_id = $1 AND path != '/'`,
-    [workspaceId],
-  );
+  const dbRowsQuery = pathPrefix === '/'
+    ? `SELECT path FROM _openeral.workspace_files WHERE workspace_id = $1 AND path != '/'`
+    : `SELECT path FROM _openeral.workspace_files
+       WHERE workspace_id = $1 AND path != $2 AND (path = $2 OR path LIKE $3)`;
+  const dbRowsParams = pathPrefix === '/'
+    ? [workspaceId]
+    : [workspaceId, pathPrefix, `${pathPrefix}/%`];
+  const { rows: dbRows } = await pool.query(dbRowsQuery, dbRowsParams);
   for (const row of dbRows) {
     if (!seenPaths.has(row.path)) {
       await pool.query(
@@ -232,17 +267,19 @@ export function watchAndSync(
   pool: pg.Pool,
   workspaceId: string,
   dir: string,
-  opts?: { debounceMs?: number; excludeDirs?: Set<string> },
+  opts?: { debounceMs?: number; excludeDirs?: Set<string>; pathPrefix?: string },
 ): () => void {
   const debounceMs = opts?.debounceMs ?? 2000;
   const excludeDirs = opts?.excludeDirs ?? DEFAULT_EXCLUDE_DIRS;
+  const pathPrefix = normalizePathPrefix(opts?.pathPrefix);
   let timer: ReturnType<typeof setTimeout> | null = null;
   let syncing = false;
 
   const ac = new AbortController();
 
   try {
-    const watcher = watch(dir, { recursive: true, signal: ac.signal });
+    const watchDir = pathPrefix === '/' ? dir : join(dir, pathPrefix);
+    const watcher = watch(watchDir, { recursive: true, signal: ac.signal });
 
     watcher.on('change', (_event, filename) => {
       if (typeof filename === 'string') {
@@ -257,7 +294,7 @@ export function watchAndSync(
         if (syncing) return;
         syncing = true;
         try {
-          await syncFromFs(pool, workspaceId, dir, { excludeDirs });
+          await syncFromFs(pool, workspaceId, dir, { excludeDirs, pathPrefix });
         } catch (err: any) {
           process.stderr.write(`openeral: sync error: ${err.message}\n`);
         } finally {

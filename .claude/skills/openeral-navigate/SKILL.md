@@ -1,23 +1,17 @@
 ---
 name: openeral-navigate
-description: Explore /db and manage files in /home/agent — available when running with DATABASE_URL via just-bash or OpenShell
+description: Query PostgreSQL with pg in OpenEral; /db virtual browsing is available only for custom-agent just-bash usage
 ---
 
 # OpenEral Navigate
 
-When running with `DATABASE_URL` set, two virtual mounts are available:
-
-- `/db` — read-only database (schemas, tables, rows as files)
-- `/home/agent` — read-write persistent workspace
-
-These are available via the `pg` command (Claude Code path) or as virtual directories (custom agent path with just-bash).
+In Claude Code service mode, use the real shell plus the `pg` helper. The `/db` and virtual `/home/agent` mounts are custom-agent just-bash features, not Claude Code runtime mounts.
 
 ## Database queries (Claude Code + custom agents)
 
 ```bash
 pg "SELECT table_name FROM information_schema.tables WHERE table_schema = 'public'"
 pg "SELECT * FROM public.users LIMIT 5"
-pg "\d public.users"
 ```
 
 ## /db virtual filesystem (custom agent path only)
@@ -37,18 +31,18 @@ ls /db/public/users/.order/created_at/desc/     # sorted rows
 
 Prefer `.filter/` and `.info/count` over scanning page trees.
 
-## Workspace
+## Claude Code Workspace
 
-Files written to `$HOME` persist to PostgreSQL (when `DATABASE_URL` is set):
+Claude Code runs with `HOME=/home/agent`. With `DATABASE_URL` set, OpenEral syncs Claude state under `$HOME/.claude/**` and OpenEral state under `$HOME/.openeral/**` to PostgreSQL. Arbitrary source code and temporary work directories remain sandbox-local.
 
 ```bash
-mkdir -p $HOME/work
-echo "notes" > $HOME/work/todo.txt
+openeral memory refresh --query "current project"
+claude -c
 ```
 
 ## Rules
 
 - `/db` is read-only — writes throw EROFS
 - `/tmp` is ephemeral
-- Without `DATABASE_URL`, only session-local storage (no cross-session persistence, no `pg`, no `/db`)
+- Without `DATABASE_URL`, embedded PGlite is scoped to the running sandbox lifetime
 - `ANTHROPIC_API_KEY` stays as a placeholder in the sandbox — resolved by the OpenShell proxy at egress

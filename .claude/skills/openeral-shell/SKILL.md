@@ -46,6 +46,7 @@ openshell gateway info >/dev/null 2>&1 || openshell gateway start
 PROVIDERS="--provider claude"   # claude is auto-created from ANTHROPIC_API_KEY
 OPENERAL_INPUT=""
 UPLOAD_ARGS=""
+OPENERAL_WORKSPACE="${OPENERAL_WORKSPACE:-openeral-claude}"
 
 cleanup_openeral_input() {
   [ -z "$OPENERAL_INPUT" ] || rm -rf "$OPENERAL_INPUT"
@@ -97,11 +98,12 @@ fi
 ### Step 4: Create the sandbox from the published image
 
 ```bash
-openshell sandbox create --tty \
+openshell sandbox create \
+  --name "$OPENERAL_WORKSPACE" \
   --from ghcr.io/sandys/openeral/sandbox:just-bash \
   $UPLOAD_ARGS \
   $PROVIDERS --auto-providers \
-  -- openeral
+  -- env WORKSPACE_ID="$OPENERAL_WORKSPACE" openeral-start
 
 cleanup_openeral_input
 trap - EXIT
@@ -109,12 +111,27 @@ trap - EXIT
 
 The `stringcost` provider from Step 3 is attached only when `STRINGCOST_API_KEY` is set. The upload directory is used because OpenShell accepts one `--upload` flag; `setup.sh` reads `/sandbox/openeral-input/db-url` and `/sandbox/openeral-input/presign.json` when present.
 
+### Step 5: Connect and run Claude
+
+```bash
+openshell sandbox connect "$OPENERAL_WORKSPACE"
+```
+
+Inside the connected sandbox shell:
+
+```bash
+claude
+```
+
+To stop Claude but keep the sandbox alive, type `/exit` at the Claude prompt or press `Ctrl+D`. You will return to the sandbox shell. Start Claude again with `claude`, or continue the most recent conversation with `claude -c`.
+
 ## What happens after launch
 
+- Claude Code starts only when the user runs `claude` inside the connected sandbox shell.
 - Claude Code starts with `HOME` pointing to the isolated sandbox workspace.
 - **Workspace persistence**:
-  - Without `DATABASE_URL`: embedded PGlite runs in-process. Files survive restarts/reconnects within the sandbox's lifetime; lost when the sandbox is deleted.
-  - With `DATABASE_URL` or `POSTGRES_URL` delivered via `/sandbox/openeral-input/db-url`: pg tunnels through OpenShell's HTTP CONNECT proxy (via `openeral-js/src/db/http-connect-socket.ts`) to Supabase / Neon / RDS. Workspace survives sandbox delete and is shared across machines. The host must be allowlisted in the image's `postgres` network policy — common Supabase poolers are pre-allowlisted.
+  - Without `DATABASE_URL`: embedded PGlite runs under `/var/lib/openeral/data`. Files survive restarts/reconnects within the running sandbox's lifetime; lost when the sandbox is deleted.
+  - With `DATABASE_URL` or `POSTGRES_URL` delivered via `/sandbox/openeral-input/db-url`: pg tunnels through OpenShell's HTTP CONNECT proxy (via `openeral-js/src/db/http-connect-socket.ts`) to Supabase / Neon / RDS. Claude state under `/home/agent/.claude/**` and OpenEral state under `/home/agent/.openeral/**` survive sandbox delete when the same `WORKSPACE_ID` is reused. Arbitrary checked-out source code remains sandbox-local. The host must be allowlisted in the image's `postgres` network policy — common Supabase poolers are pre-allowlisted.
 - **With `STRINGCOST_API_KEY`**: Claude's API calls route through the uploaded StringCost presign for billing and usage metering.
 - **First Claude launch**: Claude Code may ask for theme, security acknowledgement, trust for `/sandbox`, and API usage billing. This is expected first-run setup.
 
@@ -123,31 +140,30 @@ The `stringcost` provider from Step 3 is attached only when `STRINGCOST_API_KEY`
 ```bash
 openshell sandbox list                            # list sandboxes
 openshell sandbox connect <name>                  # open an interactive shell
+openshell sandbox exec -n <name> -- pg "SELECT 1" # run one-off command
 openshell sandbox delete <name>                   # stop and remove
-openshell sandbox ssh-config <name>               # print ssh config for scripted access
 ```
 
-There is no `openshell sandbox exec` subcommand. Run one-off commands via the ssh-config helper:
+Run one-off commands with `sandbox exec`:
 
 ```bash
-openshell sandbox ssh-config <name> > /tmp/sb-cfg
-ssh -F /tmp/sb-cfg openshell-<name> '<command>'
+openshell sandbox exec -n <name> -- pg "SELECT 1"
+openshell sandbox exec -n <name> -- claude -p "say ok"
 ```
 
-Always prefix with `HOME=/home/agent` — SSH connects as the sandbox user whose home is `/sandbox`, but openeral keeps all state under `/home/agent`.
+Use `sandbox connect` for interactive Claude sessions; use `sandbox exec` for non-interactive maintenance and smoke checks.
 
 ### Refresh Claude's memory files
 
 From outside the sandbox:
 
 ```bash
-openshell sandbox ssh-config <name> > /tmp/sb-cfg
-ssh -F /tmp/sb-cfg openshell-<name> \
-  'HOME=/home/agent node /opt/openeral/dist/bin/openeral.js memory refresh'
+openshell sandbox exec -n <name> -- \
+  openeral memory refresh
 
 # focus on a topic
-ssh -F /tmp/sb-cfg openshell-<name> \
-  'HOME=/home/agent node /opt/openeral/dist/bin/openeral.js memory refresh --query "openshell policy"'
+openshell sandbox exec -n <name> -- \
+  openeral memory refresh --query "openshell policy"
 ```
 
 This rewrites `/home/agent/.claude/projects/<project>/memory/*.md` inside the workspace with a backup in `.openeral-memory-backups/` unless `--no-backup` is set.

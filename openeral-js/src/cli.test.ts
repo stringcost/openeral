@@ -126,14 +126,8 @@ describe('openeral-shell skill shape', () => {
     expect(skill).not.toMatch(/openshell provider create --name db\b/);
   });
 
-  it('does not invoke openshell sandbox exec (which does not exist)', () => {
-    // Allow mentions inside prose (e.g. "There is no `openshell sandbox exec`"),
-    // but reject it appearing in a shell code block.
-    const codeBlockRe = /```[a-z]*\n([\s\S]*?)```/g;
-    let m: RegExpExecArray | null;
-    while ((m = codeBlockRe.exec(skill)) !== null) {
-      expect(m[1]).not.toMatch(/openshell sandbox exec\b/);
-    }
+  it('documents openshell sandbox exec for one-off commands', () => {
+    expect(skill).toMatch(/openshell sandbox exec\b/);
   });
 });
 
