@@ -46,6 +46,14 @@ describe('proxy policy (PROXY-PLAN compliance)', () => {
     expect(anthropicSection).toContain('tls: terminate');
   });
 
+  it('Claude policy allows the wrapper and the real native Claude binary', () => {
+    const claudeStart = policy.indexOf('claude_code:');
+    const nextPolicy = policy.indexOf('\n  #', claudeStart + 1);
+    const claudeBlock = policy.slice(claudeStart, nextPolicy > 0 ? nextPolicy : undefined);
+    expect(claudeBlock).toContain('/usr/local/bin/claude');
+    expect(claudeBlock).toContain('/usr/local/bin/claude-real');
+  });
+
   it('Socket.dev endpoint has protocol: rest + tls: terminate', () => {
     expect(policy).toContain('registry.socket.dev');
     const socketSection = policy.slice(
@@ -164,6 +172,12 @@ describe('setup.sh StringCost integration', () => {
     const directBranch = directAuthBranch(setup, 'setup.sh: launching Claude Code');
     expect(directBranch).toContain('exec env');
     expect(directBranch).not.toMatch(/-u ANTHROPIC_API_KEY/);
+  });
+
+  it('writes an OpenShell Anthropic placeholder into service session env when provider env is absent', () => {
+    expect(setup).toContain('openshell:resolve:env:ANTHROPIC_API_KEY');
+    expect(setup).toContain('write_export ANTHROPIC_API_KEY "$ANTHROPIC_API_KEY"');
+    expect(setup).toContain('write_export ANTHROPIC_API_KEY "openshell:resolve:env:ANTHROPIC_API_KEY"');
   });
 
   it('preserves ANTHROPIC_API_KEY in CLI inline direct-auth launches', () => {

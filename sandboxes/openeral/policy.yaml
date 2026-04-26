@@ -57,6 +57,7 @@ network_policies:
       - { host: platform.claude.com, port: 443 }
     binaries:
       - { path: /usr/local/bin/claude }
+      - { path: /usr/local/bin/claude-real }
       - { path: /usr/bin/node }
 
   # --- Socket.dev package registry ---

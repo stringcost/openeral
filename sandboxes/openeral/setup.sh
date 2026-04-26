@@ -461,7 +461,14 @@ write_session_env() {
     write_export WORKSPACE_ID "$WORKSPACE_ID"
     write_export NODE_NO_WARNINGS "$NODE_NO_WARNINGS"
     [ -z "${NPM_CONFIG_USERCONFIG:-}" ] || write_export NPM_CONFIG_USERCONFIG "$NPM_CONFIG_USERCONFIG"
-    [ -z "${ANTHROPIC_API_KEY:-}" ] || write_export ANTHROPIC_API_KEY "$ANTHROPIC_API_KEY"
+    if [ -n "${ANTHROPIC_API_KEY:-}" ]; then
+      write_export ANTHROPIC_API_KEY "$ANTHROPIC_API_KEY"
+    else
+      # OpenShell exposes provider secrets to sandbox processes as placeholders.
+      # In service mode, later SSH/exec sessions are separate processes, so
+      # persist the standard placeholder for Claude's wrapper to inherit.
+      write_export ANTHROPIC_API_KEY "openshell:resolve:env:ANTHROPIC_API_KEY"
+    fi
     [ -z "${ANTHROPIC_BASE_URL:-}" ] || write_export ANTHROPIC_BASE_URL "$ANTHROPIC_BASE_URL"
     [ -z "${STRINGCOST_PROXY_URL:-}" ] || write_export ANTHROPIC_BASE_URL "$STRINGCOST_PROXY_URL"
   } > "$session_env"

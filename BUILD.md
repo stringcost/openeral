@@ -55,6 +55,25 @@ Override the dev image name via env var (if you tagged it differently):
 OPENERAL_DEV_IMAGE=my-image:tag npx openeral --dev
 ```
 
+### Run a local OpenShell build directly
+
+OpenShell can build a local sandbox image and push it into the gateway when `--from` points at a Dockerfile or a directory containing one. Use the repo-root Dockerfile so the build context includes `openeral-js/` and `.claude/skills/`:
+
+```bash
+openshell gateway start
+
+openshell sandbox create \
+  --name openeral-local-dev \
+  --from Dockerfile.openeral \
+  --provider claude --auto-providers \
+  -- env WORKSPACE_ID=openeral-local-dev openeral-start
+
+openshell sandbox connect openeral-local-dev
+claude
+```
+
+Do not pass a plain local Docker tag such as `openeral-sandbox:dev` directly to raw `openshell sandbox create --from`. OpenShell treats tag-shaped values as image references for the sandbox pod. Use `--from Dockerfile.openeral`, or use `npx openeral --dev`, which performs its own local-image import before creating the sandbox.
+
 ---
 
 ## CLI subcommands (local development)

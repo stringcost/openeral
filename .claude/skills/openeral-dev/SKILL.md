@@ -37,6 +37,8 @@ sandboxes/openeral/
   pg-client.mjs               # pg helper for real-bash Claude sessions
   setup.sh                    # openeral/openeral-start sandbox entry point
   policy.yaml                 # Network policy
+
+Dockerfile.openeral           # Repo-root OpenShell local-build entrypoint
 ```
 
 ## Build & Verify
@@ -52,9 +54,21 @@ DATABASE_URL='...' bash ../tests/test_setup_e2e.sh     # setup.sh flow inside co
 DATABASE_URL='...' ANTHROPIC_API_KEY='...' bash ../tests/test_claude_e2e.sh  # real Claude Code via Run:/Bash writes in isolated HOME
 ```
 
-## Structural Lints (lint.mjs — 30 rules)
+To test a local build through OpenShell itself, run from the repo root:
 
-Key rules: imports resolve, exports match, just-bash >=2.x, PgFs throws EROFS, no write-back buffering, no FUSE in Dockerfile, no hardcoded credentials, sync persists deletions, sync preserves modes, exclude uses exact matching, syncToFs prunes stale files, syncToFs prunes before creating, pruneLocal handles type conflicts, README includes build steps, migrations use advisory lock, skill checks node_modules, no fork-specific policy fields (secret_injection/egress_via), Socket.dev endpoint has TLS terminate.
+```bash
+openshell sandbox create \
+  --name openeral-local-dev \
+  --from Dockerfile.openeral \
+  --provider claude --auto-providers \
+  -- env WORKSPACE_ID=openeral-local-dev openeral-start
+```
+
+Do not use raw `--from openeral-sandbox:dev` unless that image has already been imported into the OpenShell gateway's containerd. Tag-shaped values are treated as image references by the sandbox pod. `--from Dockerfile.openeral` is the direct OpenShell local-build path.
+
+## Structural Lints (lint.mjs — 31 rules)
+
+Key rules: imports resolve, exports match, just-bash >=2.x, PgFs throws EROFS, no write-back buffering, no FUSE in Dockerfile, no hardcoded credentials, sync persists deletions, sync preserves modes, exclude uses exact matching, syncToFs prunes stale files, syncToFs prunes before creating, pruneLocal handles type conflicts, README includes build steps, migrations use advisory lock, skill checks node_modules, no fork-specific policy fields (secret_injection/egress_via), Socket.dev endpoint has TLS terminate, Claude policy allows `claude-real`.
 
 ## Conventions
 

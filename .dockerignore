@@ -9,6 +9,7 @@ sandboxes
 !sandboxes/
 !sandboxes/openeral/
 !sandboxes/openeral/**
+sandboxes/openeral/skills
 vendor
 openeral-js/node_modules
 openeral-js/dist

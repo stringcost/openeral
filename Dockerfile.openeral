@@ -1,0 +1,73 @@
+# OpenEral sandbox - Claude service runtime + optional PostgreSQL persistence.
+#
+# This repo-root Dockerfile exists for OpenShell local builds:
+#
+#   openshell sandbox create --from Dockerfile.openeral -- ...
+#
+# OpenShell uses the Dockerfile's parent directory as the build context. The
+# canonical sandbox Dockerfile lives under sandboxes/openeral/, but that path
+# would make the build context too narrow for COPY openeral-js/ and
+# COPY .claude/skills/. Keep this file in sync with sandboxes/openeral/Dockerfile.
+
+FROM ghcr.io/nvidia/openshell-community/sandboxes/base:latest
+
+USER root
+
+# Node.js 22 LTS via NodeSource (apt nodejs conflicts with npm on Ubuntu Noble)
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends ca-certificates curl gnupg \
+    && curl -fsSL https://deb.nodesource.com/setup_22.x | bash - \
+    && apt-get install -y --no-install-recommends nodejs \
+    && rm -rf /var/lib/apt/lists/*
+
+# Install openeral-js: install all deps (including devDeps for tsc), build, then prune
+COPY openeral-js/ /opt/openeral/
+RUN cd /opt/openeral && npm install && npm run build && npm prune --omit=dev \
+    && chmod -R a+rX /opt/openeral \
+    && chown -R sandbox:sandbox /opt/openeral
+
+# Preinstall Claude Code so service-mode users do not pay npm install latency
+# after connecting. Preserve the real binary behind the OpenEral wrapper.
+RUN npm install -g @anthropic-ai/claude-code \
+    && CLAUDE_BIN="$(command -v claude)" \
+    && if [ "$CLAUDE_BIN" = "/usr/local/bin/claude" ]; then \
+         mv /usr/local/bin/claude /usr/local/bin/claude-real; \
+       else \
+         ln -sf "$CLAUDE_BIN" /usr/local/bin/claude-real; \
+       fi
+
+# openeral-bash: daemon/client bridge for pg, sync, and custom agents.
+COPY --chown=sandbox:sandbox sandboxes/openeral/openeral-bash.mjs /opt/openeral/openeral-bash.mjs
+RUN chmod a+rx /opt/openeral/openeral-bash.mjs \
+    && ln -sf /opt/openeral/openeral-bash.mjs /usr/local/bin/openeral-bash
+
+# Runtime wrappers used by service mode.
+COPY sandboxes/openeral/openeral-claude.sh /usr/local/bin/claude
+COPY sandboxes/openeral/pg-client.mjs /usr/local/bin/pg
+RUN chmod 755 /usr/local/bin/claude /usr/local/bin/pg
+
+# Rename real bash so openeral-bash can fall back to it for interactive use.
+RUN cp /bin/bash /bin/bash.real
+
+# Setup script (entry point for sandbox create).
+#
+# Users invoke this as the trailing command of `openshell sandbox create`.
+# OpenShell doesn't honour Docker ENTRYPOINT/CMD; the image's native entry is
+# overridden by openshell's own supervisor, and an empty trailing command just
+# leaves the pod asleep. Shipping /usr/local/bin/openeral-start gives users a
+# stable service-mode entrypoint.
+COPY sandboxes/openeral/setup.sh /opt/openeral/setup.sh
+RUN chmod 755 /opt/openeral/setup.sh \
+    && chown sandbox:sandbox /opt/openeral/setup.sh \
+    && ln -sf /opt/openeral/setup.sh /usr/local/bin/openeral \
+    && ln -sf /opt/openeral/setup.sh /usr/local/bin/openeral-start
+
+# Override the upstream base policy.
+COPY sandboxes/openeral/policy.yaml /etc/openshell/policy.yaml
+
+# Skills for Claude Code.
+COPY .claude/skills/ /sandbox/.skills/
+
+# Workspace and embedded database directories.
+RUN mkdir -p /home/agent /var/lib/openeral/data \
+    && chown -R sandbox:sandbox /home/agent /var/lib/openeral

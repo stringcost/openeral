@@ -14,6 +14,18 @@ ghcr.io/sandys/openeral/sandbox:just-bash
 docker build -f sandboxes/openeral/Dockerfile -t openeral-sandbox:local .
 ```
 
+To let OpenShell build and push a local sandbox image into the gateway, run from the repo root and use the repo-root Dockerfile:
+
+```bash
+openshell sandbox create \
+  --name openeral-local-dev \
+  --from Dockerfile.openeral \
+  --provider claude --auto-providers \
+  -- env WORKSPACE_ID=openeral-local-dev openeral-start
+```
+
+OpenShell sets the Docker build context to the Dockerfile's parent directory. Do not use `--from sandboxes/openeral/Dockerfile` for this repo; that context is too narrow for `COPY openeral-js/` and `COPY .claude/skills/`.
+
 ## Launch From The Published Image
 
 ```bash

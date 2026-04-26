@@ -613,6 +613,27 @@ try {
 }
 
 // ---------------------------------------------------------------------------
+// Lint 30: Claude policy must include the native claude-real binary
+// Catches: wrapper execs /usr/local/bin/claude-real, but policy only allows
+// /usr/local/bin/claude or /usr/bin/node.
+// ---------------------------------------------------------------------------
+console.log('\n--- Lint: Claude policy allows claude-real ---');
+
+try {
+  const policy = readFileSync('../sandboxes/openeral/policy.yaml', 'utf8');
+  const claudeStart = policy.indexOf('claude_code:');
+  const nextPol = policy.indexOf('\n  #', claudeStart + 1);
+  const claudeBlock = policy.slice(claudeStart, nextPol > 0 ? nextPol : undefined);
+  if (!claudeBlock.includes('/usr/local/bin/claude-real')) {
+    fail('sandboxes/openeral/policy.yaml', 'claude_code policy must allow /usr/local/bin/claude-real (Claude Code native binary)');
+  } else {
+    pass('Claude policy allows claude-real');
+  }
+} catch {
+  pass('policy.yaml not found (skipped)');
+}
+
+// ---------------------------------------------------------------------------
 // Summary
 // ---------------------------------------------------------------------------
 
