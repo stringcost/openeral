@@ -78,6 +78,36 @@ Reuse the same sandbox name on every machine, and point it at the same `DATABASE
 
 Do not pass the database URL through an OpenShell generic provider. PostgreSQL is raw TCP, so the credential must be delivered by `--upload`.
 
+## Work on Host Project Files
+
+OpenEral can read and write files on your host machine. Run once after the gateway starts (safe to re-run — skips if already done):
+
+```bash
+./scripts/gateway-ensure-mnt.sh
+```
+
+Then create the sandbox as normal:
+
+```bash
+openshell sandbox create --tty \
+  --name openeral-claude \
+  --from ghcr.io/sandys/openeral/sandbox:just-bash \
+  --provider claude --auto-providers \
+  -- openeral
+```
+
+Once Claude starts, your host files are accessible at their `/mnt/...` path:
+
+| Host location | Path inside sandbox |
+|---|---|
+| `C:\Users\alice\myproject` (WSL) | `/mnt/c/Users/alice/myproject` |
+| `/home/alice/myproject` (Linux) | `/mnt/home/alice/myproject` |
+
+Tell Claude the path once it starts:
+```
+My project is at /mnt/c/Users/alice/Desktop/work/myproject — please work on files there.
+```
+
 ## Add StringCost Tracking
 
 StringCost is optional. It routes Claude API calls through a presigned proxy URL for token and cost metering.
@@ -126,6 +156,91 @@ rm -rf "$OPENERAL_INPUT"
 
 Create the presign on the host. Inside OpenShell, provider secrets are placeholders; they work for HTTP headers but not as JSON body values for StringCost's `client_api_key`.
 
+---
+
+## Start OpenClaw
+
+OpenClaw is an alternative AI coding agent that runs in the same image. The `openclaw` provider is what signals the sandbox to launch OpenClaw instead of Claude Code.
+
+Create the provider once (this is the only one-time step — the provider persists in your OpenShell gateway):
+
+```bash
+openshell provider create --name openclaw --type generic \
+  --credential "OPENERAL_AGENT=openclaw" \
+  || openshell provider update openclaw \
+    --credential "OPENERAL_AGENT=openclaw"
+```
+
+Then start the sandbox:
+
+```bash
+export ANTHROPIC_API_KEY='sk-ant-...'
+
+openshell gateway start
+
+openshell sandbox create --tty \
+  --name openeral-openclaw \
+  --from ghcr.io/sandys/openeral/sandbox:just-bash \
+  --provider openclaw --auto-providers \
+  -- openeral
+```
+
+`--auto-providers` picks up `ANTHROPIC_API_KEY` from your shell and injects it alongside the `openclaw` provider. Without PostgreSQL, OpenEral uses embedded PGlite for the session lifetime.
+
+## Add PostgreSQL Persistence (OpenClaw)
+
+Same connection string as Claude Code — the same `_openeral` schema and workspace table are used by both agents.
+
+```bash
+export ANTHROPIC_API_KEY='sk-ant-...'
+export DATABASE_URL='postgresql://...'
+
+export DATABASE_URL="${DATABASE_URL:-${POSTGRES_URL:-}}"
+
+printf '%s' "$DATABASE_URL" > /tmp/openeral-db-url
+chmod 600 /tmp/openeral-db-url
+
+openshell sandbox create --tty \
+  --name openeral-openclaw \
+  --from ghcr.io/sandys/openeral/sandbox:just-bash \
+  --upload /tmp/openeral-db-url:/sandbox/db-url \
+  --provider openclaw --auto-providers \
+  -- openeral
+
+rm -f /tmp/openeral-db-url
+```
+
+Reuse `--name openeral-openclaw` on every machine and point it at the same `DATABASE_URL`. OpenEral uses the sandbox name as the workspace ID, so the same PostgreSQL-backed home restores after deletion or on another host.
+
+## Work on Host Project Files (OpenClaw)
+
+Run the same one-time gateway script as for Claude Code:
+
+```bash
+bash <(curl -fsSL https://raw.githubusercontent.com/Pavitra-programmers/openeral/main/scripts/gateway-ensure-mnt.sh)
+```
+
+Then create the sandbox:
+
+```bash
+openshell sandbox create --tty \
+  --name openeral-openclaw \
+  --from ghcr.io/sandys/openeral/sandbox:just-bash \
+  --provider openclaw --auto-providers \
+  -- openeral
+```
+
+Host files are accessible at the same `/mnt/...` paths inside the sandbox:
+
+| Host location | Path inside sandbox |
+|---|---|
+| `C:\Users\alice\myproject` (WSL) | `/mnt/c/Users/alice/myproject` |
+| `/home/alice/myproject` (Linux) | `/mnt/home/alice/myproject` |
+
+## Add StringCost Tracking (OpenClaw)
+
+StringCost cost tracking is not supported for OpenClaw. OpenClaw authenticates directly with the Anthropic API using your `ANTHROPIC_API_KEY` — there is no presign proxy step. Use your Anthropic console's usage dashboard to monitor spend when running OpenClaw.
+
 ## Manage Sandboxes
 
 ```bash
@@ -147,7 +262,7 @@ Keep the `HOME=/home/agent` prefix. OpenShell SSH starts in `/sandbox`, while Op
 
 ## Troubleshooting
 
-**No active gateway** - run `openshell gateway start`.
+**No active gateway / gateway not reachable** - run `openshell gateway start --recreate`. The `--recreate` flag handles a stopped or crashed gateway container without conflicts.
 
 **Claude exits with `Input must be provided either through stdin or as a prompt argument`** - the command was run without an interactive terminal. Use a real terminal and keep `--tty` in the command.
 

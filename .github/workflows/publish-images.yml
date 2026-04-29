@@ -75,6 +75,12 @@ jobs:
           DATABASE_URL: postgresql://openeral:openeral@localhost:5432/testdb
         run: node test-integration.mjs
 
+      - name: Validate setup.sh syntax (claude and openclaw paths)
+        run: |
+          bash -n sandboxes/openeral/setup.sh
+          grep -q 'OPENERAL_AGENT' sandboxes/openeral/setup.sh
+          grep -q 'openclaw' sandboxes/openeral/setup.sh
+
   build-and-push:
     needs: [test]
     runs-on: ubuntu-latest

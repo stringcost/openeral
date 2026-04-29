@@ -38,6 +38,10 @@ fi
 # Workspace ID defaults to sandbox ID (set by OpenShell supervisor)
 export WORKSPACE_ID="${OPENSHELL_SANDBOX_ID:-default}"
 
+# Agent kind — injected by the `openclaw` generic provider as OPENERAL_AGENT=openclaw.
+# Defaults to claude when the provider is absent.
+export OPENERAL_AGENT="${OPENERAL_AGENT:-claude}"
+
 # Fix the PGlite data directory to a stable path so every Node.js process
 # in this script uses the same embedded database.  /home/agent is a real
 # directory in the container (created in the Dockerfile).
@@ -80,8 +84,10 @@ case "${DATABASE_URL:-}" in
     ;;
 esac
 
-# StringCost integration.
-#
+# StringCost integration — Claude Code only.
+# OpenClaw uses direct API key auth; the presign model does not apply to it.
+if [ "$OPENERAL_AGENT" != "openclaw" ]; then
+
 # Priority:
 #   1. STRINGCOST_PROXY_URL already set → normalize and use it.
 #   2. Uploaded presign JSON or URL under /sandbox/openeral-input → normalize and use it.
@@ -266,6 +272,8 @@ console.log('setup.sh: StringCost proxy written to ~/.claude/settings.json');
 "
 fi
 
+fi # end: OPENERAL_AGENT != openclaw
+
 echo "setup.sh: running migrations..."
 # Log which DB target we're pointing at (redact credentials from the URL)
 if [ -n "${DATABASE_URL:-}" ]; then
@@ -343,11 +351,17 @@ node -e "
       enableAllProjectMcpServers: false
     }, null, 2);
 
+    const agentKind = process.env.OPENERAL_AGENT || 'claude';
+    const autoDirs = agentKind === 'openclaw'
+      ? ['/', '/.config']
+      : ['/', '/.claude', '/.claude/projects'];
+    const seedFiles = agentKind === 'openclaw'
+      ? {}
+      : { '/.claude/settings.json': defaultSettings };
+
     await ws.seedFromConfig(pool, process.env.WORKSPACE_ID, {
-      autoDirs: ['/', '/.claude', '/.claude/projects'],
-      seedFiles: {
-        '/.claude/settings.json': defaultSettings
-      },
+      autoDirs,
+      seedFiles,
     });
 
     await pool.end();
@@ -374,7 +388,7 @@ node -e "
 
 # Re-apply runtime settings after the restore step. syncToFs intentionally makes
 # PostgreSQL authoritative, so freshly generated settings must be written after it.
-if [ -n "${STRINGCOST_PROXY_URL:-}" ]; then
+if [ -n "${STRINGCOST_PROXY_URL:-}" ] && [ "$OPENERAL_AGENT" != "openclaw" ]; then
   echo "setup.sh: writing StringCost proxy to ~/.claude/settings.json..."
   node -e "
 const fs = require('fs');
@@ -445,6 +459,26 @@ else
   trap "rm -f /tmp/openeral-bash.sock" EXIT
 fi
 
+if [ "$OPENERAL_AGENT" = "openclaw" ]; then
+  # OpenClaw is baked into the image (see Dockerfile).
+  # This fallback handles stale images — if you hit it, rebuild the image.
+  if ! command -v openclaw >/dev/null 2>&1; then
+    echo "setup.sh: OpenClaw not found in image — falling back to runtime install (slow)..." >&2
+    SHARP_IGNORE_GLOBAL_LIBVIPS=1 npm install -g --loglevel=error openclaw@latest 2>&1 | tail -40
+    if ! command -v openclaw >/dev/null 2>&1; then
+      echo "setup.sh: ERROR: OpenClaw install failed" >&2
+      exit 1
+    fi
+  fi
+  echo "setup.sh: launching OpenClaw..."
+  exec env \
+    HOME=/home/agent \
+    SHELL=/usr/local/bin/openeral-bash \
+    PATH="$PATH" \
+    openclaw "$@"
+fi
+
+# Claude Code launch (reached only when OPENERAL_AGENT != openclaw, since openclaw execs above).
 # Install Claude Code if not already present in the image
 if ! command -v claude >/dev/null 2>&1; then
   echo "setup.sh: Claude CLI not found, installing..."
@@ -456,22 +490,10 @@ if ! command -v claude >/dev/null 2>&1; then
   echo "setup.sh: Claude CLI installed"
 fi
 
-# Launch Claude Code with persistent home.
-#
-# Claude Code reads ANTHROPIC_BASE_URL / ANTHROPIC_AUTH_TOKEN from process.env
-# at startup for auth-mode selection; ~/.claude/settings.json is only
-# consulted afterward. Delivering the proxy config via settings.json alone
-# lands Claude in "API Usage Billing" mode against any stale URL on disk —
-# which, if that URL still has the presign's /v1/messages suffix, produces a
-# doubled /v1/messages/v1/messages path against StringCost. Export the vars
-# here so the proxy is picked up at the auth-selection step.
-# STRINGCOST_PROXY_URL was normalized by normalize_stringcost_proxy_url above.
-#
-# The proxy path preserves ANTHROPIC_API_KEY from the claude provider for
-# Claude Code's local auth-mode selection and request signing. Do not write that
-# key to settings.json; settings only stores the proxy base URL. STRINGCOST_API_KEY
-# is only needed for presign creation, so remove it before handing control to
-# Claude Code.
+# Claude Code reads ANTHROPIC_BASE_URL from process.env at startup for
+# auth-mode selection. Export the proxy here so it's picked up before
+# settings.json is consulted. STRINGCOST_API_KEY is only needed for presign
+# creation — remove it before handing control to Claude Code.
 echo "setup.sh: launching Claude Code..."
 if [ -n "${STRINGCOST_PROXY_URL:-}" ]; then
   exec env -u STRINGCOST_API_KEY -u ANTHROPIC_AUTH_TOKEN \

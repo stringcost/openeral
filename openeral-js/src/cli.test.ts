@@ -203,6 +203,7 @@ describe('CLI argument parsing', () => {
       kind: 'launch',
       workspaceId: 'alpha',
       claudeArgs: ['-p', 'hello'],
+      agent: 'claude',
     });
   });
 
@@ -213,6 +214,7 @@ describe('CLI argument parsing', () => {
       kind: 'launch',
       workspaceId: 'openeral-claude',
       claudeArgs: ['--help'],
+      agent: 'claude',
     });
   });
 });

@@ -11,16 +11,18 @@ Agent ──bash tool──► openeral-bash ──► just-bash (TypeScript)
                                      └── /tmp        → InMemoryFs
 ```
 
-For Claude Code (`npx openeral`):
+For Claude Code and OpenClaw:
 
 ```
                     ┌─────────────┐
-PostgreSQL ◄──sync──┤ /home/agent ├──► Claude Code (Read, Write, Edit, Bash, ...)
-                    └──────┬──────┘
+PostgreSQL ◄──sync──┤ /home/agent ├──► Claude Code  (Read, Write, Edit, Bash, ...)
+                    └──────┬──────┘    OpenClaw      (same filesystem, same workspace)
                       file watcher
                            │
                     sync on change ──► PostgreSQL
 ```
+
+Agent selection is controlled by the `OPENERAL_AGENT` environment variable (`claude` or `openclaw`), which is injected into the sandbox by the corresponding OpenShell provider.
 
 ## Components
 
@@ -42,9 +44,9 @@ Supporting modules:
 
 Stock OpenShell base image + Node.js + openeral-js. No custom cluster or gateway.
 
-- **openeral-bash.mjs** — daemon/client bridge. Daemon holds a persistent just-bash shell on a Unix socket. Each `bash -c` from Claude Code connects, executes, streams output.
-- **setup.sh** — entry point. Migrations → seed → daemon → Claude Code.
-- **policy.yaml** — network policy for the OpenShell supervisor.
+- **openeral-bash.mjs** — daemon/client bridge. Daemon holds a persistent just-bash shell on a Unix socket. Each `bash -c` from Claude Code or OpenClaw connects, executes, streams output.
+- **setup.sh** — entry point. Migrations → seed → daemon → agent launch. Reads `OPENERAL_AGENT` (`claude` or `openclaw`) to decide which agent to exec; defaults to Claude Code. StringCost presign integration is skipped for OpenClaw.
+- **policy.yaml** — network policy for the OpenShell supervisor. Includes `openclaw_install` (openclaw.ai), `openclaw_openai` (api.openai.com), and `npm_registry` GitHub release hosts required by openclaw's native module postinstall.
 
 ### Database schema (`_openeral`)
 
