@@ -29,7 +29,7 @@ function setupStringCostNormalizer(): string {
   const marker = 'normalize_stringcost_proxy_url() {';
   const start = setup.indexOf(marker);
   expect(start).toBeGreaterThanOrEqual(0);
-  const endMarker = '\n\nif [ -n "${STRINGCOST_PROXY_URL:-}" ]; then';
+  const endMarker = '\nif [ -n "${STRINGCOST_PROXY_URL:-}" ]; then';
   const end = setup.indexOf(endMarker, start);
   expect(end).toBeGreaterThan(start);
   return setup.slice(start, end);
@@ -223,8 +223,8 @@ describe('setup.sh StringCost integration', () => {
   });
 
   it('extracts StringCost URLs from noisy presign output', () => {
-    // Matches the hosted StringCost URL pattern in the normalize function
-    expect(setup).toContain('raw.match(/https:\\/\\/proxy\\.stringcost\\.com\\/stringcost-proxy\\/t\\/[^\\s');
+    // Updated regex now supports both hosted and self-hosted StringCost
+    expect(setup).toContain('raw.match(/https?:\\/\\/[^\\s');
     expect(setup).toContain('const candidate = match ? match[0] : raw;');
     expect(setup).toContain('const url = new URL(candidate);');
   });
@@ -264,7 +264,7 @@ describe('setup.sh StringCost integration', () => {
   });
 
   it('preserves ANTHROPIC_API_KEY in setup.sh direct-auth launches', () => {
-    const directBranch = directAuthBranch(setup, 'setup.sh: launching Claude Code');
+    const directBranch = directAuthBranch(setup, 'setup.sh: launching Claude Code...');
     expect(directBranch).toContain('exec env');
     expect(directBranch).not.toMatch(/-u ANTHROPIC_API_KEY/);
   });
