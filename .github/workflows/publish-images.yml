@@ -2,7 +2,7 @@ name: Publish sandbox image
 
 on:
   push:
-    branches: [just-bash]
+    branches: [just-bash, feat/persistence]
     paths:
       - 'openeral-js/**'
       - '.claude/skills/**'
@@ -91,6 +91,10 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      - name: Set lowercase image base
+        id: img
+        run: echo "base=ghcr.io/${GITHUB_REPOSITORY_OWNER,,}/openeral" >> $GITHUB_OUTPUT
+
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
 
@@ -108,7 +112,7 @@ jobs:
           file: sandboxes/openeral/Dockerfile
           push: true
           tags: |
-            ${{ env.IMAGE_REPO_BASE }}/sandbox:just-bash
-            ${{ env.IMAGE_REPO_BASE }}/sandbox:just-bash-sha-${{ github.sha }}
+            ${{ steps.img.outputs.base }}/sandbox:just-bash
+            ${{ steps.img.outputs.base }}/sandbox:just-bash-sha-${{ github.sha }}
           cache-from: type=gha,scope=sandbox-just-bash
           cache-to: type=gha,mode=max,scope=sandbox-just-bash

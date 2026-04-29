@@ -91,7 +91,7 @@ Then create the sandbox with `--project-path` pointing at your project:
 ```bash
 openshell sandbox create --tty \
   --name openeral-claude \
-  --from openeral-sandbox:dev \
+  --from ghcr.io/sandys/openeral/sandbox:just-bash \
   --provider claude --auto-providers \
   -- openeral --project-path /mnt/c/Users/dines/OneDrive/Desktop
 ```
