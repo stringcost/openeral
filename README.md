@@ -110,13 +110,16 @@ My project is at /mnt/c/Users/alice/Desktop/work/myproject — please work on fi
 
 ## Add StringCost Tracking
 
-StringCost is optional. It routes Claude API calls through a presigned proxy URL for token and cost metering.
+StringCost is optional. It routes Claude API calls through a presigned proxy URL for token and cost metering. Both Claude Code and OpenClaw can route through StringCost — set the `metadata.labels` entry below to `claude-code` or `openclaw` so the StringCost vendor portfolio attributes the spend to the right agent.
 
 ```bash
 export ANTHROPIC_API_KEY='sk-ant-...'
 export STRINGCOST_API_KEY='sk-st-...'
 
 OPENERAL_INPUT="$(mktemp -d)"
+
+# Use 'claude-code' for Claude Code; switch to 'openclaw' when launching OpenClaw.
+AGENT_LABEL='claude-code'
 
 curl -fsS https://app.stringcost.com/v1/presign \
   -H "Authorization: Bearer $STRINGCOST_API_KEY" \
@@ -128,7 +131,7 @@ curl -fsS https://app.stringcost.com/v1/presign \
     "expires_in": -1,
     "max_uses": -1,
     "cost_limit": 10000000,
-    "tags": ["openeral"]
+    "metadata": { "source": "openeral-sandbox", "client": "'"$AGENT_LABEL"'", "labels": ["openeral", "'"$AGENT_LABEL"'"] }
   }' \
   > "$OPENERAL_INPUT/presign.json"
 
@@ -186,6 +189,8 @@ openshell sandbox create --tty \
 ```
 
 `--auto-providers` picks up `ANTHROPIC_API_KEY` from your shell and injects it alongside the `openclaw` provider. Without PostgreSQL, OpenEral uses embedded PGlite for the session lifetime.
+
+To route OpenClaw through StringCost the same way Claude Code does, follow [Add StringCost Tracking](#add-stringcost-tracking) but set `AGENT_LABEL='openclaw'` so the presign is tagged for the OpenClaw vendor row in StringCost's portfolio.
 
 ## Add PostgreSQL Persistence (OpenClaw)
 
