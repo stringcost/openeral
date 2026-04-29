@@ -64,13 +64,22 @@ DATABASE_URL='...' ANTHROPIC_API_KEY='...' bash ../tests/test_claude_e2e.sh
 The sandbox supports two agents controlled by `OPENERAL_AGENT`:
 
 - `claude` (default) — Claude Code. Seeds `/.claude` and `/.claude/projects`, writes StringCost proxy to `~/.claude/settings.json`, execs `claude`.
-- `openclaw` — OpenClaw. Seeds `/.config` only (no `/.claude`), skips all StringCost logic, execs `openclaw`.
+- `openclaw` — OpenClaw. Seeds `/.config` only (no `/.claude`), reads StringCost proxy from `ANTHROPIC_BASE_URL` exported at exec time, execs `openclaw`.
 
 `OPENERAL_AGENT` is never set directly by users. It is injected into the sandbox by OpenShell's provider framework: the `openclaw` generic provider carries `--credential "OPENERAL_AGENT=openclaw"`.
 
 The workspace schema (`_openeral`) is shared — both agents read and write the same `workspace_files` table.
 
-When adding features that differ by agent, gate on `OPENERAL_AGENT` in `setup.sh` (bash) and `process.env.OPENERAL_AGENT` in Node.js. StringCost and `~/.claude` config must always be inside `if [ "$OPENERAL_AGENT" != "openclaw" ]`.
+### StringCost integration
+
+Both agents route their Anthropic API calls through StringCost when a presign is available. Each agent gets its own presign with a distinct `metadata.labels` entry so the StringCost vendor portfolio can attribute usage:
+
+- Claude Code → `metadata.labels: ['openeral', 'claude-code']`, stored at `~/.openeral/presign.json`.
+- OpenClaw → `metadata.labels: ['openeral', 'openclaw']`, stored at `~/.openeral/presign-openclaw.json`.
+
+Presigns are created against `STRINGCOST_API_BASE` (defaults to `https://app.stringcost.com`; override for local stacks). The proxy URL regex accepts both `https://proxy.stringcost.com/...` and self-hosted shapes (`http(s)://<host>/stringcost-proxy/t/...`).
+
+When adding features that differ by agent, gate on `OPENERAL_AGENT` in `setup.sh` (bash) and `process.env.OPENERAL_AGENT` in Node.js. The StringCost presign acquisition runs for **both** agents; only the `~/.claude/settings.json` write is gated to Claude Code.
 
 ## Build & test for OpenClaw
 
