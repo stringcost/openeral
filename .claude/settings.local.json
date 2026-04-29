@@ -82,7 +82,24 @@
       "Bash(bash -n /mnt/c/Users/dines/OneDrive/Desktop/work/openeral/sandboxes/openeral/setup.sh)",
       "Bash(git -C /mnt/c/Users/dines/OneDrive/Desktop/work/openeral log --oneline --all)",
       "Bash(git -C /mnt/c/Users/dines/OneDrive/Desktop/work/openeral log --oneline --follow -- sandboxes/openeral/setup.sh)",
-      "Bash(git -C /mnt/c/Users/dines/OneDrive/Desktop/work/openeral branch -a)"
+      "Bash(git -C /mnt/c/Users/dines/OneDrive/Desktop/work/openeral branch -a)",
+      "WebFetch(domain:docs.openshell.ai)",
+      "WebFetch(domain:openshell.ai)",
+      "WebFetch(domain:gist.github.com)",
+      "Bash(~/.local/bin/openshell --help)",
+      "Bash(~/.local/bin/openshell gateway *)",
+      "Bash(~/.local/bin/openshell sandbox *)",
+      "Bash(~/.local/bin/openshell settings *)",
+      "Read(//home/linux/.config/openshell/**)",
+      "Read(//home/linux/.config/openshell/gateways/**)",
+      "Read(//home/linux/.config/openshell/gateways/openshell/**)",
+      "Bash(docker update *)",
+      "Bash(~/.local/bin/openshell provider *)",
+      "Bash(curl -sk https://127.0.0.1:8080/swagger.json)",
+      "Bash(curl -sk https://127.0.0.1:8080/openapi.json)",
+      "Bash(curl -sk https://127.0.0.1:8080/health)",
+      "WebFetch(domain:agent-sandbox.sigs.k8s.io)",
+      "WebFetch(domain:northflank.com)"
     ]
   }
 }

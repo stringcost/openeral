@@ -223,7 +223,8 @@ describe('setup.sh StringCost integration', () => {
   });
 
   it('extracts StringCost URLs from noisy presign output', () => {
-    expect(setup).toMatch(/raw\.match\(\/https:\\\/\\\/proxy\\\.stringcost\\\.com\\\/stringcost-proxy\\\/t\\\/\[\^\\s/);
+    // Matches the hosted StringCost URL pattern in the normalize function
+    expect(setup).toContain('raw.match(/https:\\/\\/proxy\\.stringcost\\.com\\/stringcost-proxy\\/t\\/[^\\s');
     expect(setup).toContain('const candidate = match ? match[0] : raw;');
     expect(setup).toContain('const url = new URL(candidate);');
   });
