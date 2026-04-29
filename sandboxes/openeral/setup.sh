@@ -60,6 +60,21 @@ export WORKSPACE_ID="${OPENSHELL_SANDBOX_ID:-default}"
 # Defaults to claude when the provider is absent.
 export OPENERAL_AGENT="${OPENERAL_AGENT:-claude}"
 
+# Agent label written into the StringCost presign metadata. The vendor portfolio
+# report in StringCost reads `metadata.labels` to attribute usage to a specific
+# agent (Claude Code vs OpenClaw inside OpenEral). One label per agent kind.
+if [ "$OPENERAL_AGENT" = "openclaw" ]; then
+  STRINGCOST_AGENT_LABEL="openclaw"
+else
+  STRINGCOST_AGENT_LABEL="claude-code"
+fi
+export STRINGCOST_AGENT_LABEL
+
+# StringCost API host. Defaults to the hosted service; override with
+# STRINGCOST_API_BASE=http://<host-ip>:8080 (or similar) to point at a
+# self-hosted control plane during local end-to-end testing.
+export STRINGCOST_API_BASE="${STRINGCOST_API_BASE:-https://app.stringcost.com}"
+
 # Fix the PGlite data directory to a stable path so every Node.js process
 # in this script uses the same embedded database.  /home/agent is a real
 # directory in the container (created in the Dockerfile).
@@ -102,17 +117,26 @@ case "${DATABASE_URL:-}" in
     ;;
 esac
 
-# StringCost integration — Claude Code only.
-# OpenClaw uses direct API key auth; the presign model does not apply to it.
-if [ "$OPENERAL_AGENT" != "openclaw" ]; then
+# StringCost integration — both agents (Claude Code AND OpenClaw).
+# Each agent gets its own presign with a distinct metadata.labels entry so the
+# StringCost vendor portfolio can attribute token spend, COGS, and revenue to
+# the right agent. Both agents read ANTHROPIC_BASE_URL at startup and route
+# their /v1/messages calls through the StringCost proxy.
 
 # Priority:
 #   1. STRINGCOST_PROXY_URL already set → normalize and use it.
 #   2. Uploaded presign JSON or URL under /sandbox/openeral-input → normalize and use it.
-#   3. STRINGCOST_PROXY_URL stored from previous session in /home/agent/.openeral/presign.json → reuse.
+#   3. STRINGCOST_PROXY_URL stored from previous session → reuse.
 #   4. STRINGCOST_API_KEY + raw ANTHROPIC_API_KEY present → create a new permanent presign
 #      (expires_in=-1, max_uses=-1, cost_limit=$10), store in workspace, reuse on next launch.
-STRINGCOST_PRESIGN_FILE=/home/agent/.openeral/presign.json
+#
+# Presign storage is per-agent so Claude Code and OpenClaw don't clobber each
+# other when the same workspace is launched with both agents.
+if [ "$OPENERAL_AGENT" = "openclaw" ]; then
+  STRINGCOST_PRESIGN_FILE=/home/agent/.openeral/presign-openclaw.json
+else
+  STRINGCOST_PRESIGN_FILE=/home/agent/.openeral/presign.json
+fi
 
 normalize_stringcost_proxy_url() {
   node -e '
@@ -120,14 +144,16 @@ const raw = (process.argv[1] || "").trim();
 if (!raw) process.exit(0);
 
 try {
-  const match = raw.match(/https:\/\/proxy\.stringcost\.com\/stringcost-proxy\/t\/[^\s"'\''<>]+/);
+  // Accept the hosted shape (https://proxy.stringcost.com/stringcost-proxy/t/...)
+  // and any self-hosted shape (http(s)://<any-host>/stringcost-proxy/t/...).
+  const match = raw.match(/https?:\/\/[^\s"'\''<>]+\/stringcost-proxy\/t\/[^\s"'\''<>]+/);
   const candidate = match ? match[0] : raw;
   const url = new URL(candidate);
   url.pathname = url.pathname.replace(/\/v1\/.*$/, "");
   url.search = "";
   url.hash = "";
   const normalized = url.toString().replace(/\/$/, "");
-  if (!/^https:\/\/proxy\.stringcost\.com\/stringcost-proxy\/t\/[^/]+$/.test(normalized)) {
+  if (!/^https?:\/\/[^/]+\/stringcost-proxy\/t\/[^/]+$/.test(normalized)) {
     throw new Error("unexpected StringCost proxy URL shape");
   }
   process.stdout.write(normalized);
@@ -211,7 +237,9 @@ const fetch = globalThis.fetch;
   const controller = new AbortController();
   const to = setTimeout(() => controller.abort(), 30000);
   try {
-    const r = await fetch('https://app.stringcost.com/v1/presign', {
+    const apiBase = (process.env.STRINGCOST_API_BASE || 'https://app.stringcost.com').replace(/\/+\$/, '');
+    const agentLabel = process.env.STRINGCOST_AGENT_LABEL || 'claude-code';
+    const r = await fetch(apiBase + '/v1/presign', {
       method: 'POST',
       headers: {
         'Authorization': 'Bearer ' + process.env.STRINGCOST_API_KEY,
@@ -224,8 +252,14 @@ const fetch = globalThis.fetch;
         expires_in: -1,
         max_uses: -1,
         cost_limit: 10000000,
-        tags: ['openeral'],
-        metadata: { source: 'openeral-sandbox' },
+        // metadata.labels is what StringCost's vendor portfolio classifier
+        // reads. 'tags' on the request body is NOT a presign-schema field
+        // and would be silently dropped.
+        metadata: {
+          source: 'openeral-sandbox',
+          client: agentLabel,
+          labels: ['openeral', agentLabel],
+        },
       }),
       signal: controller.signal,
     });
@@ -272,8 +306,10 @@ const fetch = globalThis.fetch;
   esac
 fi
 
-# Apply proxy to Claude Code settings if we have one
-if [ -n "${STRINGCOST_PROXY_URL:-}" ]; then
+# Apply proxy to Claude Code settings if we have one. OpenClaw has no
+# ~/.claude/settings.json — it picks up ANTHROPIC_BASE_URL from the env at
+# launch (see the OpenClaw exec block further down).
+if [ -n "${STRINGCOST_PROXY_URL:-}" ] && [ "$OPENERAL_AGENT" != "openclaw" ]; then
   echo "setup.sh: writing StringCost proxy to ~/.claude/settings.json..."
   node -e "
 const fs = require('fs');
@@ -289,8 +325,6 @@ fs.writeFileSync(file, JSON.stringify(s, null, 2));
 console.log('setup.sh: StringCost proxy written to ~/.claude/settings.json');
 "
 fi
-
-fi # end: OPENERAL_AGENT != openclaw
 
 echo "setup.sh: running migrations..."
 # Log which DB target we're pointing at (redact credentials from the URL)
@@ -498,11 +532,24 @@ if [ "$OPENERAL_AGENT" = "openclaw" ]; then
     echo "setup.sh: working directory set to $PROJECT_PATH"
   fi
   echo "setup.sh: launching OpenClaw..."
-  exec env \
-    HOME=/home/agent \
-    SHELL=/usr/local/bin/openeral-bash \
-    PATH="$PATH" \
-    openclaw "$@"
+  if [ -n "${STRINGCOST_PROXY_URL:-}" ]; then
+    # Route OpenClaw's Anthropic API calls through the StringCost proxy so its
+    # token spend, COGS, and revenue land in StringCost's vendor portfolio
+    # under the `openclaw` label. Strip STRINGCOST_API_KEY before exec — it's
+    # only needed for presign creation.
+    exec env -u STRINGCOST_API_KEY -u ANTHROPIC_AUTH_TOKEN \
+      HOME=/home/agent \
+      SHELL=/usr/local/bin/openeral-bash \
+      PATH="$PATH" \
+      ANTHROPIC_BASE_URL="$STRINGCOST_PROXY_URL" \
+      openclaw "$@"
+  else
+    exec env \
+      HOME=/home/agent \
+      SHELL=/usr/local/bin/openeral-bash \
+      PATH="$PATH" \
+      openclaw "$@"
+  fi
 fi
 
 # Claude Code launch (reached only when OPENERAL_AGENT != openclaw, since openclaw execs above).
