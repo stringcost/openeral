@@ -65,6 +65,7 @@ All subcommands accept `--dev`/`-d` to target the local dev image.
 |---|---|
 | `npx openeral` | Launch Claude Code (published image) |
 | `npx openeral --dev` | Launch Claude Code (local dev image) |
+| `npx openeral --agent openclaw` | Launch OpenClaw instead of Claude Code |
 | `npx openeral presign` | Show the currently stored StringCost presign |
 | `npx openeral presign renew` | Create a new permanent StringCost presign and store it |
 | `npx openeral stats` | API usage statistics (cost, tokens, model distribution, cache hit rate) |
@@ -92,8 +93,9 @@ All subcommands accept `--dev`/`-d` to target the local dev image.
 | Variable | Default | Description |
 |---|---|---|
 | `ANTHROPIC_API_KEY` | (required) | Anthropic API key |
-| `STRINGCOST_API_KEY` | (optional) | StringCost key — enables cost tracking |
+| `STRINGCOST_API_KEY` | (optional) | StringCost key — enables cost tracking (Claude Code only) |
 | `DATABASE_URL` | (optional) | PostgreSQL connection string — enables persistence and `pg` |
+| `OPENERAL_AGENT` | `claude` | Agent to launch: `claude` or `openclaw`. Injected via the `openclaw` provider; not set directly. |
 | `OPENERAL_WORKSPACE_ID` | hostname | Workspace identifier |
 | `OPENERAL_HOME` | `/tmp/openeral-<id>` | Local workspace directory |
 | `OPENERAL_SANDBOX_IMAGE` | `ghcr.io/sandys/openeral/sandbox:just-bash` | Override the production sandbox image |
@@ -139,6 +141,15 @@ DATABASE_URL='...' ANTHROPIC_API_KEY='...' bash ../tests/test_claude_e2e.sh
 ```
 
 Launches Claude Code through the built binary, has it write a file, deletes the home directory, relaunches, and verifies the file is restored from PostgreSQL.
+
+### OpenClaw code path (requires Docker + PostgreSQL)
+
+```bash
+# Exercise setup.sh with OPENERAL_AGENT=openclaw
+DATABASE_URL='...' OPENERAL_AGENT=openclaw bash ../tests/test_setup_e2e.sh
+```
+
+Verifies that setup.sh correctly seeds `/.config` (not `/.claude`), skips StringCost, and detects the openclaw binary when `OPENERAL_AGENT=openclaw` is set.
 
 ---
 

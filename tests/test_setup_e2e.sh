@@ -2,19 +2,21 @@
 set -euo pipefail
 
 # test_setup_e2e.sh — Runs setup.sh inside the Docker image end-to-end,
-# then verifies the resulting state is correct for Claude Code.
+# then verifies the resulting state is correct for Claude Code and OpenClaw.
 #
-# This replaces the final `exec claude` with verification commands.
+# This replaces the final `exec claude`/`exec openclaw` with verification commands.
 # It exercises the ACTUAL setup.sh code path, not manual reproductions.
 #
 # Requires: docker, reachable PostgreSQL
 # Usage: DATABASE_URL='postgresql://...' ./tests/test_setup_e2e.sh
+# OpenClaw path: DATABASE_URL='...' OPENERAL_AGENT=openclaw ./tests/test_setup_e2e.sh
 
 repo_root="$(cd "$(dirname "$0")/.." && pwd)"
 cd "$repo_root"
 
 IMAGE="${OPENERAL_E2E_IMAGE:-openeral-e2e:local}"
 DB_URL="${DATABASE_URL:?DATABASE_URL required}"
+AGENT="${OPENERAL_AGENT:-claude}"
 WORKSPACE="setup-e2e-$$"
 PASSED=0
 FAILED=0
@@ -26,13 +28,17 @@ echo ""
 echo "=== Building image ==="
 docker build -f sandboxes/openeral/Dockerfile -t "$IMAGE" . 2>&1 | tail -2
 
-# Create a modified setup.sh that stops before exec claude and runs checks instead
 echo ""
-echo "=== Running setup.sh (with verification instead of claude) ==="
+echo "=== Agent: $AGENT ==="
+
+# Create a modified setup.sh that stops before exec claude/openclaw and runs checks instead
+echo ""
+echo "=== Running setup.sh (with verification instead of $AGENT) ==="
 out=$(timeout 60 docker run --rm --network host \
   -e DATABASE_URL="$DB_URL" \
   -e WORKSPACE_ID="$WORKSPACE" \
   -e OPENSHELL_SANDBOX_ID="$WORKSPACE" \
+  -e OPENERAL_AGENT="$AGENT" \
   -e SOCKET_TOKEN="test-placeholder-token" \
   --user sandbox \
   --entrypoint /bin/sh \
@@ -52,14 +58,16 @@ out=$(timeout 60 docker run --rm --network host \
       }).catch(e=>{console.error(\"CHECK:migrations=FAIL:\"+e.message);process.exit(1)});
     "
 
-    # --- Seed workspace (from setup.sh) ---
+    # --- Seed workspace (from setup.sh, agent-aware) ---
     node -e "
       import(\"/opt/openeral/dist/db/pool.js\").then(async({createPool})=>{
         const ws=await import(\"/opt/openeral/dist/db/workspace-queries.js\");
         const p=createPool(process.env.DATABASE_URL);
         try{await p.query(\"INSERT INTO _openeral.workspace_config (id,display_name,config) VALUES(\\\$1,\\\$2,\\x27{}\\x27::jsonb) ON CONFLICT(id) DO NOTHING\",[process.env.WORKSPACE_ID,\"sandbox\"])}catch{}
-        await ws.seedFromConfig(p,process.env.WORKSPACE_ID,{autoDirs:[\"/\",\"/.claude\",\"/.claude/projects\"],seedFiles:{}});
-        await p.end();console.log(\"CHECK:seed=ok\");
+        const agentKind=process.env.OPENERAL_AGENT||\"claude\";
+        const autoDirs=agentKind===\"openclaw\"?[\"/\",\"/.config\"]:[\".\",\"/.claude\",\"/.claude/projects\"];
+        await ws.seedFromConfig(p,process.env.WORKSPACE_ID,{autoDirs,seedFiles:{}});
+        await p.end();console.log(\"CHECK:seed=ok:agent=\"+agentKind);
       }).catch(e=>{console.error(\"CHECK:seed=FAIL:\"+e.message);process.exit(1)});
     "
 
@@ -118,6 +126,18 @@ NPMRC
     # 6. pg helper would be written by CLI (not setup.sh, but verify PATH logic)
     echo "CHECK:node-available=$(which node)"
 
+    # 7. Agent-specific checks
+    AGENT="${OPENERAL_AGENT:-claude}"
+    if [ "$AGENT" = "openclaw" ]; then
+      # openclaw path: /.config should exist, /.claude should NOT
+      echo "CHECK:agent-dirs-openclaw=$([ -d /home/agent/.config ] && echo ok || echo FAIL)"
+      echo "CHECK:claude-dir-absent=$([ ! -d /home/agent/.claude ] && echo ok || echo PRESENT)"
+      echo "CHECK:openclaw-binary=$(command -v openclaw >/dev/null 2>&1 && echo ok || echo FAIL)"
+    else
+      # claude path: /.claude should exist
+      echo "CHECK:agent-dirs-claude=$([ -d /home/agent/.claude ] && echo ok || echo FAIL)"
+    fi
+
     kill $DPID 2>/dev/null
     exit 0
   ' 2>&1)
@@ -145,6 +165,14 @@ check "npm reads socket.dev"    "CHECK:npm-registry=https://registry.socket.dev"
 check "user .npmrc untouched"   "CHECK:user-npmrc=absent-ok"
 check "SOCKET_TOKEN present"    "CHECK:socket-token-present=yes"
 check "daemon responds"         "CHECK:daemon-response=daemon-works"
+
+if [ "$AGENT" = "openclaw" ]; then
+  check "openclaw: /.config dir created" "CHECK:agent-dirs-openclaw=ok"
+  check "openclaw: /.claude absent"      "CHECK:claude-dir-absent=ok"
+  check "openclaw: binary present"       "CHECK:openclaw-binary=ok"
+else
+  check "claude: /.claude dir created"   "CHECK:agent-dirs-claude=ok"
+fi
 
 # Cleanup
 node -e "

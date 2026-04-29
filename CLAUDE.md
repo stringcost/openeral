@@ -59,6 +59,30 @@ DATABASE_URL='...' ANTHROPIC_API_KEY='...' bash ../tests/test_claude_e2e.sh
 - Command safety: just-bash parse() AST walk with regex fallback
 - `pg` command: SQL with parens or quotes must be double-quoted
 
+## Agent Selection (Claude Code vs OpenClaw)
+
+The sandbox supports two agents controlled by `OPENERAL_AGENT`:
+
+- `claude` (default) — Claude Code. Seeds `/.claude` and `/.claude/projects`, writes StringCost proxy to `~/.claude/settings.json`, execs `claude`.
+- `openclaw` — OpenClaw. Seeds `/.config` only (no `/.claude`), skips all StringCost logic, execs `openclaw`.
+
+`OPENERAL_AGENT` is never set directly by users. It is injected into the sandbox by OpenShell's provider framework: the `openclaw` generic provider carries `--credential "OPENERAL_AGENT=openclaw"`.
+
+The workspace schema (`_openeral`) is shared — both agents read and write the same `workspace_files` table.
+
+When adding features that differ by agent, gate on `OPENERAL_AGENT` in `setup.sh` (bash) and `process.env.OPENERAL_AGENT` in Node.js. StringCost and `~/.claude` config must always be inside `if [ "$OPENERAL_AGENT" != "openclaw" ]`.
+
+## Build & test for OpenClaw
+
+```bash
+# Verify setup.sh handles both agents (no Docker required)
+bash -n sandboxes/openeral/setup.sh
+grep -q 'OPENERAL_AGENT' sandboxes/openeral/setup.sh
+
+# Full OpenClaw setup path (requires Docker + PostgreSQL)
+DATABASE_URL='...' OPENERAL_AGENT=openclaw bash tests/test_setup_e2e.sh
+```
+
 ## Hard Rules
 
 - **Never fix forward from the middle.** Stop and restart the flow from scratch.

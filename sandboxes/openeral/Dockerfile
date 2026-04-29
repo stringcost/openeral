@@ -14,6 +14,12 @@ RUN apt-get update \
     && apt-get install -y --no-install-recommends nodejs \
     && rm -rf /var/lib/apt/lists/*
 
+# OpenClaw — baked into the image so the sandbox doesn't reinstall on every launch.
+# SHARP_IGNORE_GLOBAL_LIBVIPS=1 skips the sharp native postinstall, which would
+# otherwise try to pull GitHub release assets (blocked in some CI environments).
+RUN SHARP_IGNORE_GLOBAL_LIBVIPS=1 npm install -g --loglevel=error openclaw@latest \
+    && chmod -R a+rX /usr/lib/node_modules/openclaw
+
 # Install openeral-js: install all deps (including devDeps for tsc), build, then prune
 COPY openeral-js/ /opt/openeral/
 RUN cd /opt/openeral && npm install && npm run build && npm prune --omit=dev \

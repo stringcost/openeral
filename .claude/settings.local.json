@@ -67,7 +67,18 @@
       "Bash(node *)",
       "Bash(pnpm typecheck *)",
       "Bash(ls *)",
-      "Bash(bash /tmp/test_env.sh)"
+      "Bash(bash /tmp/test_env.sh)",
+      "WebFetch(domain:docs.openshell.dev)",
+      "WebFetch(domain:openshell.dev)",
+      "WebSearch",
+      "WebFetch(domain:docs.nvidia.com)",
+      "WebFetch(domain:github.com)",
+      "WebFetch(domain:deepwiki.com)",
+      "WebFetch(domain:openshelldocs.com)",
+      "WebFetch(domain:docs.openclaw.ai)",
+      "Bash(openshell gateway *)",
+      "Bash(git remote *)",
+      "Bash(grep -n \"setup: launching Claude Code\\\\|STRINGCOST_PROXY_URL\\\\|else\\\\|fi$\" /mnt/c/Users/dines/OneDrive/Desktop/work/openeral/openeral-js/src/cli.ts)"
     ]
   }
 }
