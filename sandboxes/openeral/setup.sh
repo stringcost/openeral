@@ -3,7 +3,7 @@ set -euo pipefail
 
 # setup.sh — OpenEral sandbox entry point
 #
-# Called by: openshell sandbox create ... -- openeral
+# Called by: openshell sandbox create ... -- openeral [--project-path /mnt/...]
 # (or, equivalently, -- /opt/openeral/setup.sh — the `openeral` name is a
 # /usr/local/bin shim installed in the Dockerfile.)
 #
@@ -12,6 +12,24 @@ set -euo pipefail
 #   2. Seed the workspace
 #   3. Start openeral-bash daemon
 #   4. Exec Claude Code
+
+# Parse --project-path from args before handing the rest to claude/openclaw.
+# Must be under /mnt/ (host filesystem) — any other prefix is rejected.
+PROJECT_PATH=""
+PASSTHROUGH_ARGS=()
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --project-path)
+      PROJECT_PATH="${2:-}"
+      shift 2
+      ;;
+    *)
+      PASSTHROUGH_ARGS+=("$1")
+      shift
+      ;;
+  esac
+done
+set -- "${PASSTHROUGH_ARGS[@]+"${PASSTHROUGH_ARGS[@]}"}"
 
 # OpenShell's Node HTTP proxy path currently emits an experimental Undici warning
 # in some environments. Keep setup output clean and, more importantly, keep
@@ -470,6 +488,15 @@ if [ "$OPENERAL_AGENT" = "openclaw" ]; then
       exit 1
     fi
   fi
+  if [ -n "$PROJECT_PATH" ]; then
+    case "$PROJECT_PATH" in
+      /mnt/*) ;;
+      *) echo "setup.sh: --project-path must be under /mnt/ (got: $PROJECT_PATH)" >&2; exit 1 ;;
+    esac
+    [ -d "$PROJECT_PATH" ] || { echo "setup.sh: --project-path not found: $PROJECT_PATH" >&2; exit 1; }
+    cd "$PROJECT_PATH"
+    echo "setup.sh: working directory set to $PROJECT_PATH"
+  fi
   echo "setup.sh: launching OpenClaw..."
   exec env \
     HOME=/home/agent \
@@ -494,6 +521,15 @@ fi
 # auth-mode selection. Export the proxy here so it's picked up before
 # settings.json is consulted. STRINGCOST_API_KEY is only needed for presign
 # creation — remove it before handing control to Claude Code.
+if [ -n "$PROJECT_PATH" ]; then
+  case "$PROJECT_PATH" in
+    /mnt/*) ;;
+    *) echo "setup.sh: --project-path must be under /mnt/ (got: $PROJECT_PATH)" >&2; exit 1 ;;
+  esac
+  [ -d "$PROJECT_PATH" ] || { echo "setup.sh: --project-path not found: $PROJECT_PATH" >&2; exit 1; }
+  cd "$PROJECT_PATH"
+  echo "setup.sh: working directory set to $PROJECT_PATH"
+fi
 echo "setup.sh: launching Claude Code..."
 if [ -n "${STRINGCOST_PROXY_URL:-}" ]; then
   exec env -u STRINGCOST_API_KEY -u ANTHROPIC_AUTH_TOKEN \

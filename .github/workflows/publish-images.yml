@@ -2,7 +2,7 @@ name: Publish sandbox image
 
 on:
   push:
-    branches: [just-bash]
+    branches: [just-bash, feat/persistence]
     paths:
       - 'openeral-js/**'
       - '.claude/skills/**'

@@ -80,33 +80,32 @@ Do not pass the database URL through an OpenShell generic provider. PostgreSQL i
 
 ## Work on Host Project Files
 
-OpenEral can read and write files on your host machine. Run once after the gateway starts (safe to re-run — skips if already done):
+OpenEral can read and write files on your host machine directly. Run once after the gateway starts (safe to re-run — skips if already done):
 
 ```bash
 ./scripts/gateway-ensure-mnt.sh
 ```
 
-Then create the sandbox as normal:
+Then create the sandbox with `--project-path` pointing at your project:
 
 ```bash
 openshell sandbox create --tty \
   --name openeral-claude \
-  --from ghcr.io/sandys/openeral/sandbox:just-bash \
+  --from openeral-sandbox:dev \
   --provider claude --auto-providers \
-  -- openeral
+  -- openeral --project-path /mnt/c/Users/dines/OneDrive/Desktop
 ```
 
-Once Claude starts, your host files are accessible at their `/mnt/...` path:
+Claude starts with that directory as its working directory and can read and write all files inside it. No PostgreSQL required — changes go directly to your host filesystem.
+
+Your host path inside the sandbox follows this mapping:
 
 | Host location | Path inside sandbox |
 |---|---|
 | `C:\Users\alice\myproject` (WSL) | `/mnt/c/Users/alice/myproject` |
 | `/home/alice/myproject` (Linux) | `/mnt/home/alice/myproject` |
 
-Tell Claude the path once it starts:
-```
-My project is at /mnt/c/Users/alice/Desktop/work/myproject — please work on files there.
-```
+The `--project-path` must be under `/mnt/`. Claude's home directory (`/home/agent`) stays inside the sandbox and holds settings, memory, and shell history for the session.
 
 ## Add StringCost Tracking
 
@@ -220,14 +219,14 @@ Run the same one-time gateway script as for Claude Code:
 bash <(curl -fsSL https://raw.githubusercontent.com/Pavitra-programmers/openeral/main/scripts/gateway-ensure-mnt.sh)
 ```
 
-Then create the sandbox:
+Then create the sandbox with `--project-path`:
 
 ```bash
 openshell sandbox create --tty \
   --name openeral-openclaw \
   --from ghcr.io/sandys/openeral/sandbox:just-bash \
   --provider openclaw --auto-providers \
-  -- openeral
+  -- openeral --project-path /mnt/c/Users/alice/Desktop/work/myproject
 ```
 
 Host files are accessible at the same `/mnt/...` paths inside the sandbox:
