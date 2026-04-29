@@ -96,7 +96,7 @@ openshell sandbox create --tty \
   -- openeral --project-path /mnt/c/Users/dines/OneDrive/Desktop
 ```
 
-Claude starts with that directory as its working directory and can read and write all files inside it. No PostgreSQL required — changes go directly to your host filesystem.
+Claude starts with that directory its working directory and can read and write all files inside it. No PostgreSQL required — changes go directly to your host filesystem.
 
 Your host path inside the sandbox follows this mapping:
 
