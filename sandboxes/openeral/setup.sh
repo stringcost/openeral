@@ -57,6 +57,12 @@ fi
 # Workspace ID defaults to sandbox ID (set by OpenShell supervisor)
 export WORKSPACE_ID="${OPENSHELL_SANDBOX_ID:-default}"
 
+# Capture the sandbox user's real HOME before we override it when launching agents.
+# `openshell sandbox connect` gives a shell with this HOME (typically /sandbox),
+# not /home/agent. We write a .bashrc there so reconnect sessions automatically
+# set HOME=/home/agent and export StringCost env vars.
+SANDBOX_USER_HOME="${HOME:-/sandbox}"
+
 # Agent kind — injected by the `openclaw` generic provider as OPENERAL_AGENT=openclaw.
 # OpenShell wraps ALL generic provider credentials as openshell:resolve:env:* placeholders,
 # so OPENERAL_AGENT may arrive as a placeholder string rather than the literal "openclaw".
@@ -484,6 +490,17 @@ if [ -n "${STRINGCOST_PROXY_URL:-}" ]; then
   if ! grep -q 'openeral/env.sh' "$BASHRC" 2>/dev/null; then
     printf '\n[ -f ~/.openeral/env.sh ] && . ~/.openeral/env.sh\n' >> "$BASHRC"
   fi
+
+  # openshell sandbox connect gives a shell with HOME=$SANDBOX_USER_HOME (e.g. /sandbox),
+  # not /home/agent. Write a .bashrc there so `claude` in a reconnect session uses the
+  # right HOME and routes through StringCost — no need to prefix with HOME=/home/agent.
+  if [ "$SANDBOX_USER_HOME" != "/home/agent" ] && [ -n "$SANDBOX_USER_HOME" ]; then
+    CONNECT_BASHRC="$SANDBOX_USER_HOME/.bashrc"
+    if ! grep -q 'openeral-connect' "$CONNECT_BASHRC" 2>/dev/null; then
+      printf '\n# openeral-connect: set agent HOME and StringCost env for sandbox connect sessions\nexport HOME=/home/agent\n[ -f /home/agent/.openeral/env.sh ] && . /home/agent/.openeral/env.sh\n' \
+        >> "$CONNECT_BASHRC"
+    fi
+  fi
 fi
 
 echo "setup.sh: flushing /home/agent to workspace..."
@@ -577,6 +594,8 @@ const file = dir + '/openclaw.json';
 let config = {};
 try { config = JSON.parse(fs.readFileSync(file, 'utf8')); } catch(e) {}
 if (!config.env) config.env = {};
+if (!config.gateway) config.gateway = {};
+if (!config.gateway.mode) config.gateway.mode = 'local';
 if (!config.agents) config.agents = {};
 if (!config.agents.defaults) config.agents.defaults = {};
 if (!config.agents.defaults.model) config.agents.defaults.model = {};
@@ -605,7 +624,7 @@ console.log('setup.sh: openclaw config written to ' + file);
   # process launched in the background, rather than `openclaw gateway start`
   # which requires a systemd user session.
   echo "setup.sh: starting openclaw gateway..."
-  HOME=/home/agent openclaw gateway --port 18789 </dev/null >/tmp/openclaw-gateway.log 2>&1 &
+  HOME=/home/agent openclaw gateway --port 18789 --allow-unconfigured </dev/null >/tmp/openclaw-gateway.log 2>&1 &
   _gw_pid=$!
   # Wait up to 30s for the gateway WebSocket port to open
   _gd=0
