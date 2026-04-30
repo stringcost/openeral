@@ -152,13 +152,14 @@ export ANTHROPIC_API_KEY='sk-ant-...'
 openshell gateway start
 
 openshell sandbox create --tty \
-  --name openeral-openclaw \
   --from ghcr.io/sandys/openeral/sandbox:just-bash \
   --provider openclaw --auto-providers \
   -- openeral
 ```
 
 `--auto-providers` picks up `ANTHROPIC_API_KEY` from your shell and injects it alongside the `openclaw` provider. Without PostgreSQL, OpenEral uses embedded PGlite for the session lifetime.
+
+> **If Claude Code launches instead of OpenClaw**, the `openclaw` provider was not created or was not passed. Run the `openshell provider create` command above (one-time) and ensure you pass `--provider openclaw` in the sandbox create command.
 
 To route OpenClaw through StringCost the same way Claude Code does, follow [Add StringCost Tracking](#add-stringcost-tracking) but set `AGENT_LABEL='openclaw'` so the presign is tagged for the OpenClaw vendor row in StringCost's portfolio.
 

@@ -411,7 +411,7 @@ node -e "
 
     const agentKind = process.env.OPENERAL_AGENT || 'claude';
     const autoDirs = agentKind === 'openclaw'
-      ? ['/', '/.config']
+      ? ['/', '/.config', '/.openclaw']
       : ['/', '/.claude', '/.claude/projects'];
     const seedFiles = agentKind === 'openclaw'
       ? {}
@@ -554,20 +554,82 @@ if [ "$OPENERAL_AGENT" = "openclaw" ]; then
       exit 1
     fi
   fi
+
+  # Write ~/.openclaw/openclaw.json so openclaw starts with the right model and
+  # API credentials. StringCost proxy takes priority; falls back to a bare API key.
+  # The API key is NOT stored when it is an OpenShell placeholder — openclaw's
+  # Node.js process still resolves it via the OpenShell HTTP proxy at runtime.
+  echo "setup.sh: writing openclaw config..."
+  HOME=/home/agent node -e "
+const fs = require('fs');
+const dir = process.env.HOME + '/.openclaw';
+const file = dir + '/openclaw.json';
+let config = {};
+try { config = JSON.parse(fs.readFileSync(file, 'utf8')); } catch(e) {}
+if (!config.env) config.env = {};
+if (!config.agents) config.agents = {};
+if (!config.agents.defaults) config.agents.defaults = {};
+if (!config.agents.defaults.model) config.agents.defaults.model = {};
+config.agents.defaults.model.primary = 'anthropic/claude-sonnet-4-6';
+const proxyUrl = process.env.STRINGCOST_PROXY_URL || '';
+if (proxyUrl) {
+  config.env.ANTHROPIC_BASE_URL = proxyUrl;
+  config.env.ANTHROPIC_AUTH_TOKEN = 'dummy';
+  delete config.env.ANTHROPIC_API_KEY;
+} else {
+  const key = process.env.ANTHROPIC_API_KEY || '';
+  if (key && !key.startsWith('openshell:resolve:env:')) {
+    config.env.ANTHROPIC_API_KEY = key;
+  }
+  delete config.env.ANTHROPIC_BASE_URL;
+  delete config.env.ANTHROPIC_AUTH_TOKEN;
+}
+fs.mkdirSync(dir, { recursive: true, mode: 0o700 });
+fs.writeFileSync(file, JSON.stringify(config, null, 2), { mode: 0o600 });
+console.log('setup.sh: openclaw config written to ' + file);
+"
+
+  # OpenClaw uses a gateway/client architecture: the gateway (ws://127.0.0.1:18789)
+  # must be running before the openclaw client is launched.
+  echo "setup.sh: starting openclaw gateway..."
+  HOME=/home/agent openclaw gateway start 2>/dev/null || true
+  # Wait up to 30s for the gateway WebSocket port to open
+  _gd=0
+  while [ $_gd -lt 300 ]; do
+    HOME=/home/agent node -e "
+const net = require('net');
+const s = net.createConnection(18789, '127.0.0.1');
+s.on('connect', () => { s.destroy(); process.exit(0); });
+s.on('error', () => { process.exit(1); });
+setTimeout(() => process.exit(1), 500);
+" 2>/dev/null && break
+    [ $_gd -eq 40 ] && echo "setup.sh: waiting for openclaw gateway (ws://127.0.0.1:18789)..." >&2
+    sleep 0.1
+    _gd=$((_gd+1))
+  done
+  if HOME=/home/agent node -e "
+const net = require('net');
+const s = net.createConnection(18789, '127.0.0.1');
+s.on('connect', () => { s.destroy(); process.exit(0); });
+s.on('error', () => { process.exit(1); });
+setTimeout(() => process.exit(1), 500);
+" 2>/dev/null; then
+    echo "setup.sh: openclaw gateway ready"
+  else
+    echo "setup.sh: warning: openclaw gateway not ready — openclaw will prompt to start it" >&2
+  fi
+
   echo "setup.sh: launching OpenClaw..."
+  # Auth credentials are now in ~/.openclaw/openclaw.json, not env vars.
+  # Strip STRINGCOST_API_KEY (presign-creation only) and any stale auth tokens.
   if [ -n "${STRINGCOST_PROXY_URL:-}" ]; then
-    # Route OpenClaw's Anthropic API calls through the StringCost proxy so its
-    # token spend, COGS, and revenue land in StringCost's vendor portfolio
-    # under the `openclaw` label. Strip STRINGCOST_API_KEY before exec — it's
-    # only needed for presign creation.
-    exec env -u STRINGCOST_API_KEY -u ANTHROPIC_AUTH_TOKEN \
+    exec env -u STRINGCOST_API_KEY -u ANTHROPIC_AUTH_TOKEN -u ANTHROPIC_API_KEY \
       HOME=/home/agent \
       SHELL=/usr/local/bin/openeral-bash \
       PATH="$PATH" \
-      ANTHROPIC_BASE_URL="$STRINGCOST_PROXY_URL" \
       openclaw "$@"
   else
-    exec env \
+    exec env -u STRINGCOST_API_KEY \
       HOME=/home/agent \
       SHELL=/usr/local/bin/openeral-bash \
       PATH="$PATH" \

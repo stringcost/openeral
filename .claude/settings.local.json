@@ -99,7 +99,10 @@
       "Bash(curl -sk https://127.0.0.1:8080/openapi.json)",
       "Bash(curl -sk https://127.0.0.1:8080/health)",
       "WebFetch(domain:agent-sandbox.sigs.k8s.io)",
-      "WebFetch(domain:northflank.com)"
+      "WebFetch(domain:northflank.com)",
+      "WebFetch(domain:lumadock.com)",
+      "Bash(pnpm --prefix openeral-js check)",
+      "Bash(pnpm --prefix openeral-js lint)"
     ]
   }
 }
