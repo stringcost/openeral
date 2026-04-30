@@ -1991,8 +1991,8 @@ let s = {};
 try { s = JSON.parse(fs.readFileSync(file, 'utf8')); } catch(e) {}
 if (!s.env) s.env = {};
 s.env.ANTHROPIC_BASE_URL = process.env.STRINGCOST_PROXY_URL;
+s.env.ANTHROPIC_AUTH_TOKEN = 'dummy';
 delete s.env.ANTHROPIC_API_KEY;
-delete s.env.ANTHROPIC_AUTH_TOKEN;
 fs.mkdirSync('/home/agent/.claude', {recursive: true});
 fs.writeFileSync(file, JSON.stringify(s, null, 2));
 console.log('setup: StringCost proxy written to ~/.claude/settings.json');

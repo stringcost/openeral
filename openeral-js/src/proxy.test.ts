@@ -257,10 +257,14 @@ describe('setup.sh StringCost integration', () => {
     const cliProxyBlock = launchBlock(cli, 'setup: launching Claude Code');
     expect(setupProxyBlock).not.toMatch(/-u ANTHROPIC_API_KEY/);
     expect(cliProxyBlock).not.toMatch(/-u ANTHROPIC_API_KEY/);
+    // ANTHROPIC_API_KEY must be deleted (never stored in settings.json).
     expect(setup).toContain('delete s.env.ANTHROPIC_API_KEY');
-    expect(setup).toContain('delete s.env.ANTHROPIC_AUTH_TOKEN');
     expect(cli).toContain('delete s.env.ANTHROPIC_API_KEY');
-    expect(cli).toContain('delete s.env.ANTHROPIC_AUTH_TOKEN');
+    // ANTHROPIC_AUTH_TOKEN is set to a dummy placeholder so Claude Code does not
+    // prompt for re-authentication on reconnect. StringCost authenticates via the
+    // presign token in ANTHROPIC_BASE_URL, not via the Bearer token Claude sends.
+    expect(setup).toContain("s.env.ANTHROPIC_AUTH_TOKEN = 'dummy'");
+    expect(cli).toContain("s.env.ANTHROPIC_AUTH_TOKEN = 'dummy'");
   });
 
   it('preserves ANTHROPIC_API_KEY in setup.sh direct-auth launches', () => {
