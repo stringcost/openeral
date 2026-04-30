@@ -102,7 +102,9 @@
       "WebFetch(domain:northflank.com)",
       "WebFetch(domain:lumadock.com)",
       "Bash(pnpm --prefix openeral-js check)",
-      "Bash(pnpm --prefix openeral-js lint)"
+      "Bash(pnpm --prefix openeral-js lint)",
+      "Bash(openshell provider *)",
+      "Bash(bash -n sandboxes/openeral/setup.sh)"
     ]
   }
 }

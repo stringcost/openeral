@@ -58,8 +58,18 @@ fi
 export WORKSPACE_ID="${OPENSHELL_SANDBOX_ID:-default}"
 
 # Agent kind — injected by the `openclaw` generic provider as OPENERAL_AGENT=openclaw.
-# Defaults to claude when the provider is absent.
-export OPENERAL_AGENT="${OPENERAL_AGENT:-claude}"
+# OpenShell wraps ALL generic provider credentials as openshell:resolve:env:* placeholders,
+# so OPENERAL_AGENT may arrive as a placeholder string rather than the literal "openclaw".
+# Since OPENERAL_AGENT is only ever set by the openclaw provider, any non-empty value
+# (literal or placeholder) means openclaw is active.
+case "${OPENERAL_AGENT:-}" in
+  openclaw|openshell:resolve:env:*)
+    export OPENERAL_AGENT="openclaw"
+    ;;
+  *)
+    export OPENERAL_AGENT="claude"
+    ;;
+esac
 
 # Agent label written into the StringCost presign metadata. The vendor portfolio
 # report in StringCost reads `metadata.labels` to attribute usage to a specific
