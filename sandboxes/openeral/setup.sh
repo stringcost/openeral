@@ -3,7 +3,7 @@ set -euo pipefail
 
 # setup.sh — OpenEral sandbox entry point
 #
-# Called by: openshell sandbox create ... -- openeral [--project-path /mnt/...]
+# Called by: openshell sandbox create ... -- openeral [--shell]
 # (or, equivalently, -- /opt/openeral/setup.sh — the `openeral` name is a
 # /usr/local/bin shim installed in the Dockerfile.)
 #
@@ -11,17 +11,18 @@ set -euo pipefail
 #   1. Run database migrations
 #   2. Seed the workspace
 #   3. Start openeral-bash daemon
-#   4. Exec Claude Code
+#   4. Exec the selected agent (Claude Code or OpenClaw), or drop to bash (--shell)
 
-# Parse --project-path from args before handing the rest to claude/openclaw.
-# Must be under /mnt/ (host filesystem) — any other prefix is rejected.
-PROJECT_PATH=""
+# Parse --shell flag before forwarding remaining args to the agent.
+# --shell: run setup then drop to an interactive bash where both
+#          `claude` and `openclaw` are available.
+SHELL_MODE=0
 PASSTHROUGH_ARGS=()
 while [[ $# -gt 0 ]]; do
   case "$1" in
-    --project-path)
-      PROJECT_PATH="${2:-}"
-      shift 2
+    --shell)
+      SHELL_MODE=1
+      shift
       ;;
     *)
       PASSTHROUGH_ARGS+=("$1")
@@ -309,6 +310,11 @@ fi
 # Apply proxy to Claude Code settings if we have one. OpenClaw has no
 # ~/.claude/settings.json — it picks up ANTHROPIC_BASE_URL from the env at
 # launch (see the OpenClaw exec block further down).
+#
+# ANTHROPIC_AUTH_TOKEN is set to a dummy value so Claude Code does not prompt
+# for re-authentication when ANTHROPIC_API_KEY is absent (e.g. on reconnect).
+# StringCost authenticates via the presign token embedded in ANTHROPIC_BASE_URL,
+# not via the Bearer token Claude sends, so any non-empty value works here.
 if [ -n "${STRINGCOST_PROXY_URL:-}" ] && [ "$OPENERAL_AGENT" != "openclaw" ]; then
   echo "setup.sh: writing StringCost proxy to ~/.claude/settings.json..."
   node -e "
@@ -318,8 +324,8 @@ let s = {};
 try { s = JSON.parse(fs.readFileSync(file, 'utf8')); } catch(e) {}
 if (!s.env) s.env = {};
 s.env.ANTHROPIC_BASE_URL = process.env.STRINGCOST_PROXY_URL;
+s.env.ANTHROPIC_AUTH_TOKEN = 'dummy';
 delete s.env.ANTHROPIC_API_KEY;
-delete s.env.ANTHROPIC_AUTH_TOKEN;
 fs.mkdirSync('/home/agent/.claude', {recursive: true});
 fs.writeFileSync(file, JSON.stringify(s, null, 2));
 console.log('setup.sh: StringCost proxy written to ~/.claude/settings.json');
@@ -449,12 +455,25 @@ let s = {};
 try { s = JSON.parse(fs.readFileSync(file, 'utf8')); } catch(e) {}
 if (!s.env) s.env = {};
 s.env.ANTHROPIC_BASE_URL = process.env.STRINGCOST_PROXY_URL;
+s.env.ANTHROPIC_AUTH_TOKEN = 'dummy';
 delete s.env.ANTHROPIC_API_KEY;
-delete s.env.ANTHROPIC_AUTH_TOKEN;
 fs.mkdirSync('/home/agent/.claude', {recursive: true});
 fs.writeFileSync(file, JSON.stringify(s, null, 2));
 console.log('setup.sh: StringCost proxy written to ~/.claude/settings.json');
 "
+fi
+
+# Persist ANTHROPIC_BASE_URL to the shell environment so reconnect sessions
+# (openshell sandbox connect) also route through StringCost even if
+# ~/.claude/settings.json is reset by `claude init` or similar.
+if [ -n "${STRINGCOST_PROXY_URL:-}" ]; then
+  mkdir -p /home/agent/.openeral
+  printf 'export ANTHROPIC_BASE_URL="%s"\nexport ANTHROPIC_AUTH_TOKEN="dummy"\n' \
+    "$STRINGCOST_PROXY_URL" > /home/agent/.openeral/env.sh
+  BASHRC=/home/agent/.bashrc
+  if ! grep -q 'openeral/env.sh' "$BASHRC" 2>/dev/null; then
+    printf '\n[ -f ~/.openeral/env.sh ] && . ~/.openeral/env.sh\n' >> "$BASHRC"
+  fi
 fi
 
 echo "setup.sh: flushing /home/agent to workspace..."
@@ -511,6 +530,19 @@ else
   trap "rm -f /tmp/openeral-bash.sock" EXIT
 fi
 
+# Shell mode: drop to an interactive bash where both `claude` and `openclaw`
+# are available. ~/.openeral/env.sh is already written by the block above;
+# export ANTHROPIC_BASE_URL here so the exec'd bash inherits it directly.
+if [ "$SHELL_MODE" = "1" ]; then
+  [ -n "${STRINGCOST_PROXY_URL:-}" ] && export ANTHROPIC_BASE_URL="$STRINGCOST_PROXY_URL" ANTHROPIC_AUTH_TOKEN="dummy"
+  echo "setup.sh: shell mode ready — run 'claude' or 'openclaw' to start an agent"
+  exec env \
+    HOME=/home/agent \
+    SHELL=/usr/local/bin/openeral-bash \
+    PATH="$PATH" \
+    /bin/bash.real
+fi
+
 if [ "$OPENERAL_AGENT" = "openclaw" ]; then
   # OpenClaw is baked into the image (see Dockerfile).
   # This fallback handles stale images — if you hit it, rebuild the image.
@@ -521,15 +553,6 @@ if [ "$OPENERAL_AGENT" = "openclaw" ]; then
       echo "setup.sh: ERROR: OpenClaw install failed" >&2
       exit 1
     fi
-  fi
-  if [ -n "$PROJECT_PATH" ]; then
-    case "$PROJECT_PATH" in
-      /mnt/*) ;;
-      *) echo "setup.sh: --project-path must be under /mnt/ (got: $PROJECT_PATH)" >&2; exit 1 ;;
-    esac
-    [ -d "$PROJECT_PATH" ] || { echo "setup.sh: --project-path not found: $PROJECT_PATH" >&2; exit 1; }
-    cd "$PROJECT_PATH"
-    echo "setup.sh: working directory set to $PROJECT_PATH"
   fi
   echo "setup.sh: launching OpenClaw..."
   if [ -n "${STRINGCOST_PROXY_URL:-}" ]; then
@@ -568,15 +591,6 @@ fi
 # auth-mode selection. Export the proxy here so it's picked up before
 # settings.json is consulted. STRINGCOST_API_KEY is only needed for presign
 # creation — remove it before handing control to Claude Code.
-if [ -n "$PROJECT_PATH" ]; then
-  case "$PROJECT_PATH" in
-    /mnt/*) ;;
-    *) echo "setup.sh: --project-path must be under /mnt/ (got: $PROJECT_PATH)" >&2; exit 1 ;;
-  esac
-  [ -d "$PROJECT_PATH" ] || { echo "setup.sh: --project-path not found: $PROJECT_PATH" >&2; exit 1; }
-  cd "$PROJECT_PATH"
-  echo "setup.sh: working directory set to $PROJECT_PATH"
-fi
 echo "setup.sh: launching Claude Code..."
 if [ -n "${STRINGCOST_PROXY_URL:-}" ]; then
   exec env -u STRINGCOST_API_KEY -u ANTHROPIC_AUTH_TOKEN \

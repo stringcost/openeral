@@ -23,7 +23,6 @@ filesystem_policy:
     - /dev/null
     - /home/agent
     - /home/**
-    - /mnt/**
 
 landlock:
   compatibility: best_effort

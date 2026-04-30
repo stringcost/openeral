@@ -78,35 +78,6 @@ Reuse the same sandbox name on every machine, and point it at the same `DATABASE
 
 Do not pass the database URL through an OpenShell generic provider. PostgreSQL is raw TCP, so the credential must be delivered by `--upload`.
 
-## Work on Host Project Files
-
-OpenEral can read and write files on your host machine directly. Run once after the gateway starts (safe to re-run — skips if already done):
-
-```bash
-./scripts/gateway-ensure-mnt.sh
-```
-
-Then create the sandbox with `--project-path` pointing at your project:
-
-```bash
-openshell sandbox create --tty \
-  --name openeral-claude \
-  --from ghcr.io/sandys/openeral/sandbox:just-bash \
-  --provider claude --auto-providers \
-  -- openeral --project-path /mnt/c/Users/dines/OneDrive/Desktop
-```
-
-Claude starts with that directory as its working directory and can read and write all files inside it. No PostgreSQL required — changes go directly to your host filesystem.
-
-Your host path inside the sandbox follows this mapping:
-
-| Host location | Path inside sandbox |
-|---|---|
-| `C:\Users\alice\myproject` (WSL) | `/mnt/c/Users/alice/myproject` |
-| `/home/alice/myproject` (Linux) | `/mnt/home/alice/myproject` |
-
-The `--project-path` must be under `/mnt/`. Claude's home directory (`/home/agent`) stays inside the sandbox and holds settings, memory, and shell history for the session.
-
 ## Add StringCost Tracking
 
 StringCost is optional. It routes Claude API calls through a presigned proxy URL for token and cost metering. Both Claude Code and OpenClaw can route through StringCost — set the `metadata.labels` entry below to `claude-code` or `openclaw` so the StringCost vendor portfolio attributes the spend to the right agent.
@@ -216,34 +187,40 @@ rm -f /tmp/openeral-db-url
 
 Reuse `--name openeral-openclaw` on every machine and point it at the same `DATABASE_URL`. OpenEral uses the sandbox name as the workspace ID, so the same PostgreSQL-backed home restores after deletion or on another host.
 
-## Work on Host Project Files (OpenClaw)
-
-Run the same one-time gateway script as for Claude Code:
-
-```bash
-bash <(curl -fsSL https://raw.githubusercontent.com/Pavitra-programmers/openeral/main/scripts/gateway-ensure-mnt.sh)
-```
-
-Then create the sandbox with `--project-path`:
-
-```bash
-openshell sandbox create --tty \
-  --name openeral-openclaw \
-  --from ghcr.io/sandys/openeral/sandbox:just-bash \
-  --provider openclaw --auto-providers \
-  -- openeral --project-path /mnt/c/Users/alice/Desktop/work/myproject
-```
-
-Host files are accessible at the same `/mnt/...` paths inside the sandbox:
-
-| Host location | Path inside sandbox |
-|---|---|
-| `C:\Users\alice\myproject` (WSL) | `/mnt/c/Users/alice/myproject` |
-| `/home/alice/myproject` (Linux) | `/mnt/home/alice/myproject` |
-
 ## Add StringCost Tracking (OpenClaw)
 
-StringCost cost tracking is not supported for OpenClaw. OpenClaw authenticates directly with the Anthropic API using your `ANTHROPIC_API_KEY` — there is no presign proxy step. Use your Anthropic console's usage dashboard to monitor spend when running OpenClaw.
+Follow the [Add StringCost Tracking](#add-stringcost-tracking) steps above with `AGENT_LABEL='openclaw'`. The presign flow is identical — `setup.sh` routes OpenClaw's Anthropic API calls through the StringCost proxy when `ANTHROPIC_BASE_URL` is set, and the `openclaw` label in `metadata.labels` attributes usage to the OpenClaw row in the StringCost vendor portfolio.
+
+## Run Both Agents in One Sandbox
+
+Pass `--shell` to start a sandbox where you can launch either Claude Code or OpenClaw from an interactive bash prompt:
+
+```bash
+export ANTHROPIC_API_KEY='sk-ant-...'
+
+openshell gateway start
+
+openshell sandbox create --tty \
+  --name openeral \
+  --from ghcr.io/sandys/openeral/sandbox:just-bash \
+  --provider claude --auto-providers \
+  -- openeral --shell
+```
+
+After setup completes you land in a bash shell inside the sandbox. Run whichever agent you want:
+
+```bash
+claude       # start Claude Code
+openclaw     # start OpenClaw
+```
+
+To reconnect to the same sandbox in a later terminal session:
+
+```bash
+openshell sandbox connect openeral
+```
+
+PostgreSQL persistence and StringCost tracking compose with `--shell` the same way as the agent-specific commands — add `--upload /tmp/openeral-db-url:/sandbox/db-url` for persistence, or upload a presign file via `--upload "$OPENERAL_INPUT:/sandbox/openeral-input"` for StringCost. When StringCost is active, `ANTHROPIC_BASE_URL` is exported to the shell (and written to `~/.openeral/env.sh`), so both `claude` and `openclaw` route through the proxy automatically.
 
 ## Manage Sandboxes
 
