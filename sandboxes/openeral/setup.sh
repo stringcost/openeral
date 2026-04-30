@@ -478,7 +478,7 @@ fi
 # ~/.claude/settings.json is reset by `claude init` or similar.
 if [ -n "${STRINGCOST_PROXY_URL:-}" ]; then
   mkdir -p /home/agent/.openeral
-  printf 'export ANTHROPIC_BASE_URL="%s"\nexport ANTHROPIC_AUTH_TOKEN="dummy"\n' \
+  printf 'export ANTHROPIC_BASE_URL="%s"\nexport ANTHROPIC_AUTH_TOKEN="dummy"\nunset ANTHROPIC_API_KEY\n' \
     "$STRINGCOST_PROXY_URL" > /home/agent/.openeral/env.sh
   BASHRC=/home/agent/.bashrc
   if ! grep -q 'openeral/env.sh' "$BASHRC" 2>/dev/null; then
@@ -601,8 +601,12 @@ console.log('setup.sh: openclaw config written to ' + file);
 
   # OpenClaw uses a gateway/client architecture: the gateway (ws://127.0.0.1:18789)
   # must be running before the openclaw client is launched.
+  # In containers (no systemd), use `openclaw gateway --port 18789` as a foreground
+  # process launched in the background, rather than `openclaw gateway start`
+  # which requires a systemd user session.
   echo "setup.sh: starting openclaw gateway..."
-  HOME=/home/agent openclaw gateway start 2>/dev/null || true
+  HOME=/home/agent openclaw gateway --port 18789 </dev/null >/tmp/openclaw-gateway.log 2>&1 &
+  _gw_pid=$!
   # Wait up to 30s for the gateway WebSocket port to open
   _gd=0
   while [ $_gd -lt 300 ]; do
@@ -624,9 +628,10 @@ s.on('connect', () => { s.destroy(); process.exit(0); });
 s.on('error', () => { process.exit(1); });
 setTimeout(() => process.exit(1), 500);
 " 2>/dev/null; then
-    echo "setup.sh: openclaw gateway ready"
+    echo "setup.sh: openclaw gateway ready (pid $_gw_pid)"
   else
-    echo "setup.sh: warning: openclaw gateway not ready — openclaw will prompt to start it" >&2
+    echo "setup.sh: warning: openclaw gateway not ready after 30s — check /tmp/openclaw-gateway.log" >&2
+    cat /tmp/openclaw-gateway.log >&2 || true
   fi
 
   echo "setup.sh: launching OpenClaw..."

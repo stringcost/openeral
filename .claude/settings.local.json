@@ -104,7 +104,8 @@
       "Bash(pnpm --prefix openeral-js check)",
       "Bash(pnpm --prefix openeral-js lint)",
       "Bash(openshell provider *)",
-      "Bash(bash -n sandboxes/openeral/setup.sh)"
+      "Bash(bash -n sandboxes/openeral/setup.sh)",
+      "Bash(openclaw --help)"
     ]
   }
 }
