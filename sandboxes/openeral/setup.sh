@@ -626,9 +626,9 @@ console.log('setup.sh: openclaw config written to ' + file);
   echo "setup.sh: starting openclaw gateway..."
   HOME=/home/agent openclaw gateway --port 18789 --allow-unconfigured </dev/null >/tmp/openclaw-gateway.log 2>&1 &
   _gw_pid=$!
-  # Wait up to 30s for the gateway WebSocket port to open
+  # Wait up to 120s for the gateway WebSocket port to open (first run installs ~11 plugins)
   _gd=0
-  while [ $_gd -lt 300 ]; do
+  while [ $_gd -lt 1200 ]; do
     HOME=/home/agent node -e "
 const net = require('net');
 const s = net.createConnection(18789, '127.0.0.1');
@@ -649,9 +649,37 @@ setTimeout(() => process.exit(1), 500);
 " 2>/dev/null; then
     echo "setup.sh: openclaw gateway ready (pid $_gw_pid)"
   else
-    echo "setup.sh: warning: openclaw gateway not ready after 30s — check /tmp/openclaw-gateway.log" >&2
+    echo "setup.sh: warning: openclaw gateway not ready after 120s — check /tmp/openclaw-gateway.log" >&2
     cat /tmp/openclaw-gateway.log >&2 || true
   fi
+
+  # Re-apply auth credentials: the gateway modifies openclaw.json during startup
+  # (adds gateway.auth.token, may clobber env settings on first run). Write our
+  # auth settings back now that the gateway has finished its own modifications.
+  echo "setup.sh: re-applying openclaw auth config..."
+  HOME=/home/agent node -e "
+const fs = require('fs');
+const dir = process.env.HOME + '/.openclaw';
+const file = dir + '/openclaw.json';
+let config = {};
+try { config = JSON.parse(fs.readFileSync(file, 'utf8')); } catch(e) {}
+if (!config.env) config.env = {};
+const proxyUrl = process.env.STRINGCOST_PROXY_URL || '';
+if (proxyUrl) {
+  config.env.ANTHROPIC_BASE_URL = proxyUrl;
+  config.env.ANTHROPIC_AUTH_TOKEN = 'dummy';
+  delete config.env.ANTHROPIC_API_KEY;
+} else {
+  const key = process.env.ANTHROPIC_API_KEY || '';
+  if (key && !key.startsWith('openshell:resolve:env:')) {
+    config.env.ANTHROPIC_API_KEY = key;
+  }
+  delete config.env.ANTHROPIC_BASE_URL;
+  delete config.env.ANTHROPIC_AUTH_TOKEN;
+}
+fs.writeFileSync(file, JSON.stringify(config, null, 2), { mode: 0o600 });
+console.log('setup.sh: openclaw auth config applied');
+"
 
   echo "setup.sh: launching OpenClaw..."
   # Auth credentials are now in ~/.openclaw/openclaw.json, not env vars.
