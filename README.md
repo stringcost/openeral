@@ -89,7 +89,7 @@ export STRINGCOST_API_KEY='sk-st-...'
 OPENERAL_INPUT="$(mktemp -d)"
 
 # Use 'claude-code' for Claude Code; switch to 'openclaw' when launching OpenClaw.
-AGENT_LABEL='claude-code'
+AGENT_LABEL='openclaw'
 
 curl -fsS https://app.stringcost.com/v1/presign \
   -H "Authorization: Bearer $STRINGCOST_API_KEY" \
@@ -119,9 +119,9 @@ openshell provider create --name stringcost --type generic \
     --credential "STRINGCOST_API_KEY=$STRINGCOST_API_KEY"
 
 openshell sandbox create --tty \
-  --from ghcr.io/sandys/openeral/sandbox:just-bash \
+  --from ghcr.io/pavitra-programmers/openeral/sandbox:just-bash \
   --upload "$OPENERAL_INPUT:/sandbox/openeral-input" \
-  --provider claude --provider stringcost --auto-providers \
+  --provider openclaw --provider stringcost --auto-providers \
   -- openeral
 
 rm -rf "$OPENERAL_INPUT"
@@ -152,7 +152,7 @@ export ANTHROPIC_API_KEY='sk-ant-...'
 openshell gateway start
 
 openshell sandbox create --tty \
-  --from ghcr.io/sandys/openeral/sandbox:just-bash \
+  --from ghcr.io/pavitra-programmers/openeral/sandbox:just-bash \
   --provider openclaw --auto-providers \
   -- openeral
 ```
@@ -177,8 +177,7 @@ printf '%s' "$DATABASE_URL" > /tmp/openeral-db-url
 chmod 600 /tmp/openeral-db-url
 
 openshell sandbox create --tty \
-  --name openeral-openclaw \
-  --from ghcr.io/sandys/openeral/sandbox:just-bash \
+  --from ghcr.io/pavitra-programmers/openeral/sandbox:just-bash \
   --upload /tmp/openeral-db-url:/sandbox/db-url \
   --provider openclaw --auto-providers \
   -- openeral

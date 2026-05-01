@@ -620,6 +620,18 @@ fs.writeFileSync(file, JSON.stringify(config, null, 2), { mode: 0o600 });
 console.log('setup.sh: openclaw config written to ' + file);
 "
 
+  # Warn if OpenClaw has no credentials to call the Anthropic API.
+  # ANTHROPIC_API_KEY may be an openshell:resolve:env:* placeholder (resolved by
+  # the OpenShell HTTP proxy) — that is fine. An empty value means the sandbox was
+  # created without the key being exported in the host shell.
+  if [ -z "${STRINGCOST_PROXY_URL:-}" ] && [ -z "${ANTHROPIC_API_KEY:-}" ]; then
+    echo "setup.sh: WARNING: ANTHROPIC_API_KEY is not set and no StringCost presign is available." >&2
+    echo "setup.sh: OpenClaw will start but cannot make Anthropic API calls — responses will hang." >&2
+    echo "setup.sh: Fix: export ANTHROPIC_API_KEY='sk-ant-...' in your host shell before" >&2
+    echo "setup.sh:      running 'openshell sandbox create', then create a new sandbox." >&2
+    echo "setup.sh:      If your key is in .env: set -a; source .env; set +a" >&2
+  fi
+
   # OpenClaw uses a gateway/client architecture: the gateway (ws://127.0.0.1:18789)
   # must be running before the openclaw client is launched.
   # In containers (no systemd), use `openclaw gateway --port 18789` as a foreground
@@ -640,17 +652,23 @@ console.log('setup.sh: openclaw config written to ' + file);
   # Wait up to 120s for /readyz (NOT just TCP).
   # TCP opens well before the WebSocket RPC layer is live; /readyz returns 200
   # only once the gateway is truly ready to accept client connections.
+  # The gateway stages 35 bundled npm packages on every cold start, which can take
+  # several minutes on slow networks. Wait up to 300s (5 min) before giving up.
   _gd=0
-  while [ $_gd -lt 120 ]; do
+  while [ $_gd -lt 300 ]; do
     curl -fsS http://127.0.0.1:18789/readyz >/dev/null 2>&1 && break
-    [ $_gd -eq 10 ] && echo "setup.sh: waiting for openclaw gateway readiness (/readyz)..." >&2
+    [ $_gd -eq 10 ] && echo "setup.sh: waiting for openclaw gateway readiness (/readyz) — this can take a few minutes on first run..." >&2
+    [ $_gd -eq 60 ] && echo "setup.sh: still waiting for gateway (staging bundled deps)..." >&2
+    [ $_gd -eq 120 ] && echo "setup.sh: still waiting for gateway (2 min)..." >&2
+    [ $_gd -eq 180 ] && echo "setup.sh: still waiting for gateway (3 min)..." >&2
+    [ $_gd -eq 240 ] && echo "setup.sh: still waiting for gateway (4 min)..." >&2
     sleep 1
     _gd=$((_gd+1))
   done
   if curl -fsS http://127.0.0.1:18789/readyz >/dev/null 2>&1; then
     echo "setup.sh: openclaw gateway ready (pid $_gw_pid)"
   else
-    echo "setup.sh: warning: openclaw gateway not ready after 120s — check /tmp/openclaw-gateway.log" >&2
+    echo "setup.sh: warning: openclaw gateway not ready after 300s — check /tmp/openclaw-gateway.log" >&2
     cat /tmp/openclaw-gateway.log >&2 || true
   fi
 
