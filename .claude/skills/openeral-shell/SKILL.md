@@ -41,19 +41,6 @@ echo "POSTGRES_URL=${POSTGRES_URL:+(set)}"
 openshell gateway info >/dev/null 2>&1 || openshell gateway start --recreate
 ```
 
-### Step 2.5: Inject host filesystem into the gateway container
-
-This makes `/mnt` (your host drives) visible inside the sandbox. On WSL, Windows drives appear at `/mnt/c/`, `/mnt/d/` etc. The script auto-detects WSL2 vs native Linux and picks the right approach.
-
-```bash
-bash <(curl -fsSL https://raw.githubusercontent.com/Pavitra-programmers/openeral/main/scripts/gateway-ensure-mnt.sh)
-```
-
-For native Linux, to skip the sudo prompt on every launch (one-time):
-```bash
-echo "$(whoami) ALL=(ALL) NOPASSWD: /usr/bin/nsenter" | sudo tee /etc/sudoers.d/openeral-nsenter
-```
-
 ### Step 3: Create providers
 
 The skill argument determines the agent. If the user passed `openclaw`, use the OpenClaw path; otherwise default to Claude Code.
