@@ -29,7 +29,7 @@ function setupStringCostNormalizer(): string {
   const marker = 'normalize_stringcost_proxy_url() {';
   const start = setup.indexOf(marker);
   expect(start).toBeGreaterThanOrEqual(0);
-  const endMarker = '\n\nif [ -n "${STRINGCOST_PROXY_URL:-}" ]; then';
+  const endMarker = '\nif [ -n "${STRINGCOST_PROXY_URL:-}" ]; then';
   const end = setup.indexOf(endMarker, start);
   expect(end).toBeGreaterThan(start);
   return setup.slice(start, end);
@@ -223,7 +223,8 @@ describe('setup.sh StringCost integration', () => {
   });
 
   it('extracts StringCost URLs from noisy presign output', () => {
-    expect(setup).toMatch(/raw\.match\(\/https:\\\/\\\/proxy\\\.stringcost\\\.com\\\/stringcost-proxy\\\/t\\\/\[\^\\s/);
+    // Updated regex now supports both hosted and self-hosted StringCost
+    expect(setup).toContain('raw.match(/https?:\\/\\/[^\\s');
     expect(setup).toContain('const candidate = match ? match[0] : raw;');
     expect(setup).toContain('const url = new URL(candidate);');
   });
@@ -256,14 +257,18 @@ describe('setup.sh StringCost integration', () => {
     const cliProxyBlock = launchBlock(cli, 'setup: launching Claude Code');
     expect(setupProxyBlock).not.toMatch(/-u ANTHROPIC_API_KEY/);
     expect(cliProxyBlock).not.toMatch(/-u ANTHROPIC_API_KEY/);
+    // ANTHROPIC_API_KEY must be deleted (never stored in settings.json).
     expect(setup).toContain('delete s.env.ANTHROPIC_API_KEY');
-    expect(setup).toContain('delete s.env.ANTHROPIC_AUTH_TOKEN');
     expect(cli).toContain('delete s.env.ANTHROPIC_API_KEY');
-    expect(cli).toContain('delete s.env.ANTHROPIC_AUTH_TOKEN');
+    // ANTHROPIC_AUTH_TOKEN is set to a dummy placeholder so Claude Code does not
+    // prompt for re-authentication on reconnect. StringCost authenticates via the
+    // presign token in ANTHROPIC_BASE_URL, not via the Bearer token Claude sends.
+    expect(setup).toContain("s.env.ANTHROPIC_AUTH_TOKEN = 'dummy'");
+    expect(cli).toContain("s.env.ANTHROPIC_AUTH_TOKEN = 'dummy'");
   });
 
   it('preserves ANTHROPIC_API_KEY in setup.sh direct-auth launches', () => {
-    const directBranch = directAuthBranch(setup, 'setup.sh: launching Claude Code');
+    const directBranch = directAuthBranch(setup, 'setup.sh: launching Claude Code...');
     expect(directBranch).toContain('exec env');
     expect(directBranch).not.toMatch(/-u ANTHROPIC_API_KEY/);
   });

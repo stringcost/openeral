@@ -22,28 +22,36 @@ which docker    || echo "MISSING docker"
 which openshell || echo "MISSING openshell — install: https://github.com/NVIDIA/OpenShell-Community"
 which curl      || echo "MISSING curl"
 echo "ANTHROPIC_API_KEY=${ANTHROPIC_API_KEY:+(set)}"
+echo "OPENAI_API_KEY=${OPENAI_API_KEY:+(set)}"
 echo "STRINGCOST_API_KEY=${STRINGCOST_API_KEY:+(set)}"
 echo "DATABASE_URL=${DATABASE_URL:+(set)}"
 echo "POSTGRES_URL=${POSTGRES_URL:+(set)}"
 ```
 
-- `ANTHROPIC_API_KEY` is required; if missing, stop and ask the user to `export ANTHROPIC_API_KEY='sk-ant-...'`.
-- `STRINGCOST_API_KEY` is optional — enables cost tracking.
-- `DATABASE_URL` or `POSTGRES_URL` (Supabase / Neon / RDS) is optional — enables cross-sandbox persistence. It must be delivered via `openshell sandbox create --upload` (plaintext file); the provider framework wraps credentials as placeholders that pg cannot resolve.
+- **Claude Code**: `ANTHROPIC_API_KEY` is required.
+- **OpenClaw**: at least one LLM key is required — `ANTHROPIC_API_KEY` (for Anthropic models) or `OPENAI_API_KEY` (for OpenAI models).
+- `STRINGCOST_API_KEY` is optional — enables cost tracking for Claude Code (not used by OpenClaw).
+- `DATABASE_URL` or `POSTGRES_URL` (Supabase / Neon / RDS) is optional — enables cross-sandbox persistence for both agents. It must be delivered via `openshell sandbox create --upload` (plaintext file); the provider framework wraps credentials as placeholders that pg cannot resolve.
 
 ### Step 2: Start the OpenShell gateway if it's not running
 
 ```bash
 # openshell gateway info exits 0 when a gateway is active, non-zero otherwise.
-openshell gateway info >/dev/null 2>&1 || openshell gateway start
+# --recreate handles the case where the container exists but is stopped/crashed.
+openshell gateway info >/dev/null 2>&1 || openshell gateway start --recreate
 ```
 
 ### Step 3: Create providers
 
-`--auto-providers` creates the `claude` provider from the local `ANTHROPIC_API_KEY`. The optional generic `stringcost` provider must be created explicitly so the StringCost policy is attached. Create the StringCost presign on the host and upload it; inside OpenShell, provider secrets are placeholders and cannot be used as JSON body values for StringCost's `client_api_key`. Do not create a generic database provider; upload the connection string file instead.
+The skill argument determines the agent. If the user passed `openclaw`, use the OpenClaw path; otherwise default to Claude Code.
+
+#### Claude Code path (`--provider claude`)
+
+`--auto-providers` creates the `claude` provider from `ANTHROPIC_API_KEY`. StringCost is optional cost tracking. Do not create a generic database provider; upload the connection string file instead.
 
 ```bash
-PROVIDERS="--provider claude"   # claude is auto-created from ANTHROPIC_API_KEY
+AGENT="${OPENERAL_SKILL_AGENT:-claude}"   # set to "openclaw" if user asked for it
+PROVIDERS="--provider claude"
 OPENERAL_INPUT=""
 UPLOAD_ARGS=""
 
@@ -89,17 +97,92 @@ if [ -n "$OPENERAL_INPUT" ]; then
 fi
 ```
 
-### Step 4: Create the sandbox from the published image
+#### OpenClaw path (`--provider openclaw`)
+
+The `openclaw` generic provider injects `OPENERAL_AGENT=openclaw` into the sandbox so `setup.sh` launches OpenClaw instead of Claude Code. StringCost is not used; OpenClaw talks to LLM APIs directly. At least one of `ANTHROPIC_API_KEY` or `OPENAI_API_KEY` must be set.
 
 ```bash
+OPENERAL_INPUT=""
+UPLOAD_ARGS=""
+
+ensure_input_dir() {
+  if [ -z "$OPENERAL_INPUT" ]; then
+    OPENERAL_INPUT="$(mktemp -d)"
+  fi
+}
+
+# Build the credential list for the openclaw provider
+_CREDS="--credential OPENERAL_AGENT=openclaw"
+[ -n "${OPENAI_API_KEY:-}" ] && _CREDS="$_CREDS --credential OPENAI_API_KEY=$OPENAI_API_KEY"
+
+openshell provider create --name openclaw --type generic \
+  $_CREDS \
+  || openshell provider update openclaw \
+  $_CREDS
+
+PROVIDERS="--provider openclaw"
+
+DATABASE_URL="${DATABASE_URL:-${POSTGRES_URL:-}}"
+if [ -n "${DATABASE_URL:-}" ]; then
+  ensure_input_dir
+  printf '%s' "$DATABASE_URL" > "$OPENERAL_INPUT/db-url"
+  chmod 600 "$OPENERAL_INPUT/db-url"
+fi
+
+if [ -n "$OPENERAL_INPUT" ]; then
+  chmod -R go-rwx "$OPENERAL_INPUT"
+  UPLOAD_ARGS="--upload $OPENERAL_INPUT:/sandbox/openeral-input"
+fi
+```
+
+### Step 4: Create the sandbox
+
+The sandbox image's `policy.yaml` includes `/mnt/**` in `filesystem_policy.read_write`, so host files under `/mnt` are directly accessible inside the sandbox — no bind-mount injection is needed.
+
+Use the appropriate command based on the agent chosen in Step 3.
+
+**Claude Code:**
+```bash
+SANDBOX_NAME="${OPENERAL_WORKSPACE_ID:-openeral-claude}"
+
 openshell sandbox create --tty \
+  --name "$SANDBOX_NAME" \
   --from ghcr.io/sandys/openeral/sandbox:just-bash \
   $UPLOAD_ARGS \
-  $PROVIDERS --auto-providers \
+  --provider claude --auto-providers \
   -- openeral
 ```
 
-The `stringcost` provider from Step 3 is attached only when `STRINGCOST_API_KEY` is set. The upload directory is used because OpenShell accepts one `--upload` flag; `setup.sh` reads `/sandbox/openeral-input/db-url` and `/sandbox/openeral-input/presign.json` when present.
+**OpenClaw:**
+```bash
+SANDBOX_NAME="${OPENERAL_WORKSPACE_ID:-openeral-openclaw}"
+
+openshell sandbox create --tty \
+  --name "$SANDBOX_NAME" \
+  --from ghcr.io/sandys/openeral/sandbox:just-bash \
+  $UPLOAD_ARGS \
+  --provider openclaw --auto-providers \
+  -- openeral
+```
+
+The upload directory (`$UPLOAD_ARGS`) is used because OpenShell accepts one `--upload` flag. `setup.sh` reads `/sandbox/openeral-input/db-url` and `/sandbox/openeral-input/presign.json` when present. The `openclaw` provider injects `OPENERAL_AGENT=openclaw` so `setup.sh` launches OpenClaw instead of Claude Code.
+
+## Accessing host project files inside the sandbox
+
+Once the sandbox is running and `/mnt` has been injected, Claude Code and OpenClaw can both read and write files on your host machine. The path inside the sandbox mirrors the host:
+
+| Where your project lives | Path inside the sandbox |
+|---|---|
+| WSL: `C:\Users\alice\myproject` | `/mnt/c/Users/alice/myproject` |
+| Linux: `/home/alice/myproject` | `/mnt/home/alice/myproject` |
+
+Tell Claude the full `/mnt/...` path once it starts:
+
+```
+My project is at /mnt/c/Users/alice/Desktop/work/myproject — please work on files there.
+```
+
+Claude's Read, Write, Edit, Bash, and Glob tools all work on `/mnt/...` paths.
 
 ## What happens after launch
 

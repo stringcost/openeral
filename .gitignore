@@ -25,6 +25,9 @@ dist/
 # Build artifacts
 *.tar
 
+# Machine-specific Claude Code local settings (auto-generated, not portable)
+.claude/settings.local.json
+
 # Editor swap files
 *.swp
 *.swo

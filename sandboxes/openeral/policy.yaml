@@ -59,6 +59,26 @@ network_policies:
       - { path: /usr/local/bin/claude }
       - { path: /usr/bin/node }
 
+  # --- OpenClaw (Anthropic API) ---
+  # OpenClaw's gateway binary is /usr/local/bin/openclaw (npm global install),
+  # which is distinct from /usr/local/bin/claude. Without this entry,
+  # enforcement: enforce on the claude_code policy drops all outbound OpenClaw
+  # connections to api.anthropic.com, causing every agent response to hang.
+  openclaw_anthropic:
+    name: openclaw-anthropic
+    endpoints:
+      - host: api.anthropic.com
+        port: 443
+        protocol: rest
+        tls: terminate
+        enforcement: enforce
+        access: full
+      - { host: statsig.anthropic.com, port: 443 }
+    binaries:
+      - { path: /usr/bin/openclaw }
+      - { path: /usr/local/bin/openclaw }
+      - { path: /usr/bin/node }
+
   # --- Socket.dev package registry ---
   # When --provider socket is configured with SOCKET_TOKEN, npm traffic
   # routes to registry.socket.dev. The proxy resolves the placeholder
@@ -81,10 +101,17 @@ network_policies:
       - { path: /usr/bin/node }
 
   # --- npm (default registry, when Socket.dev is not configured) ---
+  # github.com + *.githubusercontent.com: native-module postinstall scripts
+  # (e.g. sharp, used by openclaw) fetch pre-built binaries from GitHub releases.
   npm_registry:
     name: npm-registry
     endpoints:
       - { host: registry.npmjs.org, port: 443 }
+      - { host: github.com, port: 443 }
+      - { host: objects.githubusercontent.com, port: 443 }
+      - { host: release-assets.githubusercontent.com, port: 443 }
+      - { host: raw.githubusercontent.com, port: 443 }
+      - { host: codeload.github.com, port: 443 }
     binaries:
       - { path: /usr/bin/npm }
       - { path: /usr/bin/node }
@@ -193,6 +220,8 @@ network_policies:
         access: full
     binaries:
       - { path: /usr/local/bin/claude }
+      - { path: /usr/bin/openclaw }
+      - { path: /usr/local/bin/openclaw }
       - { path: /usr/bin/node }
 
   # --- External PostgreSQL (Supabase) via HTTP CONNECT tunnel ---
@@ -278,6 +307,32 @@ network_policies:
       - { host: aws-0-sa-east-1.pooler.supabase.com, port: 6543 }
       - { host: aws-1-sa-east-1.pooler.supabase.com, port: 5432 }
       - { host: aws-1-sa-east-1.pooler.supabase.com, port: 6543 }
+    binaries:
+      - { path: /usr/bin/node }
+
+  # --- OpenClaw install script ---
+  # openclaw.ai serves the official install script. The npm install that
+  # follows hits registry.npmjs.org (covered by npm_registry above).
+  openclaw_install:
+    name: openclaw-install
+    endpoints:
+      - { host: openclaw.ai, port: 443 }
+    binaries:
+      - { path: /usr/bin/curl }
+      - { path: /usr/bin/wget }
+
+  # --- OpenClaw (OpenAI API) ---
+  # OpenClaw can target OpenAI models; credential injection via tls: terminate
+  # resolves the OPENAI_API_KEY placeholder at egress.
+  openclaw_openai:
+    name: openclaw-openai
+    endpoints:
+      - host: api.openai.com
+        port: 443
+        protocol: rest
+        tls: terminate
+        enforcement: enforce
+        access: full
     binaries:
       - { path: /usr/bin/node }
 

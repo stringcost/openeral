@@ -144,8 +144,10 @@ async function createPresignUrl(anthropicKey: string, stringcostKey: string): Pr
 }
 
 
-type ParsedArgs = 
-  | { kind: 'launch'; workspaceId: string; claudeArgs: string[] }
+type AgentKind = 'claude' | 'openclaw';
+
+type ParsedArgs =
+  | { kind: 'launch'; workspaceId: string; claudeArgs: string[]; agent: AgentKind }
   | { kind: 'memory-refresh'; workspaceId: string; projectRoot: string; query: string; dryRun: boolean; backup: boolean }
   | { kind: 'help' };
 
@@ -197,6 +199,7 @@ export function parseCliArgs(args: string[]): ParsedArgs {
   // Default: launch mode
   let workspaceId = process.env.OPENERAL_WORKSPACE_ID || 'openeral-claude';
   let claudeArgs: string[] = [];
+  let agent: AgentKind = 'claude';
 
   const dashIdx = args.indexOf('--');
   const ownArgs = dashIdx >= 0 ? args.slice(0, dashIdx) : args;
@@ -205,20 +208,23 @@ export function parseCliArgs(args: string[]): ParsedArgs {
   for (let i = 0; i < ownArgs.length; i++) {
     if ((ownArgs[i] === '--workspace' || ownArgs[i] === '-w') && ownArgs[i + 1]) {
       workspaceId = ownArgs[++i];
+    } else if (ownArgs[i] === '--agent' && ownArgs[i + 1]) {
+      const a = ownArgs[++i];
+      if (a === 'openclaw' || a === 'claude') agent = a as AgentKind;
     }
   }
 
   // Normalize workspace ID to be Kubernetes-compliant (lowercase, alphanumeric + hyphens)
   const originalId = workspaceId;
   workspaceId = workspaceId.toLowerCase().replace(/[^a-z0-9-]/g, '-').replace(/^-+|-+$/g, '').replace(/-{2,}/g, '-');
-  
+
   // Prevent empty workspace ID
   if (workspaceId.length === 0) {
     workspaceId = 'openeral-claude';
     process.stderr.write(`\x1b[33mwarning: workspace ID "${originalId}" normalized to empty string, using default: ${workspaceId}\x1b[0m\n`);
   }
 
-  return { kind: 'launch', workspaceId, claudeArgs };
+  return { kind: 'launch', workspaceId, claudeArgs, agent };
 }
 
 function printHelp(): void {
@@ -234,6 +240,7 @@ function printHelp(): void {
 
 Launch Options:
   --workspace, -w <id>    Workspace ID (default: openeral-claude)
+  --agent <kind>          Agent to launch: claude (default) or openclaw
   --dev, -d               Use local dev image instead of published image
   --help, -h              Show this help
 
@@ -339,67 +346,6 @@ export async function downloadOrgSkills(homeDir: string, apiKey: string): Promis
 // ---------------------------------------------------------------------------
 // OpenShell sandbox launch
 // ---------------------------------------------------------------------------
-
-/**
- * Non-destructively ensure /mnt is bind-mounted into the gateway container.
- * Does NOT recreate the container.
- */
-async function ensureGatewayHasMntMount(): Promise<void> {
-  // Check if /mnt is already a mountpoint inside the gateway container.
-  // Important: HostConfig.Binds only captures mounts configured at container
-  // creation time (-v flags). Mounts added dynamically via nsenter from a prior
-  // run never appear in HostConfig.Binds, so we must check the live mount table.
-  const mountCheck = spawnSync('docker', [
-    'exec', 'openshell-cluster-openshell',
-    'mountpoint', '-q', '/mnt'
-  ], { stdio: 'pipe', timeout: 5000 });
-
-  if (mountCheck.status === 0) {
-    process.stderr.write('\x1b[32m✓ /mnt already mounted in gateway container\x1b[0m\n');
-    return;
-  }
-
-  // Get the container PID for nsenter
-  const pidResult = spawnSync('docker', [
-    'inspect', 'openshell-cluster-openshell',
-    '--format', '{{.State.Pid}}'
-  ], { stdio: 'pipe', timeout: 5000 });
-
-  if (pidResult.status !== 0) {
-    process.stderr.write('\x1b[33mwarning: could not get gateway container PID\x1b[0m\n');
-    return;
-  }
-
-  const pid = pidResult.stdout.toString().trim();
-  const nsenterArgs = ['-t', pid, '--mount', '--', 'mount', '--rbind', '/mnt', '/mnt'];
-
-  // Attempt 1: nsenter without sudo (works when this process is already root).
-  let mounted = spawnSync('nsenter', nsenterArgs, { stdio: 'pipe', timeout: 15000 }).status === 0;
-
-  // Attempt 2: sudo -n nsenter — non-interactive, succeeds only with passwordless sudo.
-  if (!mounted) {
-    mounted = spawnSync('sudo', ['-n', 'nsenter', ...nsenterArgs], { stdio: 'pipe', timeout: 15000 }).status === 0;
-  }
-
-  // Attempt 3: interactive sudo — inherit stdio so the password prompt is visible
-  // and the user can type their password.  This is the normal path for anyone
-  // who has sudo but hasn't configured passwordless access.
-  if (!mounted) {
-    process.stderr.write('\x1b[2mopeneral: mounting host filesystem — sudo password may be required...\x1b[0m\n');
-    mounted = spawnSync('sudo', ['nsenter', ...nsenterArgs], { stdio: 'inherit', timeout: 60000 }).status === 0;
-  }
-
-  if (mounted) {
-    process.stderr.write('\x1b[32m✓ /mnt bind-mounted into gateway container\x1b[0m\n');
-  } else {
-    process.stderr.write(
-      'warning: host filesystem (/mnt) not mounted in gateway container.\n' +
-      'To avoid this prompt permanently, configure passwordless sudo for nsenter:\n' +
-      '  echo "$(whoami) ALL=(ALL) NOPASSWD: /usr/bin/nsenter" | sudo tee /etc/sudoers.d/openeral-nsenter\n' +
-      'Sandbox will have limited filesystem access.\n'
-    );
-  }
-}
 
 /**
  * Detect and fix broken TLS by regenerating certs in-place (no container recreation).
@@ -1033,106 +979,6 @@ async function cleanupExistingSandbox(workspaceId: string): Promise<void> {
 }
 
 /**
- * Background task: inject /mnt into the running sandbox container via nsenter.
- *
- * Strategy: wait for the pod to reach Running state, then use `crictl` inside
- * the k3s node container to find the container PID and `nsenter` into its mount
- * namespace to bind-mount /mnt.  No pod restart is performed, so the setup
- * script continues uninterrupted and Claude Code launches normally.
- *
- * Works on any Linux-based system where the k3s node container has:
- *   - crictl (standard in k3s distributions)
- *   - nsenter (part of util-linux, available on all modern Linux distros)
- *   - /mnt accessible (ensured by ensureGatewayHasMntMount which runs first)
- */
-async function injectMntIntoSandbox(workspaceId: string): Promise<void> {
-  // Poll until the sandbox pod is Running (up to 300 s at 500 ms intervals)
-  let podName = '';
-  for (let i = 0; i < 600; i++) {
-    await new Promise(resolve => setTimeout(resolve, 500));
-    const r = spawnSync('docker', [
-      'exec', 'openshell-cluster-openshell',
-      'kubectl', '--insecure-skip-tls-verify',
-      'get', 'pods', '-n', 'openshell',
-      '-l', `agents.x-k8s.io/sandbox-name=${workspaceId}`,
-      '-o', 'jsonpath={.items[0].metadata.name}/{.items[0].status.phase}',
-    ], { stdio: 'pipe', timeout: 10000 });
-    if (r.status === 0) {
-      const out = (r.stdout ?? Buffer.from('')).toString().trim();
-      const slash = out.indexOf('/');
-      if (slash > 0 && out.slice(slash + 1) === 'Running') {
-        podName = out.slice(0, slash);
-        break;
-      }
-    }
-  }
-
-  if (!podName) {
-    process.stderr.write('\x1b[33mwarning: sandbox pod not ready after 300s — /mnt injection skipped\x1b[0m\n');
-
-    // Emit k8s events so the user can see exactly why the pod is Pending.
-    // Common causes: missing provider secret, image pull failure, resource limits.
-    const eventsResult = spawnSync('docker', [
-      'exec', 'openshell-cluster-openshell',
-      'kubectl', '--insecure-skip-tls-verify',
-      'get', 'events', '-n', 'openshell',
-      '--sort-by=.lastTimestamp',
-      '-o', 'wide',
-    ], { stdio: 'pipe', timeout: 10000 });
-
-    if (eventsResult.status === 0) {
-      const allEvents = eventsResult.stdout.toString();
-      const relevant = allEvents.split('\n')
-        .filter(line => !line.startsWith('LAST SEEN') && line.trim() !== '')
-        .join('\n');
-      if (relevant) {
-        process.stderr.write(`\x1b[2m  sandbox pod events (for diagnosis):\n${relevant}\x1b[0m\n`);
-      }
-    }
-
-    return;
-  }
-
-  // Use crictl inside the k3s node to find the container PID, then nsenter
-  // into its mount namespace and bind-mount /mnt (no-op if already mounted).
-  //
-  // grep -Eo '"pid": *[1-9][0-9]*' matches the first non-zero pid field in the
-  // crictl inspect JSON output, working across both compact and pretty-printed
-  // JSON and across all Linux grep variants (GNU and BSD).
-  const injectScript =
-    `CONTAINER_ID=$(crictl ps ` +
-      `--label 'io.kubernetes.pod.name=${podName}' ` +
-      `--label 'io.kubernetes.pod.namespace=openshell' ` +
-      `-q 2>/dev/null | head -1); ` +
-    `if [ -z "$CONTAINER_ID" ]; then ` +
-      `echo "crictl: no container for pod ${podName}" >&2; exit 1; ` +
-    `fi; ` +
-    `PID=$(crictl inspect "$CONTAINER_ID" 2>/dev/null ` +
-      `| grep -Eo '"pid": *[1-9][0-9]*' ` +
-      `| grep -Eo '[1-9][0-9]*' | head -1); ` +
-    `if [ -z "$PID" ]; then ` +
-      `echo "crictl: could not get container PID for $CONTAINER_ID" >&2; exit 1; ` +
-    `fi; ` +
-    `nsenter -t "$PID" --mount -- ` +
-      `sh -c 'mountpoint -q /mnt 2>/dev/null && exit 0; mount --rbind /mnt /mnt'`;
-
-  const injectResult = spawnSync('docker', [
-    'exec', 'openshell-cluster-openshell',
-    'sh', '-c', injectScript,
-  ], { stdio: 'pipe', timeout: 30000 });
-
-  if (injectResult.status === 0) {
-    process.stderr.write('\x1b[32m✓ Host filesystem injected into sandbox\x1b[0m\n');
-  } else {
-    const stderr = (injectResult.stderr ?? Buffer.from('')).toString().trim();
-    process.stderr.write(
-      `\x1b[33mwarning: /mnt injection failed${stderr ? ': ' + stderr : ' (crictl/nsenter unavailable?)'}\x1b[0m\n` +
-      `\x1b[2m  Sandbox will run without host filesystem access\x1b[0m\n`,
-    );
-  }
-}
-
-/**
  * Ensure iptables DNAT rules exist inside the gateway container so traffic
  * arriving at container-eth0:8080 and loopback:8080 is forwarded to the
  * openshell-0 pod IP on port 8080.
@@ -1328,7 +1174,7 @@ async function cmdPresignRenew(): Promise<void> {
  *      setup.sh runs migrations, seeds the workspace, starts the
  *      openeral-bash daemon, then execs `claude`.
  */
-async function launchViaSandbox(workspaceId: string, claudeArgs: string[], devMode = false): Promise<void> {
+async function launchViaSandbox(workspaceId: string, claudeArgs: string[], devMode = false, agent: AgentKind = 'claude'): Promise<void> {
   const sandboxImage = devMode
     ? (process.env.OPENERAL_DEV_IMAGE ?? 'openeral-sandbox:dev')
     : (process.env.OPENERAL_SANDBOX_IMAGE ?? 'ghcr.io/sandys/openeral/sandbox:just-bash');
@@ -1554,51 +1400,8 @@ async function launchViaSandbox(workspaceId: string, claudeArgs: string[], devMo
   // Ensure sandbox image is available in k3s cluster
   await ensureSandboxImage(sandboxImage);
 
-  // Non-destructively ensure /mnt is accessible in gateway container
-  await ensureGatewayHasMntMount();
-
   // Check if sandbox already exists and delete it
   await cleanupExistingSandbox(workspaceId);
-
-  // Presign-first auth model:
-  //   - Stored presign present → use it; ANTHROPIC_API_KEY and STRINGCOST_API_KEY are not needed.
-  //   - No stored presign       → require both keys to create one now, then store it.
-  // Run `npx openeral presign renew` to replace the stored presign at any time.
-  let stringcostUrl: string | undefined;
-  const storedPresign = loadStoredPresign();
-  if (storedPresign) {
-    // Reuse the stored permanent presign — no env vars required
-    stringcostUrl = stringCostProxyBaseUrl(storedPresign.url);
-    process.stderr.write('\x1b[32m✓ Using stored StringCost presign\x1b[0m\n');
-    process.stderr.write(`\x1b[2m  Proxy URL: ${stringcostUrl}\x1b[0m\n`);
-  } else {
-    // No stored presign — both keys are required to create one
-    const anthropicKey = (process.env.ANTHROPIC_API_KEY ?? '').replace('@anthropic_api_key', '').trim();
-    const stringcostKey = (process.env.STRINGCOST_API_KEY ?? '').replace('@stringcost_api_key', '').trim();
-
-    if (!anthropicKey || !stringcostKey) {
-      process.stderr.write(
-        '\x1b[31merror: no stored presign found and required keys are missing.\x1b[0m\n' +
-        'Either run `npx openeral presign renew` once (requires both keys), or set:\n' +
-        '  ANTHROPIC_API_KEY=sk-ant-...   your Anthropic API key\n' +
-        '  STRINGCOST_API_KEY=...          your StringCost API key\n' +
-        'Once created, the presign is stored permanently and no keys are needed again.\n',
-      );
-      process.exit(1);
-    }
-
-    process.stderr.write('\x1b[2mopeneral: no stored presign — creating permanent presign...\x1b[0m\n');
-    try {
-      const fullUrl = await createPresignUrl(anthropicKey, stringcostKey);
-      saveStoredPresign(fullUrl, stringcostKey);
-      stringcostUrl = stringCostProxyBaseUrl(fullUrl);
-      process.stderr.write('\x1b[32m✓ StringCost presign created and stored (expires_in=-1, max_uses=-1, cost_limit=$10)\x1b[0m\n');
-    } catch (err) {
-      const error = err instanceof Error ? err : new Error(String(err));
-      process.stderr.write('\x1b[31merror: failed to create StringCost presign: ' + error.message + '\x1b[0m\n');
-      process.exit(1);
-    }
-  }
 
   // Build `openshell sandbox create` arguments.
   // --name   maps to OPENSHELL_SANDBOX_ID inside the container, which
@@ -1606,18 +1409,76 @@ async function launchViaSandbox(workspaceId: string, claudeArgs: string[], devMo
   // --auto-providers creates/resolves named LLM providers automatically.
   // PostgreSQL credentials are uploaded as a file because OpenShell generic
   // provider placeholders are not usable by raw TCP clients like pg.
-  // When a presign is in use we do NOT include --provider claude: the sandbox
-  // authenticates via the presign URL written to ~/.claude/settings.json and
-  // must never see ANTHROPIC_API_KEY.
   const sandboxArgs: string[] = [
     'sandbox', 'create',
     '--name', workspaceId,
     '--from', sandboxImage,
   ];
 
-  if (!stringcostUrl && process.env.ANTHROPIC_API_KEY) {
-    // Fallback (no presign): inject the raw API key via the claude provider
-    sandboxArgs.push('--provider', 'claude');
+  // Presign-first auth model (Claude Code only — OpenClaw uses direct API key auth).
+  //   - Stored presign present → use it; ANTHROPIC_API_KEY and STRINGCOST_API_KEY are not needed.
+  //   - No stored presign       → require both keys to create one now, then store it.
+  // Run `npx openeral presign renew` to replace the stored presign at any time.
+  let stringcostUrl: string | undefined;
+  let keyUploadPath: string | undefined;
+  if (agent === 'openclaw') {
+    // OpenClaw authenticates directly with the Anthropic API — no presign proxy.
+    // The openclaw provider credential arrives inside the sandbox as an opaque
+    // openshell:resolve:env:* placeholder that OpenClaw cannot use. Deliver the
+    // real key by writing it to a temp file and uploading it as a file so
+    // setup.sh can write the actual value into ~/.openclaw/openclaw.json.
+    const anthropicKey = (process.env.ANTHROPIC_API_KEY ?? '').trim();
+    if (!anthropicKey) {
+      process.stderr.write(
+        '\x1b[31merror: ANTHROPIC_API_KEY is required for OpenClaw.\x1b[0m\n',
+      );
+      process.exit(1);
+    }
+    keyUploadPath = join(tmpdir(), `openeral-anthropic-key-${process.pid}-${Date.now()}`);
+    writeFileSync(keyUploadPath, anthropicKey, { mode: 0o600 });
+    try { chmodSync(keyUploadPath, 0o600); } catch {}
+    sandboxArgs.push('--upload', `${keyUploadPath}:/sandbox/anthropic-api-key`);
+    sandboxArgs.push('--provider', 'openclaw');
+  } else {
+    const storedPresign = loadStoredPresign();
+    if (storedPresign) {
+      // Reuse the stored permanent presign — no env vars required
+      stringcostUrl = stringCostProxyBaseUrl(storedPresign.url);
+      process.stderr.write('\x1b[32m✓ Using stored StringCost presign\x1b[0m\n');
+      process.stderr.write(`\x1b[2m  Proxy URL: ${stringcostUrl}\x1b[0m\n`);
+    } else {
+      // No stored presign — both keys are required to create one
+      const anthropicKey = (process.env.ANTHROPIC_API_KEY ?? '').replace('@anthropic_api_key', '').trim();
+      const stringcostKey = (process.env.STRINGCOST_API_KEY ?? '').replace('@stringcost_api_key', '').trim();
+
+      if (!anthropicKey || !stringcostKey) {
+        process.stderr.write(
+          '\x1b[31merror: no stored presign found and required keys are missing.\x1b[0m\n' +
+          'Either run `npx openeral presign renew` once (requires both keys), or set:\n' +
+          '  ANTHROPIC_API_KEY=sk-ant-...   your Anthropic API key\n' +
+          '  STRINGCOST_API_KEY=...          your StringCost API key\n' +
+          'Once created, the presign is stored permanently and no keys are needed again.\n',
+        );
+        process.exit(1);
+      }
+
+      process.stderr.write('\x1b[2mopeneral: no stored presign — creating permanent presign...\x1b[0m\n');
+      try {
+        const fullUrl = await createPresignUrl(anthropicKey, stringcostKey);
+        saveStoredPresign(fullUrl, stringcostKey);
+        stringcostUrl = stringCostProxyBaseUrl(fullUrl);
+        process.stderr.write('\x1b[32m✓ StringCost presign created and stored (expires_in=-1, max_uses=-1, cost_limit=$10)\x1b[0m\n');
+      } catch (err) {
+        const error = err instanceof Error ? err : new Error(String(err));
+        process.stderr.write('\x1b[31merror: failed to create StringCost presign: ' + error.message + '\x1b[0m\n');
+        process.exit(1);
+      }
+    }
+
+    if (!stringcostUrl && process.env.ANTHROPIC_API_KEY) {
+      // Fallback (no presign): inject the raw API key via the claude provider
+      sandboxArgs.push('--provider', 'claude');
+    }
   }
 
   const dbUrl = process.env.DATABASE_URL || process.env.POSTGRES_URL || '';
@@ -1635,32 +1496,32 @@ async function launchViaSandbox(workspaceId: string, claudeArgs: string[], devMo
 
   sandboxArgs.push('--auto-providers');
 
-  // Resolve the StringCost API key for org skills download.
-  // Priority: env var > key stored alongside presign.
-  // If the env var is set and differs from the stored key, update the stored copy
-  // so future launches download skills automatically without the env var.
-  const envSkillsKey = (process.env.STRINGCOST_API_KEY ?? '').replace('@stringcost_api_key', '').trim();
-  const storedSkillsKey = storedPresign?.stringcostApiKey?.trim() ?? '';
-  const stringcostKeyForSkills = envSkillsKey || storedSkillsKey;
-
-  if (envSkillsKey && storedPresign && envSkillsKey !== storedSkillsKey) {
-    saveStoredPresign(storedPresign.url, envSkillsKey);
-    process.stderr.write('\x1b[2mopeneral: stored StringCost API key updated from env\x1b[0m\n');
-  }
-
-  // Fetch org skills on the host and embed them as a base64 payload in the
-  // setup script.  The sandbox never sees the API key — only the already-
-  // downloaded bundle (base64-encoded JSON) is passed in.
+  // Org skills and inline setup script are Claude Code-only.
+  // OpenClaw routes through setup.sh (-- openeral) which handles everything.
   let skillsBase64 = '';
-  if (stringcostKeyForSkills) {
-    process.stderr.write('\x1b[2mopeneral: downloading org skills...\x1b[0m\n');
-    try {
-      const skills = await fetchOrgSkills(stringcostKeyForSkills);
-      skillsBase64 = Buffer.from(JSON.stringify(skills)).toString('base64');
-      process.stderr.write(`\x1b[32m✓ Downloaded ${skills.length} org skill${skills.length !== 1 ? 's' : ''}\x1b[0m\n`);
-    } catch (err: unknown) {
-      const msg = err instanceof Error ? err.message : String(err);
-      process.stderr.write(`\x1b[33mwarn: org skills download failed: ${msg} — continuing without org skills\x1b[0m\n`);
+  if (agent !== 'openclaw') {
+    // Resolve the StringCost API key for org skills download.
+    // Priority: env var > key stored alongside presign.
+    const storedPresignForSkills = loadStoredPresign();
+    const envSkillsKey = (process.env.STRINGCOST_API_KEY ?? '').replace('@stringcost_api_key', '').trim();
+    const storedSkillsKey = storedPresignForSkills?.stringcostApiKey?.trim() ?? '';
+    const stringcostKeyForSkills = envSkillsKey || storedSkillsKey;
+
+    if (envSkillsKey && storedPresignForSkills && envSkillsKey !== storedSkillsKey) {
+      saveStoredPresign(storedPresignForSkills.url, envSkillsKey);
+      process.stderr.write('\x1b[2mopeneral: stored StringCost API key updated from env\x1b[0m\n');
+    }
+
+    if (stringcostKeyForSkills) {
+      process.stderr.write('\x1b[2mopeneral: downloading org skills...\x1b[0m\n');
+      try {
+        const skills = await fetchOrgSkills(stringcostKeyForSkills);
+        skillsBase64 = Buffer.from(JSON.stringify(skills)).toString('base64');
+        process.stderr.write(`\x1b[32m✓ Downloaded ${skills.length} org skill${skills.length !== 1 ? 's' : ''}\x1b[0m\n`);
+      } catch (err: unknown) {
+        const msg = err instanceof Error ? err.message : String(err);
+        process.stderr.write(`\x1b[33mwarn: org skills download failed: ${msg} — continuing without org skills\x1b[0m\n`);
+      }
     }
   }
 
@@ -1804,8 +1665,8 @@ let s = {};
 try { s = JSON.parse(fs.readFileSync(file, 'utf8')); } catch(e) {}
 if (!s.env) s.env = {};
 s.env.ANTHROPIC_BASE_URL = process.env.STRINGCOST_PROXY_URL;
+s.env.ANTHROPIC_AUTH_TOKEN = 'dummy';
 delete s.env.ANTHROPIC_API_KEY;
-delete s.env.ANTHROPIC_AUTH_TOKEN;
 fs.mkdirSync('/home/agent/.claude', {recursive: true});
 fs.writeFileSync(file, JSON.stringify(s, null, 2));
 console.log('setup: StringCost proxy written to ~/.claude/settings.json');
@@ -1895,7 +1756,14 @@ else
 fi
 `;
 
-  sandboxArgs.push('--', 'bash', '-c', setupScript, '--', ...claudeArgs);
+  if (agent === 'openclaw') {
+    // OpenClaw: delegate entirely to setup.sh (the `openeral` shim in the image).
+    // setup.sh reads OPENERAL_AGENT=openclaw from the openclaw provider and handles
+    // migrations, seeding, daemon, and openclaw launch.
+    sandboxArgs.push('--', 'openeral', ...claudeArgs);
+  } else {
+    sandboxArgs.push('--', 'bash', '-c', setupScript, '--', ...claudeArgs);
+  }
 
   // Pre-flight: verify DATABASE_URL is reachable from the host before launching.
   // A bad URL causes the migration step inside the sandbox to fail, which puts
@@ -1949,21 +1817,41 @@ fi
   // the secrets exist when the pod is scheduled.
   process.stderr.write('\x1b[2mopeneral: registering providers...\x1b[0m\n');
 
-  // claude provider — only needed when NOT using presign (injects ANTHROPIC_API_KEY).
-  // When a presign is in use, the sandbox authenticates via the presign URL written to
-  // ~/.claude/settings.json and ANTHROPIC_API_KEY must not be injected.
-  if (!stringcostUrl && process.env.ANTHROPIC_API_KEY) {
-    const claudeProvider = spawnSync('openshell', [
-      'provider', 'create', '--name', 'claude', '--type', 'generic', '--credential', 'ANTHROPIC_API_KEY',
-    ], { stdio: 'pipe', timeout: 30000 });
-    if (claudeProvider.status === 0) {
-      process.stderr.write('\x1b[32m✓ Claude provider registered\x1b[0m\n');
+  if (agent === 'openclaw') {
+    // openclaw provider injects OPENERAL_AGENT=openclaw so setup.sh launches OpenClaw.
+    const creds = ['--credential', 'OPENERAL_AGENT=openclaw'];
+    const createResult = spawnSync('openshell', ['provider', 'create', '--name', 'openclaw', '--type', 'generic', ...creds],
+      { stdio: 'pipe', timeout: 30000 });
+    if (createResult.status !== 0) {
+      // Non-zero exit expected when provider already exists — update it.
+      const updateResult = spawnSync('openshell', ['provider', 'update', 'openclaw', ...creds],
+        { stdio: 'pipe', timeout: 30000 });
+      if (updateResult.status !== 0) {
+        process.stderr.write('\x1b[31merror: failed to register OpenClaw provider — is `openshell` installed and the gateway running?\x1b[0m\n');
+        if (keyUploadPath) { try { rmSync(keyUploadPath, { force: true }); } catch {} }
+        if (dbUploadPath) { try { rmSync(dbUploadPath, { force: true }); } catch {} }
+        process.exit(1);
+      }
     }
-    // Non-zero exit is expected when the provider already exists — that's fine.
+    process.stderr.write('\x1b[32m✓ OpenClaw provider registered\x1b[0m\n');
+  } else {
+    // claude provider — only needed when NOT using presign (injects ANTHROPIC_API_KEY).
+    // When a presign is in use, the sandbox authenticates via the presign URL written to
+    // ~/.claude/settings.json and ANTHROPIC_API_KEY must not be injected.
+    if (!stringcostUrl && process.env.ANTHROPIC_API_KEY) {
+      const claudeProvider = spawnSync('openshell', [
+        'provider', 'create', '--name', 'claude', '--type', 'generic', '--credential', 'ANTHROPIC_API_KEY',
+      ], { stdio: 'pipe', timeout: 30000 });
+      if (claudeProvider.status === 0) {
+        process.stderr.write('\x1b[32m✓ Claude provider registered\x1b[0m\n');
+      }
+      // Non-zero exit is expected when the provider already exists — that's fine.
+    }
   }
 
+  const agentLabel = agent === 'openclaw' ? 'OpenClaw' : 'Claude Code';
   process.stderr.write(
-    `\x1b[2mopeneral: launching Claude Code in OpenShell sandbox (${workspaceId})...\x1b[0m\n` +
+    `\x1b[2mopeneral: launching ${agentLabel} in OpenShell sandbox (${workspaceId})...\x1b[0m\n` +
     `\x1b[2m  (if startup stalls for >3 min, press Ctrl+C and retry with OPENERAL_AUTO_FIX_TLS=1)\x1b[0m\n\n`,
   );
 
@@ -1985,15 +1873,13 @@ fi
     );
   }, STARTUP_WARN_MS);
 
-  // Background: inject /mnt into the running sandbox container via nsenter
-  injectMntIntoSandbox(workspaceId).catch((err: unknown) => {
-    process.stderr.write(`\x1b[33mwarning: /mnt injection failed: ${(err instanceof Error ? err.message : String(err))}\x1b[0m\n`);
-  });
-
   child.on('error', (err: NodeJS.ErrnoException) => {
     clearTimeout(startupWarnTimer);
     if (dbUploadPath) {
       try { rmSync(dbUploadPath, { force: true }); } catch {}
+    }
+    if (keyUploadPath) {
+      try { rmSync(keyUploadPath, { force: true }); } catch {}
     }
     process.stderr.write(`\x1b[31merror: ${err.message}\x1b[0m\n`);
     process.exit(1);
@@ -2003,6 +1889,9 @@ fi
     clearTimeout(startupWarnTimer);
     if (dbUploadPath) {
       try { rmSync(dbUploadPath, { force: true }); } catch {}
+    }
+    if (keyUploadPath) {
+      try { rmSync(keyUploadPath, { force: true }); } catch {}
     }
     process.exit(code ?? 0);
   });
@@ -2104,12 +1993,13 @@ export async function main() {
     }
   }
 
-  const { workspaceId, claudeArgs } = parsed;
+  const { workspaceId, claudeArgs, agent } = parsed;
 
   process.stderr.write(`\x1b[2mopeneral: workspace  ${workspaceId}\x1b[0m\n`);
+  process.stderr.write(`\x1b[2mopeneral: agent      ${agent}\x1b[0m\n`);
   if (devMode) {
     const devImage = process.env.OPENERAL_DEV_IMAGE ?? 'openeral-sandbox:dev';
     process.stderr.write(`\x1b[2mopeneral: mode       dev (${devImage})\x1b[0m\n`);
   }
-  await launchViaSandbox(workspaceId, claudeArgs, devMode);
+  await launchViaSandbox(workspaceId, claudeArgs, devMode, agent);
 }

@@ -80,7 +80,7 @@ Do not pass the database URL through an OpenShell generic provider. PostgreSQL i
 
 ## Add StringCost Tracking
 
-StringCost is optional. It routes Claude API calls through a presigned proxy URL for token and cost metering.
+StringCost is optional. It routes Claude Code API calls through a presigned proxy URL for token and cost metering.
 
 ```bash
 export ANTHROPIC_API_KEY='sk-ant-...'
@@ -98,7 +98,7 @@ curl -fsS https://app.stringcost.com/v1/presign \
     "expires_in": -1,
     "max_uses": -1,
     "cost_limit": 10000000,
-    "tags": ["openeral"]
+    "metadata": { "source": "openeral-sandbox", "client": "claude-code", "labels": ["openeral", "claude-code"] }
   }' \
   > "$OPENERAL_INPUT/presign.json"
 
@@ -118,13 +118,127 @@ openshell provider create --name stringcost --type generic \
 openshell sandbox create --tty \
   --from ghcr.io/sandys/openeral/sandbox:just-bash \
   --upload "$OPENERAL_INPUT:/sandbox/openeral-input" \
-  --provider claude --provider stringcost --auto-providers \
+  --provider claude --auto-providers \
   -- openeral
 
 rm -rf "$OPENERAL_INPUT"
 ```
 
 Create the presign on the host. Inside OpenShell, provider secrets are placeholders; they work for HTTP headers but not as JSON body values for StringCost's `client_api_key`.
+
+---
+
+## Start OpenClaw
+
+OpenClaw is an alternative AI coding agent that runs in the same image. The `openclaw` provider is what signals the sandbox to launch OpenClaw instead of Claude Code.
+
+Create the provider once (this is the only one-time step — the provider persists in your OpenShell gateway):
+
+```bash
+openshell provider create --name openclaw --type generic \
+  --credential "OPENERAL_AGENT=openclaw" \
+  || openshell provider update openclaw \
+    --credential "OPENERAL_AGENT=openclaw"
+```
+
+Then start the sandbox. The API key must be uploaded as a file — OpenShell provider credentials arrive inside the sandbox as opaque placeholders that only work for Claude Code's binary. Uploading the key as a file delivers the real value so OpenClaw can use it directly:
+
+```bash
+export ANTHROPIC_API_KEY='sk-ant-...'
+
+printf '%s' "$ANTHROPIC_API_KEY" > /tmp/openeral-key
+chmod 600 /tmp/openeral-key
+
+openshell gateway start
+
+openshell sandbox create --tty \
+  --from ghcr.io/sandys/openeral/sandbox:just-bash \
+  --upload /tmp/openeral-key:/sandbox/anthropic-api-key \
+  --provider openclaw --auto-providers \
+  -- openeral
+
+rm -f /tmp/openeral-key
+```
+
+`setup.sh` reads `/sandbox/anthropic-api-key` and writes the real key value into `~/.openclaw/openclaw.json`. Without the upload, the API key never reaches OpenClaw and every response hangs.
+
+> **If Claude Code launches instead of OpenClaw**, the `openclaw` provider was not created or was not passed. Run the `openshell provider create` command above (one-time) and ensure you pass `--provider openclaw` in the sandbox create command.
+
+To route OpenClaw through StringCost, see [Add StringCost Tracking (OpenClaw)](#add-stringcost-tracking-openclaw).
+
+## Add PostgreSQL Persistence (OpenClaw)
+
+Same connection string as Claude Code — the same `_openeral` schema and workspace table are used by both agents. Combine both uploads in a single input directory:
+
+```bash
+export ANTHROPIC_API_KEY='sk-ant-...'
+export DATABASE_URL='postgresql://...'
+export DATABASE_URL="${DATABASE_URL:-${POSTGRES_URL:-}}"
+
+OPENERAL_INPUT="$(mktemp -d)"
+printf '%s' "$ANTHROPIC_API_KEY" > "$OPENERAL_INPUT/anthropic-api-key"
+printf '%s' "$DATABASE_URL"      > "$OPENERAL_INPUT/db-url"
+chmod -R go-rwx "$OPENERAL_INPUT"
+
+openshell sandbox create --tty \
+  --name openeral-openclaw \
+  --from ghcr.io/sandys/openeral/sandbox:just-bash \
+  --upload "$OPENERAL_INPUT:/sandbox/openeral-input" \
+  --provider openclaw --auto-providers \
+  -- openeral
+
+rm -rf "$OPENERAL_INPUT"
+```
+
+Reuse `--name openeral-openclaw` on every machine and point it at the same `DATABASE_URL`. OpenEral uses the sandbox name as the workspace ID, so the same PostgreSQL-backed home restores after deletion or on another host.
+
+## Add StringCost Tracking (OpenClaw)
+
+OpenClaw needs **two** files uploaded: the presign for proxy routing, and the raw API key so OpenClaw has a non-empty `ANTHROPIC_API_KEY` before it will attempt any calls. StringCost authenticates via the presign token in the URL, not the Authorization header, so both can coexist.
+
+```bash
+export ANTHROPIC_API_KEY='sk-ant-...'
+export STRINGCOST_API_KEY='sk-st-...'
+
+OPENERAL_INPUT="$(mktemp -d)"
+
+curl -fsS https://app.stringcost.com/v1/presign \
+  -H "Authorization: Bearer $STRINGCOST_API_KEY" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "provider": "anthropic",
+    "client_api_key": "'"$ANTHROPIC_API_KEY"'",
+    "path": ["/v1/messages"],
+    "expires_in": -1,
+    "max_uses": -1,
+    "cost_limit": 10000000,
+    "metadata": { "source": "openeral-sandbox", "client": "openclaw", "labels": ["openeral", "openclaw"] }
+  }' \
+  > "$OPENERAL_INPUT/presign.json"
+
+printf '%s' "$ANTHROPIC_API_KEY" > "$OPENERAL_INPUT/anthropic-api-key"
+
+# Optional: combine PostgreSQL persistence in the same upload.
+export DATABASE_URL="${DATABASE_URL:-${POSTGRES_URL:-}}"
+if [ -n "${DATABASE_URL:-}" ]; then
+  printf '%s' "$DATABASE_URL" > "$OPENERAL_INPUT/db-url"
+fi
+
+chmod -R go-rwx "$OPENERAL_INPUT"
+
+openshell provider create --name stringcost --type generic \
+  --credential "STRINGCOST_API_KEY=$STRINGCOST_API_KEY" \
+  || openshell provider update stringcost \
+    --credential "STRINGCOST_API_KEY=$STRINGCOST_API_KEY"
+
+openshell sandbox create --tty \
+  --from ghcr.io/sandys/openeral/sandbox:just-bash \
+  --upload "$OPENERAL_INPUT:/sandbox/openeral-input" \
+  --provider openclaw --provider stringcost --auto-providers \
+  -- openeral
+
+rm -rf "$OPENERAL_INPUT"
+```
 
 ## Manage Sandboxes
 
@@ -147,7 +261,7 @@ Keep the `HOME=/home/agent` prefix. OpenShell SSH starts in `/sandbox`, while Op
 
 ## Troubleshooting
 
-**No active gateway** - run `openshell gateway start`.
+**No active gateway / gateway not reachable** - run `openshell gateway start --recreate`. The `--recreate` flag handles a stopped or crashed gateway container without conflicts.
 
 **Claude exits with `Input must be provided either through stdin or as a prompt argument`** - the command was run without an interactive terminal. Use a real terminal and keep `--tty` in the command.
 
@@ -156,6 +270,10 @@ Keep the `HOME=/home/agent` prefix. OpenShell SSH starts in `/sandbox`, while Op
 **Claude says credit balance is too low** - the Anthropic account for that key needs credits or billing enabled.
 
 **Files disappear after `sandbox delete`** - PostgreSQL persistence was not enabled. Use the `/sandbox/db-url` upload flow above.
+
+**OpenClaw hangs at `noodling…` and never responds** — the API key was not delivered to OpenClaw. The `openclaw` provider credential arrives as an opaque placeholder that OpenClaw cannot use directly. You must upload the real key as a file: include `anthropic-api-key` in the `openeral-input` directory as shown in [Start OpenClaw](#start-openclaw).
+
+**`sync error: memory access out of bounds` in setup output** - PGlite (the embedded fallback database) hit a WASM memory limit. This happens when no `DATABASE_URL` is provided. The session will still work in standalone mode, but sync is degraded and no persistence survives sandbox deletion. Fix: add PostgreSQL via `--upload /tmp/openeral-db-url:/sandbox/db-url` as shown in [Add PostgreSQL Persistence (OpenClaw)](#add-postgresql-persistence-openclaw).
 
 **Migration fails with `tunnel to ... denied - 403`** - the PostgreSQL host is not allowlisted in the image policy. Common Supabase pooler hosts are included. Other hosts require a custom image; see [BUILD.md](./BUILD.md#custom-postgresql-hosts).
 
