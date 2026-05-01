@@ -627,7 +627,7 @@ console.log('setup.sh: openclaw config written to ' + file);
   if [ -z "${STRINGCOST_PROXY_URL:-}" ] && [ -z "${ANTHROPIC_API_KEY:-}" ]; then
     echo "setup.sh: WARNING: ANTHROPIC_API_KEY is not set and no StringCost presign is available." >&2
     echo "setup.sh: OpenClaw will start but cannot make Anthropic API calls — responses will hang." >&2
-    echo "setup.sh: Fix: export ANTHROPIC_API_KEY='sk-ant-...' in your host shell before" >&2
+    echo "setup.sh: Fix: export ANTHROPIC_API_KEY='<your-key>' in your host shell before" >&2
     echo "setup.sh:      running 'openshell sandbox create', then create a new sandbox." >&2
     echo "setup.sh:      If your key is in .env: set -a; source .env; set +a" >&2
   fi
