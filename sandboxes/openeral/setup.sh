@@ -584,8 +584,8 @@ if [ "$OPENERAL_AGENT" = "openclaw" ]; then
 
   # Write ~/.openclaw/openclaw.json so openclaw starts with the right model and
   # API credentials. StringCost proxy takes priority; falls back to a bare API key.
-  # The API key is NOT stored when it is an OpenShell placeholder — openclaw's
-  # Node.js process still resolves it via the OpenShell HTTP proxy at runtime.
+  # OpenShell placeholder values (openshell:resolve:env:*) ARE written to the config —
+  # the gateway uses them as bearer tokens and OpenShell's HTTP proxy resolves them.
   echo "setup.sh: writing openclaw config..."
   HOME=/home/agent node -e "
 const fs = require('fs');
@@ -596,6 +596,8 @@ try { config = JSON.parse(fs.readFileSync(file, 'utf8')); } catch(e) {}
 if (!config.env) config.env = {};
 if (!config.gateway) config.gateway = {};
 if (!config.gateway.mode) config.gateway.mode = 'local';
+// 30 s handshake timeout — containers can be slow on cold cache; default is 3 s
+if (!config.gateway.handshakeTimeoutMs) config.gateway.handshakeTimeoutMs = 30000;
 if (!config.agents) config.agents = {};
 if (!config.agents.defaults) config.agents.defaults = {};
 if (!config.agents.defaults.model) config.agents.defaults.model = {};
@@ -607,7 +609,7 @@ if (proxyUrl) {
   delete config.env.ANTHROPIC_API_KEY;
 } else {
   const key = process.env.ANTHROPIC_API_KEY || '';
-  if (key && !key.startsWith('openshell:resolve:env:')) {
+  if (key) {
     config.env.ANTHROPIC_API_KEY = key;
   }
   delete config.env.ANTHROPIC_BASE_URL;
@@ -623,30 +625,29 @@ console.log('setup.sh: openclaw config written to ' + file);
   # In containers (no systemd), use `openclaw gateway --port 18789` as a foreground
   # process launched in the background, rather than `openclaw gateway start`
   # which requires a systemd user session.
+  #
+  # OPENCLAW_SKIP_ONBOARDING=1 — skip the interactive first-run onboarding wizard
+  #   (config is already written by setup.sh above; without this the doctor check
+  #   blocks even with </dev/null because it inspects TTY state during startup).
+  # OPENCLAW_HANDSHAKE_TIMEOUT_MS=30000 — lengthen the WebSocket pre-auth handshake
+  #   timeout from the default 3 s to 30 s; containers with cold image caches can
+  #   take several seconds between the TCP port opening and WebSocket RPC being live.
   echo "setup.sh: starting openclaw gateway..."
-  HOME=/home/agent openclaw gateway --port 18789 --allow-unconfigured </dev/null >/tmp/openclaw-gateway.log 2>&1 &
+  OPENCLAW_SKIP_ONBOARDING=1 OPENCLAW_HANDSHAKE_TIMEOUT_MS=30000 \
+    HOME=/home/agent openclaw gateway --port 18789 --allow-unconfigured \
+    </dev/null >/tmp/openclaw-gateway.log 2>&1 &
   _gw_pid=$!
-  # Wait up to 120s for the gateway WebSocket port to open (first run installs ~11 plugins)
+  # Wait up to 120s for /readyz (NOT just TCP).
+  # TCP opens well before the WebSocket RPC layer is live; /readyz returns 200
+  # only once the gateway is truly ready to accept client connections.
   _gd=0
-  while [ $_gd -lt 1200 ]; do
-    HOME=/home/agent node -e "
-const net = require('net');
-const s = net.createConnection(18789, '127.0.0.1');
-s.on('connect', () => { s.destroy(); process.exit(0); });
-s.on('error', () => { process.exit(1); });
-setTimeout(() => process.exit(1), 500);
-" 2>/dev/null && break
-    [ $_gd -eq 40 ] && echo "setup.sh: waiting for openclaw gateway (ws://127.0.0.1:18789)..." >&2
-    sleep 0.1
+  while [ $_gd -lt 120 ]; do
+    curl -fsS http://127.0.0.1:18789/readyz >/dev/null 2>&1 && break
+    [ $_gd -eq 10 ] && echo "setup.sh: waiting for openclaw gateway readiness (/readyz)..." >&2
+    sleep 1
     _gd=$((_gd+1))
   done
-  if HOME=/home/agent node -e "
-const net = require('net');
-const s = net.createConnection(18789, '127.0.0.1');
-s.on('connect', () => { s.destroy(); process.exit(0); });
-s.on('error', () => { process.exit(1); });
-setTimeout(() => process.exit(1), 500);
-" 2>/dev/null; then
+  if curl -fsS http://127.0.0.1:18789/readyz >/dev/null 2>&1; then
     echo "setup.sh: openclaw gateway ready (pid $_gw_pid)"
   else
     echo "setup.sh: warning: openclaw gateway not ready after 120s — check /tmp/openclaw-gateway.log" >&2
@@ -656,6 +657,7 @@ setTimeout(() => process.exit(1), 500);
   # Re-apply auth credentials: the gateway modifies openclaw.json during startup
   # (adds gateway.auth.token, may clobber env settings on first run). Write our
   # auth settings back now that the gateway has finished its own modifications.
+  # OpenShell placeholder values are written as-is — the HTTP proxy resolves them.
   echo "setup.sh: re-applying openclaw auth config..."
   HOME=/home/agent node -e "
 const fs = require('fs');
@@ -671,7 +673,7 @@ if (proxyUrl) {
   delete config.env.ANTHROPIC_API_KEY;
 } else {
   const key = process.env.ANTHROPIC_API_KEY || '';
-  if (key && !key.startsWith('openshell:resolve:env:')) {
+  if (key) {
     config.env.ANTHROPIC_API_KEY = key;
   }
   delete config.env.ANTHROPIC_BASE_URL;
@@ -680,6 +682,22 @@ if (proxyUrl) {
 fs.writeFileSync(file, JSON.stringify(config, null, 2), { mode: 0o600 });
 console.log('setup.sh: openclaw auth config applied');
 "
+
+  # After the config rewrite the gateway may briefly restart (pre-2026.4.29: spawns a
+  # new child process; 2026.4.29+: in-process reload). Either way, wait for /readyz
+  # again before handing off to openclaw — a TCP check is not sufficient here.
+  _gw_post=0
+  while [ $_gw_post -lt 30 ]; do
+    curl -fsS http://127.0.0.1:18789/readyz >/dev/null 2>&1 && break
+    sleep 1
+    _gw_post=$((_gw_post+1))
+  done
+  if curl -fsS http://127.0.0.1:18789/readyz >/dev/null 2>&1; then
+    echo "setup.sh: gateway stable after auth config"
+  else
+    echo "setup.sh: warning: gateway not responding after config re-apply" >&2
+    cat /tmp/openclaw-gateway.log >&2 || true
+  fi
 
   echo "setup.sh: launching OpenClaw..."
   # Auth credentials are now in ~/.openclaw/openclaw.json, not env vars.

@@ -105,7 +105,13 @@
       "Bash(pnpm --prefix openeral-js lint)",
       "Bash(openshell provider *)",
       "Bash(bash -n sandboxes/openeral/setup.sh)",
-      "Bash(openclaw --help)"
+      "Bash(openclaw --help)",
+      "WebFetch(domain:www.vibesparking.com)",
+      "WebFetch(domain:open-claw.bot)",
+      "WebFetch(domain:clawtank.dev)",
+      "WebFetch(domain:til.simonwillison.net)",
+      "WebFetch(domain:entro.work)",
+      "WebFetch(domain:www.npmjs.com)"
     ]
   }
 }
