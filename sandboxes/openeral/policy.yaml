@@ -74,6 +74,7 @@ network_policies:
         access: full
       - { host: statsig.anthropic.com, port: 443 }
     binaries:
+      - { path: /usr/bin/openclaw }
       - { path: /usr/local/bin/openclaw }
       - { path: /usr/bin/node }
 
@@ -218,6 +219,7 @@ network_policies:
         access: full
     binaries:
       - { path: /usr/local/bin/claude }
+      - { path: /usr/bin/openclaw }
       - { path: /usr/local/bin/openclaw }
       - { path: /usr/bin/node }
 

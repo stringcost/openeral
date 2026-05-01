@@ -13,25 +13,6 @@ set -euo pipefail
 #   3. Start openeral-bash daemon
 #   4. Exec the selected agent (Claude Code or OpenClaw), or drop to bash (--shell)
 
-# Parse --shell flag before forwarding remaining args to the agent.
-# --shell: run setup then drop to an interactive bash where both
-#          `claude` and `openclaw` are available.
-SHELL_MODE=0
-PASSTHROUGH_ARGS=()
-while [[ $# -gt 0 ]]; do
-  case "$1" in
-    --shell)
-      SHELL_MODE=1
-      shift
-      ;;
-    *)
-      PASSTHROUGH_ARGS+=("$1")
-      shift
-      ;;
-  esac
-done
-set -- "${PASSTHROUGH_ARGS[@]+"${PASSTHROUGH_ARGS[@]}"}"
-
 # OpenShell's Node HTTP proxy path currently emits an experimental Undici warning
 # in some environments. Keep setup output clean and, more importantly, keep
 # warning text out of shell-captured values such as the StringCost presign URL.
@@ -130,6 +111,28 @@ case "${DATABASE_URL:-}" in
       DATABASE_URL="$(cat "$DB_URL_FILE")"
       export DATABASE_URL
       echo "setup.sh: loaded DATABASE_URL from uploaded $DB_URL_FILE"
+    fi
+    ;;
+esac
+
+# ANTHROPIC_API_KEY file-based delivery for OpenClaw.
+# OpenShell provider credentials arrive as openshell:resolve:env:* placeholders
+# that the HTTP proxy resolves only for Claude Code's binary. OpenClaw's gateway
+# is a separate process; writing the placeholder into openclaw.json causes
+# Anthropic to reject every API call. Read the real key from an uploaded file
+# instead so the literal value lands in the config.
+case "${ANTHROPIC_API_KEY:-}" in
+  ''|openshell:resolve:env:*)
+    ANTHROPIC_KEY_FILE=""
+    if [ -f /sandbox/anthropic-api-key ]; then
+      ANTHROPIC_KEY_FILE=/sandbox/anthropic-api-key
+    elif [ -f /sandbox/openeral-input/anthropic-api-key ]; then
+      ANTHROPIC_KEY_FILE=/sandbox/openeral-input/anthropic-api-key
+    fi
+    if [ -n "$ANTHROPIC_KEY_FILE" ]; then
+      ANTHROPIC_API_KEY="$(cat "$ANTHROPIC_KEY_FILE")"
+      export ANTHROPIC_API_KEY
+      echo "setup.sh: loaded ANTHROPIC_API_KEY from uploaded $ANTHROPIC_KEY_FILE"
     fi
     ;;
 esac
@@ -557,19 +560,6 @@ else
   trap "rm -f /tmp/openeral-bash.sock" EXIT
 fi
 
-# Shell mode: drop to an interactive bash where both `claude` and `openclaw`
-# are available. ~/.openeral/env.sh is already written by the block above;
-# export ANTHROPIC_BASE_URL here so the exec'd bash inherits it directly.
-if [ "$SHELL_MODE" = "1" ]; then
-  [ -n "${STRINGCOST_PROXY_URL:-}" ] && export ANTHROPIC_BASE_URL="$STRINGCOST_PROXY_URL" ANTHROPIC_AUTH_TOKEN="dummy"
-  echo "setup.sh: shell mode ready — run 'claude' or 'openclaw' to start an agent"
-  exec env \
-    HOME=/home/agent \
-    SHELL=/usr/local/bin/openeral-bash \
-    PATH="$PATH" \
-    /bin/bash.real
-fi
-
 if [ "$OPENERAL_AGENT" = "openclaw" ]; then
   # OpenClaw is baked into the image (see Dockerfile).
   # This fallback handles stale images — if you hit it, rebuild the image.
@@ -603,14 +593,21 @@ if (!config.agents.defaults) config.agents.defaults = {};
 if (!config.agents.defaults.model) config.agents.defaults.model = {};
 config.agents.defaults.model.primary = 'anthropic/claude-sonnet-4-6';
 const proxyUrl = process.env.STRINGCOST_PROXY_URL || '';
+const rawKey = process.env.ANTHROPIC_API_KEY || '';
+const realKey = rawKey.startsWith('openshell:resolve:env:') ? '' : rawKey;
 if (proxyUrl) {
   config.env.ANTHROPIC_BASE_URL = proxyUrl;
   config.env.ANTHROPIC_AUTH_TOKEN = 'dummy';
-  delete config.env.ANTHROPIC_API_KEY;
+  // Keep the real key when available so OpenClaw doesn't bail before making calls.
+  // StringCost authenticates via the presign token in the URL, not the key header.
+  if (realKey) {
+    config.env.ANTHROPIC_API_KEY = realKey;
+  } else {
+    delete config.env.ANTHROPIC_API_KEY;
+  }
 } else {
-  const key = process.env.ANTHROPIC_API_KEY || '';
-  if (key) {
-    config.env.ANTHROPIC_API_KEY = key;
+  if (rawKey) {
+    config.env.ANTHROPIC_API_KEY = rawKey;
   }
   delete config.env.ANTHROPIC_BASE_URL;
   delete config.env.ANTHROPIC_AUTH_TOKEN;
@@ -685,14 +682,19 @@ let config = {};
 try { config = JSON.parse(fs.readFileSync(file, 'utf8')); } catch(e) {}
 if (!config.env) config.env = {};
 const proxyUrl = process.env.STRINGCOST_PROXY_URL || '';
+const rawKey = process.env.ANTHROPIC_API_KEY || '';
+const realKey = rawKey.startsWith('openshell:resolve:env:') ? '' : rawKey;
 if (proxyUrl) {
   config.env.ANTHROPIC_BASE_URL = proxyUrl;
   config.env.ANTHROPIC_AUTH_TOKEN = 'dummy';
-  delete config.env.ANTHROPIC_API_KEY;
+  if (realKey) {
+    config.env.ANTHROPIC_API_KEY = realKey;
+  } else {
+    delete config.env.ANTHROPIC_API_KEY;
+  }
 } else {
-  const key = process.env.ANTHROPIC_API_KEY || '';
-  if (key) {
-    config.env.ANTHROPIC_API_KEY = key;
+  if (rawKey) {
+    config.env.ANTHROPIC_API_KEY = rawKey;
   }
   delete config.env.ANTHROPIC_BASE_URL;
   delete config.env.ANTHROPIC_AUTH_TOKEN;
