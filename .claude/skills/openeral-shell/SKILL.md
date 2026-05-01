@@ -137,7 +137,7 @@ fi
 
 ### Step 4: Create the sandbox
 
-Spawn the `/mnt` injection as a background job before creating the sandbox. The background job polls until the sandbox pod is Running (which happens while `setup.sh` is running migrations), then uses `crictl`+`nsenter` inside the gateway to bind-mount `/mnt` into the sandbox pod's mount namespace. By the time Claude Code becomes interactive, host files are already accessible.
+The sandbox image's `policy.yaml` includes `/mnt/**` in `filesystem_policy.read_write`, so host files under `/mnt` are directly accessible inside the sandbox — no bind-mount injection is needed.
 
 Use the appropriate command based on the agent chosen in Step 3.
 

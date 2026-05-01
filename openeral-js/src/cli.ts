@@ -1420,8 +1420,13 @@ async function launchViaSandbox(workspaceId: string, claudeArgs: string[], devMo
   //   - No stored presign       → require both keys to create one now, then store it.
   // Run `npx openeral presign renew` to replace the stored presign at any time.
   let stringcostUrl: string | undefined;
+  let keyUploadPath: string | undefined;
   if (agent === 'openclaw') {
     // OpenClaw authenticates directly with the Anthropic API — no presign proxy.
+    // The openclaw provider credential arrives inside the sandbox as an opaque
+    // openshell:resolve:env:* placeholder that OpenClaw cannot use. Deliver the
+    // real key by writing it to a temp file and uploading it as a file so
+    // setup.sh can write the actual value into ~/.openclaw/openclaw.json.
     const anthropicKey = (process.env.ANTHROPIC_API_KEY ?? '').trim();
     if (!anthropicKey) {
       process.stderr.write(
@@ -1429,6 +1434,10 @@ async function launchViaSandbox(workspaceId: string, claudeArgs: string[], devMo
       );
       process.exit(1);
     }
+    keyUploadPath = join(tmpdir(), `openeral-anthropic-key-${process.pid}-${Date.now()}`);
+    writeFileSync(keyUploadPath, anthropicKey, { mode: 0o600 });
+    try { chmodSync(keyUploadPath, 0o600); } catch {}
+    sandboxArgs.push('--upload', `${keyUploadPath}:/sandbox/anthropic-api-key`);
     sandboxArgs.push('--provider', 'openclaw');
   } else {
     const storedPresign = loadStoredPresign();
@@ -1811,11 +1820,19 @@ fi
   if (agent === 'openclaw') {
     // openclaw provider injects OPENERAL_AGENT=openclaw so setup.sh launches OpenClaw.
     const creds = ['--credential', 'OPENERAL_AGENT=openclaw'];
-    spawnSync('openshell', ['provider', 'create', '--name', 'openclaw', '--type', 'generic', ...creds],
+    const createResult = spawnSync('openshell', ['provider', 'create', '--name', 'openclaw', '--type', 'generic', ...creds],
       { stdio: 'pipe', timeout: 30000 });
-    // Non-zero exit expected when provider already exists — update it.
-    spawnSync('openshell', ['provider', 'update', 'openclaw', ...creds],
-      { stdio: 'pipe', timeout: 30000 });
+    if (createResult.status !== 0) {
+      // Non-zero exit expected when provider already exists — update it.
+      const updateResult = spawnSync('openshell', ['provider', 'update', 'openclaw', ...creds],
+        { stdio: 'pipe', timeout: 30000 });
+      if (updateResult.status !== 0) {
+        process.stderr.write('\x1b[31merror: failed to register OpenClaw provider — is `openshell` installed and the gateway running?\x1b[0m\n');
+        if (keyUploadPath) { try { rmSync(keyUploadPath, { force: true }); } catch {} }
+        if (dbUploadPath) { try { rmSync(dbUploadPath, { force: true }); } catch {} }
+        process.exit(1);
+      }
+    }
     process.stderr.write('\x1b[32m✓ OpenClaw provider registered\x1b[0m\n');
   } else {
     // claude provider — only needed when NOT using presign (injects ANTHROPIC_API_KEY).
@@ -1861,6 +1878,9 @@ fi
     if (dbUploadPath) {
       try { rmSync(dbUploadPath, { force: true }); } catch {}
     }
+    if (keyUploadPath) {
+      try { rmSync(keyUploadPath, { force: true }); } catch {}
+    }
     process.stderr.write(`\x1b[31merror: ${err.message}\x1b[0m\n`);
     process.exit(1);
   });
@@ -1869,6 +1889,9 @@ fi
     clearTimeout(startupWarnTimer);
     if (dbUploadPath) {
       try { rmSync(dbUploadPath, { force: true }); } catch {}
+    }
+    if (keyUploadPath) {
+      try { rmSync(keyUploadPath, { force: true }); } catch {}
     }
     process.exit(code ?? 0);
   });

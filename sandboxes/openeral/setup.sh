@@ -257,7 +257,7 @@ const fetch = globalThis.fetch;
   const controller = new AbortController();
   const to = setTimeout(() => controller.abort(), 30000);
   try {
-    const apiBase = (process.env.STRINGCOST_API_BASE || 'https://app.stringcost.com').replace(/\/+\$/, '');
+    const apiBase = (process.env.STRINGCOST_API_BASE || 'https://app.stringcost.com').replace(/\/+$/, '');
     const agentLabel = process.env.STRINGCOST_AGENT_LABEL || 'claude-code';
     const r = await fetch(apiBase + '/v1/presign', {
       method: 'POST',

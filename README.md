@@ -271,7 +271,7 @@ Keep the `HOME=/home/agent` prefix. OpenShell SSH starts in `/sandbox`, while Op
 
 **Files disappear after `sandbox delete`** - PostgreSQL persistence was not enabled. Use the `/sandbox/db-url` upload flow above.
 
-**OpenClaw hangs at `noodling…` and never responds** — the sandbox network policy was missing an entry that allows the `/usr/local/bin/openclaw` binary to reach `api.anthropic.com`. All API calls were silently dropped. This is fixed in the current source; rebuild and push the image from `sandboxes/openeral/` (see [BUILD.md](./BUILD.md)) to pick up the fix.
+**OpenClaw hangs at `noodling…` and never responds** — the API key was not delivered to OpenClaw. The `openclaw` provider credential arrives as an opaque placeholder that OpenClaw cannot use directly. You must upload the real key as a file: include `anthropic-api-key` in the `openeral-input` directory as shown in [Start OpenClaw](#start-openclaw).
 
 **`sync error: memory access out of bounds` in setup output** - PGlite (the embedded fallback database) hit a WASM memory limit. This happens when no `DATABASE_URL` is provided. The session will still work in standalone mode, but sync is degraded and no persistence survives sandbox deletion. Fix: add PostgreSQL via `--upload /tmp/openeral-db-url:/sandbox/db-url` as shown in [Add PostgreSQL Persistence (OpenClaw)](#add-postgresql-persistence-openclaw).
 
