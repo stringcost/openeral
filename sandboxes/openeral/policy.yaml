@@ -58,6 +58,25 @@ network_policies:
       - { path: /usr/local/bin/claude }
       - { path: /usr/bin/node }
 
+  # --- OpenClaw (Anthropic API) ---
+  # OpenClaw's gateway binary is /usr/local/bin/openclaw (npm global install),
+  # which is distinct from /usr/local/bin/claude. Without this entry,
+  # enforcement: enforce on the claude_code policy drops all outbound OpenClaw
+  # connections to api.anthropic.com, causing every agent response to hang.
+  openclaw_anthropic:
+    name: openclaw-anthropic
+    endpoints:
+      - host: api.anthropic.com
+        port: 443
+        protocol: rest
+        tls: terminate
+        enforcement: enforce
+        access: full
+      - { host: statsig.anthropic.com, port: 443 }
+    binaries:
+      - { path: /usr/local/bin/openclaw }
+      - { path: /usr/bin/node }
+
   # --- Socket.dev package registry ---
   # When --provider socket is configured with SOCKET_TOKEN, npm traffic
   # routes to registry.socket.dev. The proxy resolves the placeholder
@@ -199,6 +218,7 @@ network_policies:
         access: full
     binaries:
       - { path: /usr/local/bin/claude }
+      - { path: /usr/local/bin/openclaw }
       - { path: /usr/bin/node }
 
   # --- External PostgreSQL (Supabase) via HTTP CONNECT tunnel ---
