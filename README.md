@@ -119,7 +119,7 @@ openshell provider create --name stringcost --type generic \
     --credential "STRINGCOST_API_KEY=$STRINGCOST_API_KEY"
 
 openshell sandbox create --tty \
-  --from ghcr.io/pavitra-programmers/openeral/sandbox:just-bash \
+  --from ghcr.io/sandys/openeral/sandbox:just-bash \
   --upload "$OPENERAL_INPUT:/sandbox/openeral-input" \
   --provider openclaw --provider stringcost --auto-providers \
   -- openeral
@@ -152,7 +152,7 @@ export ANTHROPIC_API_KEY='sk-ant-...'
 openshell gateway start
 
 openshell sandbox create --tty \
-  --from ghcr.io/pavitra-programmers/openeral/sandbox:just-bash \
+  --from ghcr.io/sandys/openeral/sandbox:just-bash \
   --provider openclaw --auto-providers \
   -- openeral
 ```
