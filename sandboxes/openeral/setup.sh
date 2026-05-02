@@ -126,6 +126,11 @@ case "${ANTHROPIC_API_KEY:-}" in
     ANTHROPIC_KEY_FILE=""
     if [ -f /sandbox/anthropic-api-key ]; then
       ANTHROPIC_KEY_FILE=/sandbox/anthropic-api-key
+    elif [ -d /sandbox/anthropic-api-key ]; then
+      # openshell --upload always places files INSIDE the destination directory
+      # (e.g. --upload /tmp/my-key:/sandbox/anthropic-api-key puts the file at
+      # /sandbox/anthropic-api-key/my-key). Pick any single file inside.
+      ANTHROPIC_KEY_FILE="$(find /sandbox/anthropic-api-key -maxdepth 1 -type f | head -1)"
     elif [ -f /sandbox/openeral-input/anthropic-api-key ]; then
       ANTHROPIC_KEY_FILE=/sandbox/openeral-input/anthropic-api-key
     fi
@@ -645,9 +650,9 @@ console.log('setup.sh: openclaw config written to ' + file);
   #   /home/agent is synced to workspace_files in the DB; restoring a previous
   #   session's plugin-runtime-deps directory can leave a corrupt npm cache that
   #   makes the gateway fail to stage its 35 bundled packages (ENOENT on cache
-  #   entries). Storing them in /var/lib (not synced) ensures a clean state on
-  #   every sandbox launch.
-  export OPENCLAW_PLUGIN_STAGE_DIR=/var/lib/openclaw/plugin-runtime-deps
+  #   entries). /tmp is always writable by the sandbox user and is never synced,
+  #   so the gateway always gets a clean staging area on each sandbox launch.
+  export OPENCLAW_PLUGIN_STAGE_DIR=/tmp/openclaw-plugin-runtime-deps
   mkdir -p "$OPENCLAW_PLUGIN_STAGE_DIR"
 
   echo "setup.sh: starting openclaw gateway..."
