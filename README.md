@@ -63,7 +63,6 @@ printf '%s' "$DATABASE_URL" > /tmp/openeral-db-url
 chmod 600 /tmp/openeral-db-url
 
 openshell sandbox create --tty \
-  --name openeral-claude \
   --from ghcr.io/sandys/openeral/sandbox:just-bash \
   --upload /tmp/openeral-db-url:/sandbox/db-url \
   --provider claude --auto-providers \
@@ -181,7 +180,6 @@ printf '%s' "$DATABASE_URL"      > "$OPENERAL_INPUT/db-url"
 chmod -R go-rwx "$OPENERAL_INPUT"
 
 openshell sandbox create --tty \
-  --name openeral-openclaw \
   --from ghcr.io/sandys/openeral/sandbox:just-bash \
   --upload "$OPENERAL_INPUT:/sandbox/openeral-input" \
   --provider openclaw --auto-providers \

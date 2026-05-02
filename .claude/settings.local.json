@@ -106,7 +106,8 @@
       "WebFetch(domain:clawtank.dev)",
       "WebFetch(domain:til.simonwillison.net)",
       "WebFetch(domain:entro.work)",
-      "WebFetch(domain:www.npmjs.com)"
+      "WebFetch(domain:www.npmjs.com)",
+      "Bash(bash -n /mnt/c/Users/dines/OneDrive/Desktop/work/openeral/sandboxes/openeral/setup.sh)"
     ]
   }
 }
