@@ -126,6 +126,11 @@ case "${ANTHROPIC_API_KEY:-}" in
     ANTHROPIC_KEY_FILE=""
     if [ -f /sandbox/anthropic-api-key ]; then
       ANTHROPIC_KEY_FILE=/sandbox/anthropic-api-key
+    elif [ -d /sandbox/anthropic-api-key ]; then
+      # openshell --upload always places files INSIDE the destination directory
+      # (e.g. --upload /tmp/my-key:/sandbox/anthropic-api-key puts the file at
+      # /sandbox/anthropic-api-key/my-key). Pick any single file inside.
+      ANTHROPIC_KEY_FILE="$(find /sandbox/anthropic-api-key -maxdepth 1 -type f | head -1)"
     elif [ -f /sandbox/openeral-input/anthropic-api-key ]; then
       ANTHROPIC_KEY_FILE=/sandbox/openeral-input/anthropic-api-key
     fi
@@ -493,16 +498,17 @@ if [ -n "${STRINGCOST_PROXY_URL:-}" ]; then
   if ! grep -q 'openeral/env.sh' "$BASHRC" 2>/dev/null; then
     printf '\n[ -f ~/.openeral/env.sh ] && . ~/.openeral/env.sh\n' >> "$BASHRC"
   fi
+fi
 
-  # openshell sandbox connect gives a shell with HOME=$SANDBOX_USER_HOME (e.g. /sandbox),
-  # not /home/agent. Write a .bashrc there so `claude` in a reconnect session uses the
-  # right HOME and routes through StringCost — no need to prefix with HOME=/home/agent.
-  if [ "$SANDBOX_USER_HOME" != "/home/agent" ] && [ -n "$SANDBOX_USER_HOME" ]; then
-    CONNECT_BASHRC="$SANDBOX_USER_HOME/.bashrc"
-    if ! grep -q 'openeral-connect' "$CONNECT_BASHRC" 2>/dev/null; then
-      printf '\n# openeral-connect: set agent HOME and StringCost env for sandbox connect sessions\nexport HOME=/home/agent\n[ -f /home/agent/.openeral/env.sh ] && . /home/agent/.openeral/env.sh\n' \
-        >> "$CONNECT_BASHRC"
-    fi
+# openshell sandbox connect gives a shell with HOME=$SANDBOX_USER_HOME (e.g. /sandbox),
+# not /home/agent. Always patch that shell's .bashrc so reconnect sessions use
+# the correct HOME — without this openclaw cannot find its config or gateway
+# auth token regardless of whether StringCost is active.
+if [ "$SANDBOX_USER_HOME" != "/home/agent" ] && [ -n "$SANDBOX_USER_HOME" ]; then
+  CONNECT_BASHRC="$SANDBOX_USER_HOME/.bashrc"
+  if ! grep -q 'openeral-connect' "$CONNECT_BASHRC" 2>/dev/null; then
+    printf '\n# openeral-connect: set agent HOME for sandbox connect sessions\nexport HOME=/home/agent\n[ -f /home/agent/.openeral/env.sh ] && . /home/agent/.openeral/env.sh\n' \
+      >> "$CONNECT_BASHRC"
   fi
 fi
 
@@ -641,31 +647,48 @@ console.log('setup.sh: openclaw config written to ' + file);
   # OPENCLAW_HANDSHAKE_TIMEOUT_MS=30000 — lengthen the WebSocket pre-auth handshake
   #   timeout from the default 3 s to 30 s; containers with cold image caches can
   #   take several seconds between the TCP port opening and WebSocket RPC being live.
+  # OPENCLAW_PLUGIN_STAGE_DIR — keep bundled npm deps OUTSIDE /home/agent.
+  #   /home/agent is synced to workspace_files in the DB; restoring a previous
+  #   session's plugin-runtime-deps directory can leave a corrupt npm cache that
+  #   makes the gateway fail to stage its 35 bundled packages (ENOENT on cache
+  #   entries). /tmp is always writable by the sandbox user and is never synced,
+  #   so the gateway always gets a clean staging area on each sandbox launch.
+  export OPENCLAW_PLUGIN_STAGE_DIR=/tmp/openclaw-plugin-runtime-deps
+  mkdir -p "$OPENCLAW_PLUGIN_STAGE_DIR"
+
   echo "setup.sh: starting openclaw gateway..."
-  OPENCLAW_SKIP_ONBOARDING=1 OPENCLAW_HANDSHAKE_TIMEOUT_MS=30000 \
+  # setsid puts the gateway in a new session with no controlling terminal.
+  # Without this, exiting the openclaw TUI (Ctrl+C) sends SIGHUP to the entire
+  # session including the background gateway, killing it. With setsid the gateway
+  # survives TUI exit, so `openshell sandbox connect` finds it still running.
+  setsid env OPENCLAW_SKIP_ONBOARDING=1 OPENCLAW_HANDSHAKE_TIMEOUT_MS=30000 \
     HOME=/home/agent openclaw gateway --port 18789 --allow-unconfigured \
     </dev/null >/tmp/openclaw-gateway.log 2>&1 &
   _gw_pid=$!
-  # Wait up to 120s for /readyz (NOT just TCP).
+  echo "$_gw_pid" > /tmp/openclaw-gateway.pid
+  # Wait up to 600s for /readyz (NOT just TCP).
   # TCP opens well before the WebSocket RPC layer is live; /readyz returns 200
   # only once the gateway is truly ready to accept client connections.
   # The gateway stages 35 bundled npm packages on every cold start, which can take
-  # several minutes on slow networks. Wait up to 300s (5 min) before giving up.
+  # several minutes on slow networks. Wait up to 600s (10 min) before giving up.
   _gd=0
-  while [ $_gd -lt 300 ]; do
+  while [ $_gd -lt 600 ]; do
     curl -fsS http://127.0.0.1:18789/readyz >/dev/null 2>&1 && break
     [ $_gd -eq 10 ] && echo "setup.sh: waiting for openclaw gateway readiness (/readyz) — this can take a few minutes on first run..." >&2
     [ $_gd -eq 60 ] && echo "setup.sh: still waiting for gateway (staging bundled deps)..." >&2
     [ $_gd -eq 120 ] && echo "setup.sh: still waiting for gateway (2 min)..." >&2
     [ $_gd -eq 180 ] && echo "setup.sh: still waiting for gateway (3 min)..." >&2
     [ $_gd -eq 240 ] && echo "setup.sh: still waiting for gateway (4 min)..." >&2
+    [ $_gd -eq 300 ] && echo "setup.sh: still waiting for gateway (5 min)..." >&2
+    [ $_gd -eq 420 ] && echo "setup.sh: still waiting for gateway (7 min)..." >&2
+    [ $_gd -eq 540 ] && echo "setup.sh: still waiting for gateway (9 min)..." >&2
     sleep 1
     _gd=$((_gd+1))
   done
   if curl -fsS http://127.0.0.1:18789/readyz >/dev/null 2>&1; then
     echo "setup.sh: openclaw gateway ready (pid $_gw_pid)"
   else
-    echo "setup.sh: warning: openclaw gateway not ready after 300s — check /tmp/openclaw-gateway.log" >&2
+    echo "setup.sh: warning: openclaw gateway not ready after 600s — check /tmp/openclaw-gateway.log" >&2
     cat /tmp/openclaw-gateway.log >&2 || true
   fi
 
@@ -678,8 +701,26 @@ console.log('setup.sh: openclaw config written to ' + file);
 const fs = require('fs');
 const dir = process.env.HOME + '/.openclaw';
 const file = dir + '/openclaw.json';
+// Retry the read: the gateway may still be writing its config. Falling back
+// to {} on a race-condition parse failure would produce a stub file smaller
+// than the gateway's copy, triggering the gateway's backup-restore logic and
+// losing the auth token. Retry up to 5 times with 800 ms between attempts.
 let config = {};
-try { config = JSON.parse(fs.readFileSync(file, 'utf8')); } catch(e) {}
+for (let attempt = 0; attempt < 5; attempt++) {
+  try {
+    const raw = fs.readFileSync(file, 'utf8');
+    const parsed = JSON.parse(raw);
+    if (parsed && typeof parsed === 'object' && Object.keys(parsed).length > 0) {
+      config = parsed;
+      break;
+    }
+  } catch(e) {}
+  if (attempt < 4) {
+    // Busy-wait 800 ms — no async available in sync Node one-liners.
+    const end = Date.now() + 800;
+    while (Date.now() < end) {}
+  }
+}
 if (!config.env) config.env = {};
 const proxyUrl = process.env.STRINGCOST_PROXY_URL || '';
 const rawKey = process.env.ANTHROPIC_API_KEY || '';
@@ -707,7 +748,7 @@ console.log('setup.sh: openclaw auth config applied');
   # new child process; 2026.4.29+: in-process reload). Either way, wait for /readyz
   # again before handing off to openclaw — a TCP check is not sufficient here.
   _gw_post=0
-  while [ $_gw_post -lt 30 ]; do
+  while [ $_gw_post -lt 60 ]; do
     curl -fsS http://127.0.0.1:18789/readyz >/dev/null 2>&1 && break
     sleep 1
     _gw_post=$((_gw_post+1))
@@ -722,14 +763,19 @@ console.log('setup.sh: openclaw auth config applied');
   echo "setup.sh: launching OpenClaw..."
   # Auth credentials are now in ~/.openclaw/openclaw.json, not env vars.
   # Strip STRINGCOST_API_KEY (presign-creation only) and any stale auth tokens.
+  # OPENCLAW_PLUGIN_STAGE_DIR is intentionally NOT forwarded: it is for the
+  # gateway process only. Passing it to the TUI/client process causes openclaw
+  # to run its own plugin staging loop on startup, which saturates the Node.js
+  # event loop and makes the terminal completely unresponsive to keyboard input.
   if [ -n "${STRINGCOST_PROXY_URL:-}" ]; then
     exec env -u STRINGCOST_API_KEY -u ANTHROPIC_AUTH_TOKEN -u ANTHROPIC_API_KEY \
+      -u OPENCLAW_PLUGIN_STAGE_DIR \
       HOME=/home/agent \
       SHELL=/usr/local/bin/openeral-bash \
       PATH="$PATH" \
       openclaw "$@"
   else
-    exec env -u STRINGCOST_API_KEY \
+    exec env -u STRINGCOST_API_KEY -u OPENCLAW_PLUGIN_STAGE_DIR \
       HOME=/home/agent \
       SHELL=/usr/local/bin/openeral-bash \
       PATH="$PATH" \
