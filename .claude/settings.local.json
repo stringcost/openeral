@@ -107,7 +107,10 @@
       "WebFetch(domain:til.simonwillison.net)",
       "WebFetch(domain:entro.work)",
       "WebFetch(domain:www.npmjs.com)",
-      "Bash(bash -n /mnt/c/Users/dines/OneDrive/Desktop/work/openeral/sandboxes/openeral/setup.sh)"
+      "Bash(bash -n /mnt/c/Users/dines/OneDrive/Desktop/work/openeral/sandboxes/openeral/setup.sh)",
+      "Bash(git add *)",
+      "Bash(git commit -m ' *)",
+      "Bash(git config *)"
     ]
   }
 }

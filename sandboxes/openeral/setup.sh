@@ -657,10 +657,15 @@ console.log('setup.sh: openclaw config written to ' + file);
   mkdir -p "$OPENCLAW_PLUGIN_STAGE_DIR"
 
   echo "setup.sh: starting openclaw gateway..."
-  OPENCLAW_SKIP_ONBOARDING=1 OPENCLAW_HANDSHAKE_TIMEOUT_MS=30000 \
+  # setsid puts the gateway in a new session with no controlling terminal.
+  # Without this, exiting the openclaw TUI (Ctrl+C) sends SIGHUP to the entire
+  # session including the background gateway, killing it. With setsid the gateway
+  # survives TUI exit, so `openshell sandbox connect` finds it still running.
+  setsid env OPENCLAW_SKIP_ONBOARDING=1 OPENCLAW_HANDSHAKE_TIMEOUT_MS=30000 \
     HOME=/home/agent openclaw gateway --port 18789 --allow-unconfigured \
     </dev/null >/tmp/openclaw-gateway.log 2>&1 &
   _gw_pid=$!
+  echo "$_gw_pid" > /tmp/openclaw-gateway.pid
   # Wait up to 600s for /readyz (NOT just TCP).
   # TCP opens well before the WebSocket RPC layer is live; /readyz returns 200
   # only once the gateway is truly ready to accept client connections.
