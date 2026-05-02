@@ -151,7 +151,7 @@ chmod 600 /tmp/openeral-key
 openshell gateway start
 
 openshell sandbox create --tty \
-  --from ghcr.io/sandys/openeral/sandbox:just-bash \
+  --from ghcr.io/pavitra-programmers/openeral/sandbox:just-bash \
   --upload /tmp/openeral-key:/sandbox/anthropic-api-key \
   --provider openclaw --auto-providers \
   -- openeral
@@ -180,7 +180,7 @@ printf '%s' "$DATABASE_URL"      > "$OPENERAL_INPUT/db-url"
 chmod -R go-rwx "$OPENERAL_INPUT"
 
 openshell sandbox create --tty \
-  --from ghcr.io/sandys/openeral/sandbox:just-bash \
+  --from ghcr.io/pavitra-programmers/openeral/sandbox:just-bash \
   --upload "$OPENERAL_INPUT:/sandbox/openeral-input" \
   --provider openclaw --auto-providers \
   -- openeral

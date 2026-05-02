@@ -498,16 +498,17 @@ if [ -n "${STRINGCOST_PROXY_URL:-}" ]; then
   if ! grep -q 'openeral/env.sh' "$BASHRC" 2>/dev/null; then
     printf '\n[ -f ~/.openeral/env.sh ] && . ~/.openeral/env.sh\n' >> "$BASHRC"
   fi
+fi
 
-  # openshell sandbox connect gives a shell with HOME=$SANDBOX_USER_HOME (e.g. /sandbox),
-  # not /home/agent. Write a .bashrc there so `claude` in a reconnect session uses the
-  # right HOME and routes through StringCost — no need to prefix with HOME=/home/agent.
-  if [ "$SANDBOX_USER_HOME" != "/home/agent" ] && [ -n "$SANDBOX_USER_HOME" ]; then
-    CONNECT_BASHRC="$SANDBOX_USER_HOME/.bashrc"
-    if ! grep -q 'openeral-connect' "$CONNECT_BASHRC" 2>/dev/null; then
-      printf '\n# openeral-connect: set agent HOME and StringCost env for sandbox connect sessions\nexport HOME=/home/agent\n[ -f /home/agent/.openeral/env.sh ] && . /home/agent/.openeral/env.sh\n' \
-        >> "$CONNECT_BASHRC"
-    fi
+# openshell sandbox connect gives a shell with HOME=$SANDBOX_USER_HOME (e.g. /sandbox),
+# not /home/agent. Always patch that shell's .bashrc so reconnect sessions use
+# the correct HOME — without this openclaw cannot find its config or gateway
+# auth token regardless of whether StringCost is active.
+if [ "$SANDBOX_USER_HOME" != "/home/agent" ] && [ -n "$SANDBOX_USER_HOME" ]; then
+  CONNECT_BASHRC="$SANDBOX_USER_HOME/.bashrc"
+  if ! grep -q 'openeral-connect' "$CONNECT_BASHRC" 2>/dev/null; then
+    printf '\n# openeral-connect: set agent HOME for sandbox connect sessions\nexport HOME=/home/agent\n[ -f /home/agent/.openeral/env.sh ] && . /home/agent/.openeral/env.sh\n' \
+      >> "$CONNECT_BASHRC"
   fi
 fi
 
@@ -757,20 +758,21 @@ console.log('setup.sh: openclaw auth config applied');
   echo "setup.sh: launching OpenClaw..."
   # Auth credentials are now in ~/.openclaw/openclaw.json, not env vars.
   # Strip STRINGCOST_API_KEY (presign-creation only) and any stale auth tokens.
-  # Forward OPENCLAW_PLUGIN_STAGE_DIR so openclaw itself also stores any
-  # per-plugin runtime deps outside /home/agent.
+  # OPENCLAW_PLUGIN_STAGE_DIR is intentionally NOT forwarded: it is for the
+  # gateway process only. Passing it to the TUI/client process causes openclaw
+  # to run its own plugin staging loop on startup, which saturates the Node.js
+  # event loop and makes the terminal completely unresponsive to keyboard input.
   if [ -n "${STRINGCOST_PROXY_URL:-}" ]; then
     exec env -u STRINGCOST_API_KEY -u ANTHROPIC_AUTH_TOKEN -u ANTHROPIC_API_KEY \
+      -u OPENCLAW_PLUGIN_STAGE_DIR \
       HOME=/home/agent \
       SHELL=/usr/local/bin/openeral-bash \
-      OPENCLAW_PLUGIN_STAGE_DIR="${OPENCLAW_PLUGIN_STAGE_DIR}" \
       PATH="$PATH" \
       openclaw "$@"
   else
-    exec env -u STRINGCOST_API_KEY \
+    exec env -u STRINGCOST_API_KEY -u OPENCLAW_PLUGIN_STAGE_DIR \
       HOME=/home/agent \
       SHELL=/usr/local/bin/openeral-bash \
-      OPENCLAW_PLUGIN_STAGE_DIR="${OPENCLAW_PLUGIN_STAGE_DIR}" \
       PATH="$PATH" \
       openclaw "$@"
   fi
