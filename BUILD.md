@@ -75,6 +75,9 @@ All subcommands accept `--dev`/`-d` to target the local dev image.
 | `npx openeral apply --proposal <id>` | Apply a single proposal (`model-routing`, `context-file`, `lazy-reading`, `readme-updates`, `memory-compact`) |
 | `npx openeral memory refresh` | Rewrite Claude's native project memory files |
 | `npx openeral memory refresh --query "..."` | Focus memory refresh on a specific topic |
+| `npx openeral memory refresh --openviking` | Memory refresh using OpenViking semantic search (requires server) |
+| `npx openeral memory status` | Show OpenViking connection status, memory stats, and configuration |
+| `npx openeral memory migrate --to-openviking` | Import existing markdown memory files into OpenViking's vector store |
 | `npx openeral -- <args>` | Pass arguments straight to Claude (e.g. `npx openeral -- -p 'hello'`) |
 
 **Options shared by `stats`, `analyze`, `apply`:**
@@ -100,6 +103,7 @@ All subcommands accept `--dev`/`-d` to target the local dev image.
 | `OPENERAL_HOME` | `/tmp/openeral-<id>` | Local workspace directory |
 | `OPENERAL_SANDBOX_IMAGE` | `ghcr.io/sandys/openeral/sandbox:just-bash` | Override the production sandbox image |
 | `OPENERAL_DEV_IMAGE` | `openeral-sandbox:dev` | Override the dev sandbox image (used with `--dev`/`-d`) |
+| `OPENVIKING_ENDPOINT` | `http://localhost:1933` | OpenViking server URL — enables semantic memory when set |
 
 ---
 
@@ -153,6 +157,40 @@ Verifies that setup.sh correctly seeds `/.config` (not `/.claude`), skips String
 
 ---
 
+## OpenViking semantic memory (optional)
+
+OpenViking is a separate Python server that adds vector-based semantic search to OpenEral's memory system. It is entirely optional — OpenEral works without it using local keyword ranking.
+
+### Start the OpenViking server
+
+```bash
+pip install openviking
+openviking serve           # listens on http://localhost:1933
+```
+
+Requires an embedding provider env var (e.g. `OPENAI_API_KEY` or Volcengine credentials) and, for auto-capture, a VLM key (`ANTHROPIC_API_KEY`).
+
+### Enable in OpenEral
+
+```bash
+# Check connection
+npx openeral memory status
+
+# Semantic memory refresh
+npx openeral memory refresh --openviking
+
+# Import existing markdown memories into vector store
+npx openeral memory migrate --to-openviking
+```
+
+The config file `~/.openeral/openviking.json` controls the endpoint, timeouts, and auto-capture settings. Set `"enabled": true` to activate.
+
+**Data storage:** OpenViking has its own database (vector DB + its own SQL schema). This is completely separate from OpenEral's `_openeral` schema in Supabase. OpenEral's PostgreSQL only ever stores workspace filesystem snapshots in `workspace_files`.
+
+For full setup instructions, network policy configuration, and deployment options, see [docs/openviking-setup.md](../docs/openviking-setup.md).
+
+---
+
 ## Custom agents (library usage)
 
 For agents with a single bash tool (not the Claude Code CLI), you can use the just-bash virtual filesystem directly:
@@ -185,6 +223,7 @@ openeral-js/                  # TypeScript package
   src/pg-fs/                  # Read-only /db filesystem
   src/workspace-fs/           # Read-write /home/agent filesystem
   src/memory/                 # Claude project-memory refresh
+  src/openviking/             # OpenViking client (types, config, client, recall, session)
   src/optimize/               # analyze / apply / stats subcommands
   src/db/                     # SQL queries, migrations
   src/safety.ts               # Command safety analysis
