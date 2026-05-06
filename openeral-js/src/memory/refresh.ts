@@ -5,6 +5,9 @@ import { rankMemoryChunks, readDirtyPathSet, selectTopChunks } from './rank.js';
 import { renderMemoryIndex, renderTopicFile, slugifyQuery } from './render.js';
 import { resolveProjectContext } from './resolve.js';
 import type { MemoryChunk, MemoryFileSpec, MemoryRefreshOptions, MemoryRefreshResult, MemorySourceKind, RankedMemoryChunk } from './types.js';
+import { createOpenVikingClient } from '../openviking/client.js';
+import { loadOpenVikingConfig } from '../openviking/config.js';
+import { hybridRecall } from '../openviking/recall.js';
 
 interface MemoryDocumentTemplate {
   filename: string;
@@ -119,21 +122,47 @@ function rankSelectedKinds(
   return ranked.filter((chunk) => kinds.includes(chunk.kind) === included);
 }
 
-function buildDefaultMemoryFiles(
+async function buildDefaultMemoryFiles(
   chunks: MemoryChunk[],
   now: Date,
   dirtyPaths: Set<string>,
-): { docs: MemoryFileSpec[]; topSources: RankedMemoryChunk[] } {
+  opts: { useOpenViking?: boolean; homeDir?: string } = {},
+): Promise<{ docs: MemoryFileSpec[]; topSources: RankedMemoryChunk[] }> {
   const docs: MemoryFileSpec[] = [];
   const selected: RankedMemoryChunk[] = [];
 
+  let ovClient = null;
+  let ovConfig = null;
+  if (opts.useOpenViking) {
+    ovConfig = loadOpenVikingConfig(opts.homeDir);
+    const candidate = createOpenVikingClient({ ...ovConfig, enabled: true });
+    if (candidate && await candidate.isAvailable()) {
+      ovClient = candidate;
+    }
+  }
+
   for (const template of DEFAULT_TEMPLATES) {
     const ranked = rankMemoryChunks(chunks, template.query, { now, dirtyPaths });
-    const top = selectPreferredChunks(ranked, {
-      limit: template.limit ?? 8,
-      maxPerFile: 2,
-      preferKinds: template.preferKinds,
-    });
+    let top: RankedMemoryChunk[];
+    if (ovClient && ovConfig) {
+      try {
+        top = await hybridRecall(chunks, ranked, ovClient, ovConfig, template.query, {
+          limit: template.limit ?? 8,
+        });
+      } catch {
+        top = selectPreferredChunks(ranked, {
+          limit: template.limit ?? 8,
+          maxPerFile: 2,
+          preferKinds: template.preferKinds,
+        });
+      }
+    } else {
+      top = selectPreferredChunks(ranked, {
+        limit: template.limit ?? 8,
+        maxPerFile: 2,
+        preferKinds: template.preferKinds,
+      });
+    }
     const doc = renderTopicFile(template, top);
     if (doc) {
       docs.push(doc);
@@ -144,14 +173,32 @@ function buildDefaultMemoryFiles(
   return { docs, topSources: uniqueTopSources(selected) };
 }
 
-function buildFocusMemoryFile(
+async function buildFocusMemoryFile(
   chunks: MemoryChunk[],
   query: string,
   now: Date,
   dirtyPaths: Set<string>,
-): { docs: MemoryFileSpec[]; topSources: RankedMemoryChunk[] } {
+  opts: { useOpenViking?: boolean; homeDir?: string } = {},
+): Promise<{ docs: MemoryFileSpec[]; topSources: RankedMemoryChunk[] }> {
   const ranked = rankMemoryChunks(chunks, query, { now, dirtyPaths });
-  const top = selectTopChunks(ranked, { limit: 10, maxPerFile: 2 });
+  let top: RankedMemoryChunk[];
+
+  if (opts.useOpenViking) {
+    const ovConfig = loadOpenVikingConfig(opts.homeDir);
+    const candidate = createOpenVikingClient({ ...ovConfig, enabled: true });
+    if (candidate && await candidate.isAvailable()) {
+      try {
+        top = await hybridRecall(chunks, ranked, candidate, ovConfig, query, { limit: 10 });
+      } catch {
+        top = selectTopChunks(ranked, { limit: 10, maxPerFile: 2 });
+      }
+    } else {
+      top = selectTopChunks(ranked, { limit: 10, maxPerFile: 2 });
+    }
+  } else {
+    top = selectTopChunks(ranked, { limit: 10, maxPerFile: 2 });
+  }
+
   const template: MemoryDocumentTemplate = {
     filename: `focus-${slugifyQuery(query)}.md`,
     name: `Focus: ${query}`,
@@ -193,10 +240,11 @@ export async function refreshClaudeMemory(opts: MemoryRefreshOptions): Promise<M
   const dirtyPaths = readDirtyPathSet(context.contentRoot);
   const trimmedQuery = opts.query?.trim();
   const mode = !trimmedQuery || trimmedQuery.toLowerCase() === 'default' ? 'default' : 'focus';
+  const ovOpts = { useOpenViking: opts.useOpenViking, homeDir: opts.homeDir };
 
   const { docs, topSources } = mode === 'default'
-    ? buildDefaultMemoryFiles(allChunks, now, dirtyPaths)
-    : buildFocusMemoryFile(allChunks, trimmedQuery!, now, dirtyPaths);
+    ? await buildDefaultMemoryFiles(allChunks, now, dirtyPaths, ovOpts)
+    : await buildFocusMemoryFile(allChunks, trimmedQuery!, now, dirtyPaths, ovOpts);
 
   const plannedFiles = ['MEMORY.md', ...docs.map((doc) => doc.name)];
 

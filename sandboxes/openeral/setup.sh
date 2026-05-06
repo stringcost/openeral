@@ -580,8 +580,13 @@ if [ "$OPENERAL_AGENT" = "openclaw" ]; then
 
   # Write ~/.openclaw/openclaw.json so openclaw starts with the right model and
   # API credentials. StringCost proxy takes priority; falls back to a bare API key.
-  # OpenShell placeholder values (openshell:resolve:env:*) ARE written to the config —
-  # the gateway uses them as bearer tokens and OpenShell's HTTP proxy resolves them.
+  #
+  # IMPORTANT: OpenShell placeholder values (openshell:resolve:env:*) are NOT written
+  # to the config for the API key. Unlike Claude Code (a patched binary), OpenClaw's
+  # Node.js gateway uses the Anthropic SDK directly and does not route through
+  # OpenShell's HTTP proxy — so a placeholder in ANTHROPIC_API_KEY would be sent raw
+  # to Anthropic, which rejects it, causing all API calls to hang silently.
+  # Only real (non-placeholder) key values are written.
   echo "setup.sh: writing openclaw config..."
   HOME=/home/agent node -e "
 const fs = require('fs');
@@ -604,6 +609,14 @@ const realKey = rawKey.startsWith('openshell:resolve:env:') ? '' : rawKey;
 if (proxyUrl) {
   config.env.ANTHROPIC_BASE_URL = proxyUrl;
   config.env.ANTHROPIC_AUTH_TOKEN = 'dummy';
+  // Also configure via OpenClaw's native provider format so the gateway picks up
+  // the proxy endpoint regardless of how it injects env vars.
+  if (!config.models) config.models = {};
+  if (!config.models.providers) config.models.providers = {};
+  if (!config.models.providers.anthropic) config.models.providers.anthropic = {};
+  config.models.providers.anthropic.baseUrl = proxyUrl;
+  config.models.providers.anthropic.apiKey = 'dummy';
+  config.models.providers.anthropic.api = 'anthropic-messages';
   // Keep the real key when available so OpenClaw doesn't bail before making calls.
   // StringCost authenticates via the presign token in the URL, not the key header.
   if (realKey) {
@@ -612,27 +625,42 @@ if (proxyUrl) {
     delete config.env.ANTHROPIC_API_KEY;
   }
 } else {
-  if (rawKey) {
-    config.env.ANTHROPIC_API_KEY = rawKey;
+  // Only write a real key — never write a placeholder (see comment above).
+  if (realKey) {
+    config.env.ANTHROPIC_API_KEY = realKey;
+  } else {
+    delete config.env.ANTHROPIC_API_KEY;
   }
   delete config.env.ANTHROPIC_BASE_URL;
   delete config.env.ANTHROPIC_AUTH_TOKEN;
+  if (config.models && config.models.providers && config.models.providers.anthropic) {
+    delete config.models.providers.anthropic.baseUrl;
+    delete config.models.providers.anthropic.apiKey;
+    delete config.models.providers.anthropic.api;
+  }
 }
 fs.mkdirSync(dir, { recursive: true, mode: 0o700 });
 fs.writeFileSync(file, JSON.stringify(config, null, 2), { mode: 0o600 });
 console.log('setup.sh: openclaw config written to ' + file);
 "
 
-  # Warn if OpenClaw has no credentials to call the Anthropic API.
-  # ANTHROPIC_API_KEY may be an openshell:resolve:env:* placeholder (resolved by
-  # the OpenShell HTTP proxy) — that is fine. An empty value means the sandbox was
-  # created without the key being exported in the host shell.
-  if [ -z "${STRINGCOST_PROXY_URL:-}" ] && [ -z "${ANTHROPIC_API_KEY:-}" ]; then
-    echo "setup.sh: WARNING: ANTHROPIC_API_KEY is not set and no StringCost presign is available." >&2
-    echo "setup.sh: OpenClaw will start but cannot make Anthropic API calls — responses will hang." >&2
-    echo "setup.sh: Fix: export ANTHROPIC_API_KEY='<your-key>' in your host shell before" >&2
-    echo "setup.sh:      running 'openshell sandbox create', then create a new sandbox." >&2
-    echo "setup.sh:      If your key is in .env: set -a; source .env; set +a" >&2
+  # Warn if OpenClaw has no usable API credentials.
+  # A placeholder (openshell:resolve:env:*) is NOT usable — unlike Claude Code,
+  # OpenClaw's Node.js gateway does not route through OpenShell's HTTP proxy, so
+  # the placeholder would be sent raw to Anthropic and every API call would hang.
+  _openclaw_key_ok=false
+  case "${ANTHROPIC_API_KEY:-}" in
+    ''|openshell:resolve:env:*) ;;
+    *) _openclaw_key_ok=true ;;
+  esac
+  if [ -z "${STRINGCOST_PROXY_URL:-}" ] && [ "$_openclaw_key_ok" = "false" ]; then
+    echo "setup.sh: WARNING: OpenClaw has no usable API credentials." >&2
+    echo "setup.sh:   ANTHROPIC_API_KEY is missing or is an OpenShell placeholder that" >&2
+    echo "setup.sh:   OpenClaw's gateway cannot resolve. Responses will hang." >&2
+    echo "setup.sh:   Fix A — upload a real key file before creating the sandbox:" >&2
+    echo "setup.sh:     echo '<your-anthropic-api-key>' > /tmp/anthropic-api-key" >&2
+    echo "setup.sh:     openshell sandbox create --upload /tmp/anthropic-api-key:/sandbox/anthropic-api-key ..." >&2
+    echo "setup.sh:   Fix B — set STRINGCOST_API_KEY so setup.sh can create a presign automatically." >&2
   fi
 
   # OpenClaw uses a gateway/client architecture: the gateway (ws://127.0.0.1:18789)
@@ -695,7 +723,8 @@ console.log('setup.sh: openclaw config written to ' + file);
   # Re-apply auth credentials: the gateway modifies openclaw.json during startup
   # (adds gateway.auth.token, may clobber env settings on first run). Write our
   # auth settings back now that the gateway has finished its own modifications.
-  # OpenShell placeholder values are written as-is — the HTTP proxy resolves them.
+  # Only real key values are written — never OpenShell placeholders (see first
+  # config-write block for the explanation).
   echo "setup.sh: re-applying openclaw auth config..."
   HOME=/home/agent node -e "
 const fs = require('fs');
@@ -728,17 +757,30 @@ const realKey = rawKey.startsWith('openshell:resolve:env:') ? '' : rawKey;
 if (proxyUrl) {
   config.env.ANTHROPIC_BASE_URL = proxyUrl;
   config.env.ANTHROPIC_AUTH_TOKEN = 'dummy';
+  if (!config.models) config.models = {};
+  if (!config.models.providers) config.models.providers = {};
+  if (!config.models.providers.anthropic) config.models.providers.anthropic = {};
+  config.models.providers.anthropic.baseUrl = proxyUrl;
+  config.models.providers.anthropic.apiKey = 'dummy';
+  config.models.providers.anthropic.api = 'anthropic-messages';
   if (realKey) {
     config.env.ANTHROPIC_API_KEY = realKey;
   } else {
     delete config.env.ANTHROPIC_API_KEY;
   }
 } else {
-  if (rawKey) {
-    config.env.ANTHROPIC_API_KEY = rawKey;
+  if (realKey) {
+    config.env.ANTHROPIC_API_KEY = realKey;
+  } else {
+    delete config.env.ANTHROPIC_API_KEY;
   }
   delete config.env.ANTHROPIC_BASE_URL;
   delete config.env.ANTHROPIC_AUTH_TOKEN;
+  if (config.models && config.models.providers && config.models.providers.anthropic) {
+    delete config.models.providers.anthropic.baseUrl;
+    delete config.models.providers.anthropic.apiKey;
+    delete config.models.providers.anthropic.api;
+  }
 }
 fs.writeFileSync(file, JSON.stringify(config, null, 2), { mode: 0o600 });
 console.log('setup.sh: openclaw auth config applied');

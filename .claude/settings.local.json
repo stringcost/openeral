@@ -110,7 +110,8 @@
       "Bash(bash -n /mnt/c/Users/dines/OneDrive/Desktop/work/openeral/sandboxes/openeral/setup.sh)",
       "Bash(git add *)",
       "Bash(git commit -m ' *)",
-      "Bash(git config *)"
+      "Bash(git config *)",
+      "Bash(git *)"
     ]
   }
 }

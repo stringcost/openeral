@@ -148,7 +148,9 @@ type AgentKind = 'claude' | 'openclaw';
 
 type ParsedArgs =
   | { kind: 'launch'; workspaceId: string; claudeArgs: string[]; agent: AgentKind }
-  | { kind: 'memory-refresh'; workspaceId: string; projectRoot: string; query: string; dryRun: boolean; backup: boolean }
+  | { kind: 'memory-refresh'; workspaceId: string; projectRoot: string; query: string; dryRun: boolean; backup: boolean; useOpenViking: boolean }
+  | { kind: 'memory-status' }
+  | { kind: 'memory-migrate'; toOpenViking: boolean }
   | { kind: 'help' };
 
 export function parseCliArgs(args: string[]): ParsedArgs {
@@ -161,39 +163,53 @@ export function parseCliArgs(args: string[]): ParsedArgs {
     }
   }
 
-  // Check for memory refresh command
-  if (args[0] === 'memory' && args[1] === 'refresh') {
-    let workspaceId = process.env.OPENERAL_WORKSPACE_ID || 'openeral-claude';
-    let projectRoot = '';
-    let query = '';
-    let dryRun = false;
-    let backup = true;
+  // Check for memory subcommands
+  if (args[0] === 'memory') {
+    if (args[1] === 'status') {
+      return { kind: 'memory-status' };
+    }
 
-    for (let i = 2; i < args.length; i++) {
-      if ((args[i] === '--workspace' || args[i] === '-w') && args[i + 1]) {
-        workspaceId = args[++i];
-      } else if (args[i] === '--project-root' && args[i + 1]) {
-        projectRoot = args[++i];
-      } else if (args[i] === '--query' && args[i + 1]) {
-        query = args[++i];
-      } else if (args[i] === '--dry-run') {
-        dryRun = true;
-      } else if (args[i] === '--no-backup') {
-        backup = false;
+    if (args[1] === 'migrate') {
+      const toOpenViking = args.includes('--to-openviking');
+      return { kind: 'memory-migrate', toOpenViking };
+    }
+
+    if (args[1] === 'refresh') {
+      let workspaceId = process.env.OPENERAL_WORKSPACE_ID || 'openeral-claude';
+      let projectRoot = '';
+      let query = '';
+      let dryRun = false;
+      let backup = true;
+      let useOpenViking = false;
+
+      for (let i = 2; i < args.length; i++) {
+        if ((args[i] === '--workspace' || args[i] === '-w') && args[i + 1]) {
+          workspaceId = args[++i];
+        } else if (args[i] === '--project-root' && args[i + 1]) {
+          projectRoot = args[++i];
+        } else if (args[i] === '--query' && args[i + 1]) {
+          query = args[++i];
+        } else if (args[i] === '--dry-run') {
+          dryRun = true;
+        } else if (args[i] === '--no-backup') {
+          backup = false;
+        } else if (args[i] === '--openviking') {
+          useOpenViking = true;
+        }
       }
-    }
 
-    // Normalize workspace ID to be Kubernetes-compliant
-    const originalId = workspaceId;
-    workspaceId = workspaceId.toLowerCase().replace(/[^a-z0-9-]/g, '-').replace(/^-+|-+$/g, '').replace(/-{2,}/g, '-');
-    
-    // Prevent empty workspace ID
-    if (workspaceId.length === 0) {
-      workspaceId = 'openeral-claude';
-      process.stderr.write(`\x1b[33mwarning: workspace ID "${originalId}" normalized to empty string, using default: ${workspaceId}\x1b[0m\n`);
-    }
+      // Normalize workspace ID to be Kubernetes-compliant
+      const originalId = workspaceId;
+      workspaceId = workspaceId.toLowerCase().replace(/[^a-z0-9-]/g, '-').replace(/^-+|-+$/g, '').replace(/-{2,}/g, '-');
 
-    return { kind: 'memory-refresh', workspaceId, projectRoot, query, dryRun, backup };
+      // Prevent empty workspace ID
+      if (workspaceId.length === 0) {
+        workspaceId = 'openeral-claude';
+        process.stderr.write(`\x1b[33mwarning: workspace ID "${originalId}" normalized to empty string, using default: ${workspaceId}\x1b[0m\n`);
+      }
+
+      return { kind: 'memory-refresh', workspaceId, projectRoot, query, dryRun, backup, useOpenViking };
+    }
   }
 
   // Default: launch mode
@@ -237,6 +253,8 @@ function printHelp(): void {
   openeral analyze [options]              Analyze session history and suggest optimizations
   openeral apply [options]                Apply optimization suggestions to project files
   openeral memory refresh [options]       Refresh memory system
+  openeral memory status                  Show OpenViking connection status
+  openeral memory migrate --to-openviking Migrate local memories to OpenViking
 
 Launch Options:
   --workspace, -w <id>    Workspace ID (default: openeral-claude)
@@ -258,6 +276,7 @@ Memory Refresh Options:
   --query <text>          Search query
   --dry-run               Preview changes without applying
   --no-backup             Skip backup creation
+  --openviking            Use OpenViking semantic search (requires OpenViking server at ~/.openeral/openviking.json)
 
 Auth (presign-first model):
   If ~/.config/openeral/presign.json exists, no env vars are required.
@@ -1956,6 +1975,95 @@ export async function main() {
     return;
   }
 
+  if (parsed.kind === 'memory-status') {
+    const { loadOpenVikingConfig } = await import('./openviking/config.js');
+    const { createOpenVikingClient } = await import('./openviking/client.js');
+    const config = loadOpenVikingConfig(process.env.HOME);
+    const client = createOpenVikingClient({ ...config, enabled: true });
+    if (!client) {
+      process.stderr.write('OpenViking is not configured.\n');
+      process.stderr.write(`Config path: ${(await import('./openviking/config.js')).getConfigPath(process.env.HOME)}\n`);
+      return;
+    }
+    const status = await client.getStatus();
+    const tick = '\x1b[32m✓\x1b[0m';
+    const cross = '\x1b[31m✗\x1b[0m';
+    const connected = status.connected ? `${tick} Connected` : `${cross} Disconnected`;
+    const healthy = status.healthy ? `${tick} Healthy` : `${cross} Unhealthy`;
+    console.log('\nOpenViking Status');
+    console.log('─'.repeat(45));
+    console.log(`Connection:  ${connected} (${status.endpoint})`);
+    console.log(`Health:      ${healthy}`);
+    console.log(`Latency:     ${status.latencyMs}ms`);
+    if (status.connected) {
+      console.log('\nMemory Stats');
+      console.log('─'.repeat(45));
+      if (status.userMemories !== undefined) console.log(`User memories:      ${status.userMemories}`);
+      if (status.agentMemories !== undefined) console.log(`Agent memories:     ${status.agentMemories}`);
+      if (status.sessionArchives !== undefined) console.log(`Session archives:   ${status.sessionArchives}`);
+      if (status.resources !== undefined) console.log(`Resources:          ${status.resources}`);
+    }
+    console.log('\nConfiguration');
+    console.log('─'.repeat(45));
+    console.log(`Enabled:     ${config.enabled}`);
+    console.log(`Endpoint:    ${config.endpoint}`);
+    console.log(`Agent ID:    ${config.agentId}`);
+    console.log(`Auto-recall: ${config.autoRecall.enabled ? 'enabled' : 'disabled'} (limit: ${config.autoRecall.limit}, threshold: ${config.autoRecall.scoreThreshold})`);
+    console.log(`Auto-capture: ${config.autoCapture.enabled ? 'enabled' : 'disabled'} (mode: ${config.autoCapture.mode}, interval: ${config.autoCapture.intervalMinutes}min)`);
+    console.log('');
+    return;
+  }
+
+  if (parsed.kind === 'memory-migrate') {
+    if (!parsed.toOpenViking) {
+      process.stderr.write('Usage: openeral memory migrate --to-openviking\n');
+      process.exit(1);
+    }
+    const { loadOpenVikingConfig } = await import('./openviking/config.js');
+    const { createOpenVikingClient } = await import('./openviking/client.js');
+    const { resolveProjectContext } = await import('./memory/resolve.js');
+    const { readdirSync, readFileSync, existsSync } = await import('node:fs');
+    const { join } = await import('node:path');
+
+    const config = loadOpenVikingConfig(process.env.HOME);
+    const client = createOpenVikingClient({ ...config, enabled: true });
+    if (!client) {
+      process.stderr.write('\x1b[31merror: OpenViking config missing. Create ~/.openeral/openviking.json first.\x1b[0m\n');
+      process.exit(1);
+    }
+    if (!(await client.isAvailable())) {
+      process.stderr.write(`\x1b[31merror: OpenViking server not reachable at ${config.endpoint}\x1b[0m\n`);
+      process.exit(1);
+    }
+
+    const ctx = resolveProjectContext({ homeDir: process.env.HOME ?? '', cwd: process.cwd() });
+    if (!existsSync(ctx.memoryDir)) {
+      process.stderr.write(`\x1b[33mNo local memories found at ${ctx.memoryDir}\x1b[0m\n`);
+      return;
+    }
+
+    const files = readdirSync(ctx.memoryDir).filter((f) => f.endsWith('.md'));
+    let imported = 0;
+    let failed = 0;
+    for (const file of files) {
+      try {
+        const content = readFileSync(join(ctx.memoryDir, file), 'utf8');
+        await client.store(content, {
+          uri: `viking://user/memories/${ctx.projectSlug}/${file}`,
+          source: 'openeral-migration',
+          project: ctx.projectSlug,
+        });
+        process.stderr.write(`\x1b[32m  migrated\x1b[0m ${file}\n`);
+        imported++;
+      } catch (err: unknown) {
+        process.stderr.write(`\x1b[31m  failed\x1b[0m ${file}: ${(err as Error).message}\n`);
+        failed++;
+      }
+    }
+    process.stderr.write(`\nopeneral: migration complete — ${imported} imported, ${failed} failed\n`);
+    return;
+  }
+
   if (parsed.kind === 'memory-refresh') {
     const { refreshClaudeMemory } = await import('./memory/refresh.js');
     try {
@@ -1966,6 +2074,7 @@ export async function main() {
         query: parsed.query || undefined,
         dryRun: parsed.dryRun,
         backup: parsed.backup,
+        useOpenViking: parsed.useOpenViking,
       });
       process.stderr.write(
         `\x1b[2mopeneral: memory ${result.mode} mode (project: ${result.context.projectSlug})\x1b[0m\n`,

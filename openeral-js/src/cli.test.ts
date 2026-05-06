@@ -193,6 +193,7 @@ describe('CLI argument parsing', () => {
       query: 'openshell proxy',
       dryRun: true,
       backup: false,
+      useOpenViking: false,
     });
   });
 
