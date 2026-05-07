@@ -44,8 +44,6 @@ export interface MemoryRefreshOptions {
   dryRun?: boolean;
   backup?: boolean;
   now?: Date;
-  /** Use OpenViking semantic search in addition to local keyword ranking. */
-  useOpenViking?: boolean;
 }
 
 export interface MemoryRefreshResult {

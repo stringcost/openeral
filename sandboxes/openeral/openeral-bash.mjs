@@ -23,49 +23,6 @@
 import { createServer, createConnection } from 'node:net';
 import { existsSync, unlinkSync, chmodSync } from 'node:fs';
 
-// ---------------------------------------------------------------------------
-// OpenViking auto-capture (optional — gracefully disabled when not configured)
-// ---------------------------------------------------------------------------
-
-let ovSessionManager = null;
-let ovCommitQueue = null;
-const OV_SESSION_ID = process.env.OPENSHELL_SANDBOX_ID || process.env.WORKSPACE_ID || 'default';
-
-async function initOpenViking() {
-  try {
-    const { loadOpenVikingConfig } = await import('/opt/openeral/dist/openviking/config.js');
-    const config = loadOpenVikingConfig(process.env.HOME || '/home/agent');
-    if (!config.enabled || !config.autoCapture.enabled) return;
-
-    const { createOpenVikingClient } = await import('/opt/openeral/dist/openviking/client.js');
-    const client = createOpenVikingClient(config);
-    if (!client || !(await client.isAvailable())) return;
-
-    const { SessionManager, BackgroundCommitQueue } = await import('/opt/openeral/dist/openviking/session.js');
-    ovSessionManager = new SessionManager(client);
-    ovCommitQueue = new BackgroundCommitQueue(ovSessionManager, config.autoCapture.timeoutMs);
-    process.stderr.write('openeral-bash: OpenViking auto-capture enabled\n');
-  } catch {
-    // OpenViking not available — no-op
-  }
-}
-
-async function captureCommand(command, result) {
-  if (!ovSessionManager || !ovCommitQueue) return;
-  try {
-    await ovSessionManager.appendTurn(OV_SESSION_ID, { role: 'user', content: command });
-    if (result.stdout || result.stderr) {
-      const output = [result.stdout, result.stderr].filter(Boolean).join('\n').slice(0, 2000);
-      await ovSessionManager.appendTurn(OV_SESSION_ID, { role: 'assistant', content: output });
-    }
-    if (ovSessionManager.shouldCommit(OV_SESSION_ID)) {
-      ovCommitQueue.enqueue(OV_SESSION_ID);
-    }
-  } catch {
-    // Capture failure is non-fatal
-  }
-}
-
 const SOCKET_PATH = '/tmp/openeral-bash.sock';
 const HOME_DIR = process.env.OPENERAL_HOME || '/home/agent';
 const syncModulePromise = import('/opt/openeral/dist/sync.js');
@@ -151,8 +108,6 @@ async function execCommandWithSync(shell, pool, workspaceId, command, syncWatch 
 // ---------------------------------------------------------------------------
 
 async function startDaemon() {
-  await initOpenViking();
-
   const { createOpeneralShell } = await import('/opt/openeral/dist/shell.js');
   const { getDatabaseConnection } = await import('/opt/openeral/dist/db/embedded.js');
 
@@ -207,8 +162,7 @@ async function startDaemon() {
         return;
       }
 
-      execCommandWithSync(shell, pool, workspaceId, command, syncWatch).then(async (result) => {
-        await captureCommand(command, result);
+      execCommandWithSync(shell, pool, workspaceId, command, syncWatch).then((result) => {
         conn.end(JSON.stringify({
           stdout: result.stdout,
           stderr: result.stderr,
