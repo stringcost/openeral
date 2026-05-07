@@ -384,7 +384,11 @@ async fn test_seed_from_directory_uses_default_workspace_owner() {
     let temp_dir = std::env::temp_dir().join(format!("openeral-seed-{}", ws_id));
 
     std::fs::create_dir_all(temp_dir.join("nested")).unwrap();
-    std::fs::write(temp_dir.join("nested").join("hello.txt"), b"hello from disk").unwrap();
+    std::fs::write(
+        temp_dir.join("nested").join("hello.txt"),
+        b"hello from disk",
+    )
+    .unwrap();
 
     ws_queries::create_workspace(&pool, &ws_id, Some("Seed Dir Test"), &layout)
         .await
@@ -399,7 +403,9 @@ async fn test_seed_from_directory_uses_default_workspace_owner() {
         .unwrap();
     assert_eq!(count, 2);
 
-    let nested = ws_queries::get_file(&pool, &ws_id, "/nested").await.unwrap();
+    let nested = ws_queries::get_file(&pool, &ws_id, "/nested")
+        .await
+        .unwrap();
     assert!(nested.is_dir);
     assert_eq!(nested.uid, root.uid);
     assert_eq!(nested.gid, root.gid);

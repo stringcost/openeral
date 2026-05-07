@@ -58,7 +58,7 @@ async fn sandbox_file_upload_download_round_trip() {
 
     let download_str = download_dir.to_str().expect("download path is UTF-8");
     guard
-        .download("/sandbox/uploaded", download_str)
+        .download("/sandbox/uploaded/upload", download_str)
         .await
         .expect("download directory");
 
@@ -108,7 +108,7 @@ async fn sandbox_file_upload_download_round_trip() {
 
     let large_down_str = large_down.to_str().expect("large_down path is UTF-8");
     guard
-        .download("/sandbox/large_test", large_down_str)
+        .download("/sandbox/large_test/large_upload", large_down_str)
         .await
         .expect("download large file");
 
@@ -261,26 +261,31 @@ async fn upload_respects_gitignore_by_default() {
         .await
         .expect("download filtered upload");
 
+    // Filtered uploads of a directory preserve the source basename, so
+    // contents land under `<download>/repo/...` (matches `openshell sandbox
+    // upload <dir> <dest>` semantics from the unfiltered path).
+    let uploaded_root = download_dir.join("repo");
+
     // tracked.txt should be present.
-    let tracked = fs::read_to_string(download_dir.join("tracked.txt"))
+    let tracked = fs::read_to_string(uploaded_root.join("tracked.txt"))
         .expect("tracked.txt should exist after filtered upload");
     assert_eq!(tracked, "i-am-tracked", "tracked.txt content mismatch");
 
     // .gitignore itself should be present (it's tracked).
     assert!(
-        download_dir.join(".gitignore").exists(),
+        uploaded_root.join(".gitignore").exists(),
         ".gitignore should be uploaded (it's a tracked file)"
     );
 
     // ignored.log should NOT be present.
     assert!(
-        !download_dir.join("ignored.log").exists(),
+        !uploaded_root.join("ignored.log").exists(),
         "ignored.log should be filtered out by .gitignore"
     );
 
     // build/ directory should NOT be present.
     assert!(
-        !download_dir.join("build").exists(),
+        !uploaded_root.join("build").exists(),
         "build/ directory should be filtered out by .gitignore"
     );
 

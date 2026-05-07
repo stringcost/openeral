@@ -30,11 +30,21 @@ pub fn draw(frame: &mut Frame<'_>, app: &mut App, area: Rect) {
         Line::from(Span::styled(" Network Rules ", t.heading))
     };
 
-    let block = Block::default()
+    let mut block = Block::default()
         .title(title)
         .borders(Borders::ALL)
         .border_style(t.border_focused)
         .padding(Padding::horizontal(1));
+
+    if app.sandbox_policy_is_global {
+        block = block.title_bottom(
+            Line::from(Span::styled(
+                " Cannot approve rules while global policy is active ",
+                t.status_warn,
+            ))
+            .left_aligned(),
+        );
+    }
 
     if app.draft_chunks.is_empty() {
         let msg = Paragraph::new(
@@ -69,14 +79,22 @@ pub fn draw(frame: &mut Frame<'_>, app: &mut App, area: Rect) {
         .map(|(i, chunk)| {
             let is_selected = i == cursor_pos;
 
-            let status_style = match chunk.status.as_str() {
-                "pending" => t.status_warn,
-                "approved" => t.status_ok,
-                "rejected" => t.status_err,
-                _ => t.muted,
+            let globally_locked = app.sandbox_policy_is_global;
+
+            let status_style = if globally_locked {
+                t.muted
+            } else {
+                match chunk.status.as_str() {
+                    "pending" => t.status_warn,
+                    "approved" => t.status_ok,
+                    "rejected" => t.status_err,
+                    _ => t.muted,
+                }
             };
 
-            let name_style = if is_selected {
+            let name_style = if globally_locked {
+                t.muted
+            } else if is_selected {
                 t.selected
             } else if chunk.status == "rejected" {
                 t.muted
@@ -306,7 +324,7 @@ pub fn draw_approve_all_popup(
     let count = chunks.len();
     // Height: header(1) + blank(1) + chunks(count, capped at 12) + blank(1) + hints(1) + borders(2) + padding(1)
     let list_lines = count.min(12);
-    let popup_height = (7 + list_lines) as u16;
+    let popup_height = u16::try_from(7 + list_lines).unwrap_or(u16::MAX);
     let popup_height = popup_height.min(area.height.saturating_sub(4));
     let popup_width = (area.width * 4 / 5).min(area.width.saturating_sub(4));
     let popup_area = centered_rect(popup_width, popup_height, area);

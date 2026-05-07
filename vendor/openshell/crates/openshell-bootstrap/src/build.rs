@@ -1,27 +1,86 @@
 // SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
-//! Build and push container images into a k3s gateway.
+//! Build container images for gateway runtimes.
 //!
 //! This module wraps bollard's `build_image()` API to build a container image
-//! from a Dockerfile and build context, then reuses the existing push pipeline
-//! to import the image into the gateway's containerd runtime.
+//! from a Dockerfile and build context. Kubernetes deployments reuse the
+//! existing push pipeline to import the image into the gateway's containerd
+//! runtime. VM deployments keep the built image in the local Docker daemon and
+//! pass an internal local-image reference to the VM driver.
 
 use std::collections::HashMap;
-use std::io::Read;
 use std::path::Path;
+use std::time::Duration;
 
 use bollard::Docker;
 use bollard::query_parameters::BuildImageOptionsBuilder;
 use futures::StreamExt;
 use miette::{IntoDiagnostic, Result, WrapErr};
+use tokio::time::timeout;
 
 use crate::constants::container_name;
 use crate::push::push_local_images;
 
+/// Maximum gap between Docker build stream events before a build is treated
+/// as stuck.
+///
+/// Total silence longer than this on under-provisioned container runtimes
+/// (e.g. default Colima 2 vCPU / 2 GiB on macOS) reliably indicates a
+/// deadlocked builder that will never recover. The default leaves headroom
+/// for legitimately quiet steps (a single long `RUN` that produces no output)
+/// — override with `OPENSHELL_BUILD_NO_PROGRESS_TIMEOUT_SECS` if a specific
+/// build needs more time, or shorter for CI tightening.
+const DEFAULT_BUILD_NO_PROGRESS_TIMEOUT_SECS: u64 = 1800;
+
+/// Build a container image from a Dockerfile using the local Docker daemon.
+///
+/// This is used by `openshell sandbox create --from <Dockerfile>` for both the
+/// Kubernetes and VM backends. The image remains available in the local Docker
+/// daemon so the caller can either hand the resulting tag directly to the VM
+/// backend or import it into a local gateway containerd runtime.
+#[allow(clippy::implicit_hasher)]
+pub async fn build_local_image(
+    dockerfile_path: &Path,
+    tag: &str,
+    context_dir: &Path,
+    build_args: &HashMap<String, String>,
+    on_log: &mut impl FnMut(String),
+) -> Result<()> {
+    on_log(format!(
+        "Building image {tag} from {}",
+        dockerfile_path.display()
+    ));
+    build_image(dockerfile_path, tag, context_dir, build_args, on_log).await?;
+    on_log(format!("Built image {tag}"));
+    Ok(())
+}
+
+/// Push a locally-built image into the gateway's containerd runtime.
+#[allow(clippy::implicit_hasher)]
+pub async fn push_image_into_gateway(
+    tag: &str,
+    gateway_name: &str,
+    on_log: &mut impl FnMut(String),
+) -> Result<()> {
+    on_log(format!(
+        "Pushing image {tag} into gateway \"{gateway_name}\""
+    ));
+    let local_docker = crate::docker::connect_local_for_large_transfers()
+        .into_diagnostic()
+        .wrap_err("failed to connect to local Docker daemon")?;
+    let container = container_name(gateway_name);
+    let images: Vec<&str> = vec![tag];
+    push_local_images(&local_docker, &local_docker, &container, &images, on_log).await?;
+
+    on_log(format!("Image {tag} is available in the gateway."));
+    Ok(())
+}
+
 /// Build a container image from a Dockerfile and push it into the gateway.
 ///
-/// This is used by `openshell sandbox create --from <Dockerfile>`. It:
+/// This is used by `openshell sandbox create --from <Dockerfile>` when the
+/// active gateway is the local Kubernetes deployment. It:
 /// 1. Creates a tar archive of the build context directory.
 /// 2. Sends it to the local Docker daemon via `build_image()`.
 /// 3. Pushes the resulting image into the gateway's containerd via the
@@ -35,26 +94,8 @@ pub async fn build_and_push_image(
     build_args: &HashMap<String, String>,
     on_log: &mut impl FnMut(String),
 ) -> Result<()> {
-    // 1. Build the image locally.
-    on_log(format!(
-        "Building image {tag} from {}",
-        dockerfile_path.display()
-    ));
-    build_image(dockerfile_path, tag, context_dir, build_args, on_log).await?;
-    on_log(format!("Built image {tag}"));
-
-    // 2. Push into the gateway.
-    on_log(format!(
-        "Pushing image {tag} into gateway \"{gateway_name}\""
-    ));
-    let local_docker = Docker::connect_with_local_defaults()
-        .into_diagnostic()
-        .wrap_err("failed to connect to local Docker daemon")?;
-    let container = container_name(gateway_name);
-    let images: Vec<&str> = vec![tag];
-    push_local_images(&local_docker, &local_docker, &container, &images, on_log).await?;
-
-    on_log(format!("Image {tag} is available in the gateway."));
+    build_local_image(dockerfile_path, tag, context_dir, build_args, on_log).await?;
+    push_image_into_gateway(tag, gateway_name, on_log).await?;
     Ok(())
 }
 
@@ -98,9 +139,30 @@ async fn build_image(
 
     let body = bollard::body_full(bytes::Bytes::from(context_tar));
     let mut stream = docker.build_image(options, None, Some(body));
+    let no_progress_secs: u64 = std::env::var("OPENSHELL_BUILD_NO_PROGRESS_TIMEOUT_SECS")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .filter(|&n| n > 0)
+        .unwrap_or(DEFAULT_BUILD_NO_PROGRESS_TIMEOUT_SECS);
+    let no_progress_timeout = Duration::from_secs(no_progress_secs);
 
-    while let Some(result) = stream.next().await {
-        let info = result
+    loop {
+        let next = match timeout(no_progress_timeout, stream.next()).await {
+            Ok(Some(result)) => result,
+            Ok(None) => break,
+            Err(_) => {
+                return Err(miette::miette!(
+                    "Docker build produced no output for {}s. This usually means the container \
+                     runtime is under-provisioned (CPU/memory) and the builder has deadlocked; \
+                     check `docker info` (NCPU, MemTotal) and increase Colima/Docker Desktop \
+                     resources before retrying. If a legitimate build step is just quiet, raise \
+                     the threshold with OPENSHELL_BUILD_NO_PROGRESS_TIMEOUT_SECS=<secs>.",
+                    no_progress_timeout.as_secs()
+                ));
+            }
+        };
+
+        let info = next
             .into_diagnostic()
             .wrap_err("Docker build stream error")?;
 
@@ -176,36 +238,10 @@ fn walk_and_add(
         if path.is_dir() {
             walk_and_add(root, &path, ignore_patterns, builder)?;
         } else {
-            let mut file = std::fs::File::open(&path)
-                .into_diagnostic()
-                .wrap_err_with(|| format!("failed to open file: {}", path.display()))?;
-            let metadata = file
-                .metadata()
-                .into_diagnostic()
-                .wrap_err_with(|| format!("failed to read metadata: {}", path.display()))?;
-
-            let mut header = tar::Header::new_gnu();
-            header.set_size(metadata.len());
-            header.set_mode(0o644);
-            #[cfg(unix)]
-            {
-                use std::os::unix::fs::PermissionsExt;
-                header.set_mode(metadata.permissions().mode());
-            }
-            header
-                .set_path(&relative_normalized)
-                .into_diagnostic()
-                .wrap_err_with(|| format!("failed to set tar entry path: {relative_normalized}"))?;
-            header.set_cksum();
-
-            #[allow(clippy::cast_possible_truncation)]
-            let mut contents = Vec::with_capacity(metadata.len() as usize);
-            file.read_to_end(&mut contents)
-                .into_diagnostic()
-                .wrap_err_with(|| format!("failed to read file: {}", path.display()))?;
-
+            // Use append_path_with_name which handles GNU LongName extensions
+            // for paths exceeding 100 bytes (the POSIX tar name field limit).
             builder
-                .append(&header, contents.as_slice())
+                .append_path_with_name(&path, &relative_normalized)
                 .into_diagnostic()
                 .wrap_err_with(|| format!("failed to add file to tar: {relative_normalized}"))?;
         }
@@ -431,6 +467,39 @@ mod tests {
 
         assert!(!entries.iter().any(|e| e.contains("a.log")));
         assert!(entries.iter().any(|e| e.contains("important.log")));
+    }
+
+    #[test]
+    fn test_long_path_exceeding_100_bytes() {
+        let dir = tempfile::tempdir().unwrap();
+        let dir_path = dir.path();
+
+        // Build a nested path that exceeds 100 bytes when relative to root.
+        let deep_dir = dir_path.join(
+            "a/deeply/nested/directory/path/that/exceeds/one/hundred/bytes/total/from/the/build/context/root",
+        );
+        fs::create_dir_all(&deep_dir).unwrap();
+        fs::write(deep_dir.join("file.txt"), "deep content\n").unwrap();
+        fs::write(dir_path.join("Dockerfile"), "FROM ubuntu:24.04\n").unwrap();
+
+        let tar_bytes = create_build_context_tar(dir_path).unwrap();
+        let mut archive = tar::Archive::new(tar_bytes.as_slice());
+        let entries: Vec<String> = archive
+            .entries()
+            .unwrap()
+            .filter_map(std::result::Result::ok)
+            .map(|e| e.path().unwrap().to_string_lossy().to_string())
+            .collect();
+
+        let long_entry = entries.iter().find(|e| e.contains("file.txt"));
+        assert!(
+            long_entry.is_some(),
+            "tar should contain deeply nested file; entries: {entries:?}"
+        );
+        assert!(
+            long_entry.unwrap().len() > 100,
+            "path should exceed 100 bytes to exercise GNU LongName handling"
+        );
     }
 
     #[test]

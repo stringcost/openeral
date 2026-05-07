@@ -1,0 +1,24 @@
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+# Keycloak dev instance for OIDC testing
+
+[keycloak]
+description = "Start a local Keycloak instance for OIDC testing"
+run = "scripts/keycloak-dev.sh start"
+
+["keycloak:stop"]
+description = "Stop and remove the local Keycloak instance"
+run = "scripts/keycloak-dev.sh stop"
+
+["keycloak:status"]
+description = "Check if the local Keycloak instance is running"
+run = "scripts/keycloak-dev.sh status"
+
+["keycloak:k8s:setup"]
+description = "Install Keycloak in the local k3s cluster and import the openshell realm (one-time setup)"
+run = "tasks/scripts/keycloak-k8s-setup.sh"
+
+["keycloak:k8s:teardown"]
+description = "Remove Keycloak from the local k3s cluster"
+run = "kubectl delete namespace keycloak --ignore-not-found"

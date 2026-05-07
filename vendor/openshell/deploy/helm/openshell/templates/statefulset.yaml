@@ -44,11 +44,19 @@ spec:
         - name: {{ .Chart.Name }}
           securityContext:
             {{- toYaml .Values.securityContext | nindent 12 }}
-          image: "{{ .Values.image.repository }}:{{ .Values.image.tag | default .Chart.AppVersion }}"
+          image: {{ include "openshell.image" . | quote }}
           imagePullPolicy: {{ .Values.image.pullPolicy }}
           args:
+            - --bind-address
+            - "0.0.0.0"
             - --port
             - {{ .Values.service.port | quote }}
+            - --health-port
+            - {{ .Values.service.healthPort | quote }}
+            {{- if .Values.service.metricsPort }}
+            - --metrics-port
+            - {{ .Values.service.metricsPort | quote }}
+            {{- end }}
             - --log-level
             - {{ .Values.server.logLevel }}
             - --db-url
@@ -62,29 +70,11 @@ spec:
             - name: OPENSHELL_SANDBOX_IMAGE_PULL_POLICY
               value: {{ .Values.server.sandboxImagePullPolicy | quote }}
             {{- end }}
-            {{- if .Values.server.sandboxFuseResourceName }}
-            - name: OPENSHELL_SANDBOX_FUSE_RESOURCE_NAME
-              value: {{ .Values.server.sandboxFuseResourceName | quote }}
-            {{- end }}
-            {{- if .Values.server.packageProxy.enabled }}
-            - name: OPENERAL_PACKAGE_PROXY_ENABLED
-              value: "true"
-            {{- end }}
-            {{- if .Values.server.packageProxy.profile }}
-            - name: OPENERAL_PACKAGE_PROXY_PROFILE
-              value: {{ .Values.server.packageProxy.profile | quote }}
-            {{- end }}
-            {{- if .Values.server.packageProxy.upstreamUrl }}
-            - name: OPENERAL_PACKAGE_PROXY_UPSTREAM_URL
-              value: {{ .Values.server.packageProxy.upstreamUrl | quote }}
-            {{- end }}
-            {{- if .Values.server.packageProxy.caSecretName }}
-            - name: OPENERAL_PACKAGE_PROXY_CA_SECRET_NAME
-              value: {{ .Values.server.packageProxy.caSecretName | quote }}
-            {{- end }}
-            {{- if .Values.server.packageProxy.authSecretName }}
-            - name: OPENERAL_PACKAGE_PROXY_AUTH_SECRET_NAME
-              value: {{ .Values.server.packageProxy.authSecretName | quote }}
+            - name: OPENSHELL_SUPERVISOR_IMAGE
+              value: {{ include "openshell.supervisorImage" . | quote }}
+            {{- if .Values.supervisor.image.pullPolicy }}
+            - name: OPENSHELL_SUPERVISOR_IMAGE_PULL_POLICY
+              value: {{ .Values.supervisor.image.pullPolicy | quote }}
             {{- end }}
             - name: OPENSHELL_GRPC_ENDPOINT
               value: {{ if .Values.server.disableTls }}{{ .Values.server.grpcEndpoint | replace "https://" "http://" | quote }}{{ else }}{{ .Values.server.grpcEndpoint | quote }}{{ end }}
@@ -101,7 +91,10 @@ spec:
               value: {{ .Values.server.hostGatewayIP | quote }}
             {{- end }}
             - name: OPENSHELL_SSH_HANDSHAKE_SECRET
-              value: {{ required "server.sshHandshakeSecret is required" .Values.server.sshHandshakeSecret | quote }}
+              valueFrom:
+                secretKeyRef:
+                  name: {{ .Values.server.sshHandshakeSecretName | quote }}
+                  key: secret
             {{- if .Values.server.disableTls }}
             - name: OPENSHELL_DISABLE_TLS
               value: "true"
@@ -119,6 +112,30 @@ spec:
               value: "true"
             {{- end }}
             {{- end }}
+            {{- if .Values.server.oidc.issuer }}
+            - name: OPENSHELL_OIDC_ISSUER
+              value: {{ .Values.server.oidc.issuer | quote }}
+            - name: OPENSHELL_OIDC_AUDIENCE
+              value: {{ .Values.server.oidc.audience | quote }}
+            - name: OPENSHELL_OIDC_JWKS_TTL
+              value: {{ .Values.server.oidc.jwksTtl | quote }}
+            {{- if .Values.server.oidc.rolesClaim }}
+            - name: OPENSHELL_OIDC_ROLES_CLAIM
+              value: {{ .Values.server.oidc.rolesClaim | quote }}
+            {{- end }}
+            {{- if .Values.server.oidc.adminRole }}
+            - name: OPENSHELL_OIDC_ADMIN_ROLE
+              value: {{ .Values.server.oidc.adminRole | quote }}
+            {{- end }}
+            {{- if .Values.server.oidc.userRole }}
+            - name: OPENSHELL_OIDC_USER_ROLE
+              value: {{ .Values.server.oidc.userRole | quote }}
+            {{- end }}
+            {{- if .Values.server.oidc.scopesClaim }}
+            - name: OPENSHELL_OIDC_SCOPES_CLAIM
+              value: {{ .Values.server.oidc.scopesClaim | quote }}
+            {{- end }}
+            {{- end }}
           volumeMounts:
             - name: openshell-data
               mountPath: /var/openshell
@@ -134,22 +151,33 @@ spec:
             - name: grpc
               containerPort: {{ .Values.service.port }}
               protocol: TCP
+            - name: health
+              containerPort: {{ .Values.service.healthPort }}
+              protocol: TCP
+            {{- if .Values.service.metricsPort }}
+            - name: metrics
+              containerPort: {{ .Values.service.metricsPort }}
+              protocol: TCP
+            {{- end }}
           startupProbe:
-            tcpSocket:
-              port: grpc
+            httpGet:
+              path: /healthz
+              port: health
             periodSeconds: {{ .Values.probes.startup.periodSeconds }}
             timeoutSeconds: {{ .Values.probes.startup.timeoutSeconds }}
             failureThreshold: {{ .Values.probes.startup.failureThreshold }}
           livenessProbe:
-            tcpSocket:
-              port: grpc
+            httpGet:
+              path: /healthz
+              port: health
             initialDelaySeconds: {{ .Values.probes.liveness.initialDelaySeconds }}
             periodSeconds: {{ .Values.probes.liveness.periodSeconds }}
             timeoutSeconds: {{ .Values.probes.liveness.timeoutSeconds }}
             failureThreshold: {{ .Values.probes.liveness.failureThreshold }}
           readinessProbe:
-            tcpSocket:
-              port: grpc
+            httpGet:
+              path: /readyz
+              port: health
             initialDelaySeconds: {{ .Values.probes.readiness.initialDelaySeconds }}
             periodSeconds: {{ .Values.probes.readiness.periodSeconds }}
             timeoutSeconds: {{ .Values.probes.readiness.timeoutSeconds }}
@@ -163,7 +191,14 @@ spec:
             secretName: {{ .Values.server.tls.certSecretName }}
         - name: tls-client-ca
           secret:
+            {{- if or .Values.pkiInitJob.enabled (and .Values.certManager.enabled .Values.certManager.clientCaFromServerTlsSecret) }}
+            secretName: {{ .Values.server.tls.certSecretName }}
+            items:
+              - key: ca.crt
+                path: ca.crt
+            {{- else }}
             secretName: {{ .Values.server.tls.clientCaSecretName }}
+            {{- end }}
         {{- end }}
       {{- with .Values.nodeSelector }}
       nodeSelector:

@@ -24,7 +24,6 @@ env:
   REGISTRY: ghcr.io
   IMAGE_REPO_BASE: ghcr.io/${{ github.repository_owner }}/openeral
   CANDIDATE_TAG: sha-${{ github.sha }}
-  OPENSHELL_IMAGE_CACHE_SCOPE: publish-openshell-images
 
 jobs:
   build-and-test:
@@ -48,30 +47,39 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Install Rust 1.85
+      - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
         with:
-          toolchain: "1.85"
+          toolchain: "1.95.0"
           components: clippy
 
       - name: Cache Rust dependencies and build outputs
         uses: Swatinem/rust-cache@v2
         with:
-          shared-key: ci-rust-1.85
+          shared-key: ci-rust-1.95
           cache-workspaces: |
             . -> target
+            vendor/openshell -> vendor/openshell/target
 
       - name: Install system dependencies
         run: |
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends libfuse3-dev fuse3 pkg-config libpq-dev postgresql-client
 
-      - name: Build and clippy
+      - name: Build and clippy openeral
         env:
           TEST_DATABASE_URL: "host=localhost user=pgmount password=pgmount dbname=testdb"
         run: |
           cargo clippy --all-targets
           cargo test -p openeral-core --no-run
+
+      - name: Build patched OpenShell crates
+        run: |
+          cargo test --manifest-path vendor/openshell/Cargo.toml \
+            -p openshell-driver-docker \
+            -p openshell-policy \
+            -p openshell-sandbox \
+            --no-run
 
       - name: Rust integration tests
         env:
@@ -90,7 +98,8 @@ jobs:
           sudo sed -i 's/#user_allow_other/user_allow_other/' /etc/fuse.conf || true
           bash tests/test_fuse_mount.sh
 
-  build-cluster:
+  build-smoke-and-publish:
+    needs: [build-and-test]
     runs-on: ubuntu-latest
     permissions:
       contents: read
@@ -101,100 +110,10 @@ jobs:
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
 
-      - name: Log in to GHCR
-        uses: docker/login-action@v3
-        with:
-          registry: ${{ env.REGISTRY }}
-          username: ${{ github.actor }}
-          password: ${{ secrets.GITHUB_TOKEN }}
-
-      - name: Build and push cluster image
-        uses: docker/build-push-action@v6
-        with:
-          context: vendor/openshell
-          file: vendor/openshell/deploy/docker/Dockerfile.images
-          target: cluster
-          push: true
-          tags: ${{ env.IMAGE_REPO_BASE }}/cluster:${{ env.CANDIDATE_TAG }}
-          cache-from: type=gha,scope=${{ env.OPENSHELL_IMAGE_CACHE_SCOPE }}
-          cache-to: type=gha,mode=max,scope=${{ env.OPENSHELL_IMAGE_CACHE_SCOPE }}
-          build-args: |
-            OPENERAL_DEFAULT_IMAGE_REPO_BASE=${{ env.IMAGE_REPO_BASE }}
-            OPENERAL_DEFAULT_IMAGE_TAG=${{ env.CANDIDATE_TAG }}
-
-  build-gateway:
-    runs-on: ubuntu-latest
-    permissions:
-      contents: read
-      packages: write
-    steps:
-      - uses: actions/checkout@v4
-
-      - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@v3
-
-      - name: Log in to GHCR
-        uses: docker/login-action@v3
-        with:
-          registry: ${{ env.REGISTRY }}
-          username: ${{ github.actor }}
-          password: ${{ secrets.GITHUB_TOKEN }}
-
-      - name: Build and push gateway image
-        uses: docker/build-push-action@v6
-        with:
-          context: vendor/openshell
-          file: vendor/openshell/deploy/docker/Dockerfile.images
-          target: gateway
-          push: true
-          tags: ${{ env.IMAGE_REPO_BASE }}/gateway:${{ env.CANDIDATE_TAG }}
-          cache-from: type=gha,scope=${{ env.OPENSHELL_IMAGE_CACHE_SCOPE }}
-          cache-to: type=gha,mode=max,scope=${{ env.OPENSHELL_IMAGE_CACHE_SCOPE }}
-          build-args: |
-            OPENERAL_DEFAULT_IMAGE_REPO_BASE=${{ env.IMAGE_REPO_BASE }}
-            OPENERAL_DEFAULT_IMAGE_TAG=${{ env.CANDIDATE_TAG }}
-
-  build-sandbox:
-    runs-on: ubuntu-latest
-    permissions:
-      contents: read
-      packages: write
-    steps:
-      - uses: actions/checkout@v4
-
-      - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@v3
-
-      - name: Log in to GHCR
-        uses: docker/login-action@v3
-        with:
-          registry: ${{ env.REGISTRY }}
-          username: ${{ github.actor }}
-          password: ${{ secrets.GITHUB_TOKEN }}
-
-      - name: Build and push sandbox image
-        uses: docker/build-push-action@v6
-        with:
-          context: .
-          file: sandboxes/openeral/Dockerfile
-          push: true
-          tags: ${{ env.IMAGE_REPO_BASE }}/sandbox:${{ env.CANDIDATE_TAG }}
-          cache-from: type=gha,scope=publish-sandbox
-          cache-to: type=gha,mode=max,scope=publish-sandbox
-
-  smoke-test:
-    needs: [build-cluster, build-gateway, build-sandbox]
-    runs-on: ubuntu-latest
-    permissions:
-      contents: read
-      packages: read
-    steps:
-      - uses: actions/checkout@v4
-
-      - name: Install system dependencies
+      - name: Install smoke dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y --no-install-recommends postgresql-client
+          sudo apt-get install -y --no-install-recommends postgresql-client curl
 
       - name: Install upstream OpenShell CLI
         run: |
@@ -205,45 +124,71 @@ jobs:
           echo "$OPENSHELL_INSTALL_DIR" >> "$GITHUB_PATH"
           "$OPENSHELL_INSTALL_DIR/openshell" --version
 
+      - name: Build gateway image locally
+        uses: docker/build-push-action@v6
+        with:
+          context: vendor/openshell
+          file: vendor/openshell/deploy/docker/Dockerfile.images
+          target: gateway
+          load: true
+          tags: ${{ env.IMAGE_REPO_BASE }}/gateway:${{ env.CANDIDATE_TAG }}
+          cache-from: type=gha,scope=publish-openshell-gateway
+          cache-to: type=gha,mode=max,scope=publish-openshell-gateway
+          build-args: |
+            BUILD_FROM_SOURCE=1
+            OPENSHELL_IMAGE_TAG=${{ env.CANDIDATE_TAG }}
+
+      - name: Build supervisor image locally
+        uses: docker/build-push-action@v6
+        with:
+          context: vendor/openshell
+          file: vendor/openshell/deploy/docker/Dockerfile.images
+          target: supervisor
+          load: true
+          tags: ${{ env.IMAGE_REPO_BASE }}/supervisor:${{ env.CANDIDATE_TAG }}
+          cache-from: type=gha,scope=publish-openshell-supervisor
+          cache-to: type=gha,mode=max,scope=publish-openshell-supervisor
+          build-args: |
+            BUILD_FROM_SOURCE=1
+            OPENSHELL_IMAGE_TAG=${{ env.CANDIDATE_TAG }}
+
+      - name: Build sandbox image locally
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: sandboxes/openeral/Dockerfile
+          load: true
+          tags: ${{ env.IMAGE_REPO_BASE }}/sandbox:${{ env.CANDIDATE_TAG }}
+          cache-from: type=gha,scope=publish-sandbox
+          cache-to: type=gha,mode=max,scope=publish-sandbox
+
+      - name: Run OpenShell Docker-driver smoke test
+        env:
+          OPENERAL_GATEWAY_IMAGE: ${{ env.IMAGE_REPO_BASE }}/gateway:${{ env.CANDIDATE_TAG }}
+          OPENERAL_SUPERVISOR_IMAGE: ${{ env.IMAGE_REPO_BASE }}/supervisor:${{ env.CANDIDATE_TAG }}
+          OPENERAL_SANDBOX_IMAGE: ${{ env.IMAGE_REPO_BASE }}/sandbox:${{ env.CANDIDATE_TAG }}
+        run: bash .github/scripts/smoke_openshell.sh
+
       - name: Log in to GHCR
-        uses: docker/login-action@v3
+        if: ${{ env.ACT != 'true' }}
+        uses: docker/login-action@v4
         with:
           registry: ${{ env.REGISTRY }}
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: Verify mixed-stack guard
-        env:
-          CLUSTER_IMAGE: ${{ env.IMAGE_REPO_BASE }}/cluster:${{ env.CANDIDATE_TAG }}
+      - name: Push candidate images
+        if: ${{ env.ACT != 'true' }}
         run: |
           set -euo pipefail
-          output_file="$(mktemp)"
-          status=0
-          docker run --rm --privileged \
-            -e IMAGE_REPO_BASE=ghcr.io/nvidia/openshell \
-            "$CLUSTER_IMAGE" server --disable=traefik \
-            >"$output_file" 2>&1 || status=$?
-          cat "$output_file"
-          if [ "$status" -eq 0 ]; then
-            echo "Expected mixed-stack guard to fail" >&2
-            exit 1
-          fi
-          grep -q "cannot resolve the upstream OpenShell gateway image" "$output_file"
-
-      - name: Run OpenShell smoke test
-        env:
-          OPENSHELL_CLUSTER_IMAGE: ${{ env.IMAGE_REPO_BASE }}/cluster:${{ env.CANDIDATE_TAG }}
-          OPENERAL_GATEWAY_IMAGE: ${{ env.IMAGE_REPO_BASE }}/gateway:${{ env.CANDIDATE_TAG }}
-          OPENERAL_SANDBOX_IMAGE: ${{ env.IMAGE_REPO_BASE }}/sandbox:${{ env.CANDIDATE_TAG }}
-          IMAGE_TAG: latest
-          OPENSHELL_REGISTRY_USERNAME: ${{ github.actor }}
-          OPENSHELL_REGISTRY_PASSWORD: ${{ secrets.GITHUB_TOKEN }}
-        run: bash .github/scripts/smoke_openshell.sh
+          docker push "${IMAGE_REPO_BASE}/gateway:${CANDIDATE_TAG}"
+          docker push "${IMAGE_REPO_BASE}/supervisor:${CANDIDATE_TAG}"
+          docker push "${IMAGE_REPO_BASE}/sandbox:${CANDIDATE_TAG}"
 
   promote:
-    needs: [smoke-test]
+    needs: [build-smoke-and-publish]
     runs-on: ubuntu-latest
-    if: github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/tags/')
+    if: ${{ github.actor != 'nektos/act' && (github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/tags/')) }}
     permissions:
       contents: read
       packages: write
@@ -252,7 +197,7 @@ jobs:
         uses: docker/setup-buildx-action@v3
 
       - name: Log in to GHCR
-        uses: docker/login-action@v3
+        uses: docker/login-action@v4
         with:
           registry: ${{ env.REGISTRY }}
           username: ${{ github.actor }}
@@ -270,18 +215,18 @@ jobs:
             docker buildx imagetools create -t "$target" "$source"
           }
 
-          cluster_source="${IMAGE_REPO_BASE}/cluster:${CANDIDATE_TAG}"
           gateway_source="${IMAGE_REPO_BASE}/gateway:${CANDIDATE_TAG}"
+          supervisor_source="${IMAGE_REPO_BASE}/supervisor:${CANDIDATE_TAG}"
           sandbox_source="${IMAGE_REPO_BASE}/sandbox:${CANDIDATE_TAG}"
 
           if [ "${GITHUB_REF}" = "refs/heads/main" ]; then
-            promote "$cluster_source" "${IMAGE_REPO_BASE}/cluster:latest"
             promote "$gateway_source" "${IMAGE_REPO_BASE}/gateway:latest"
+            promote "$supervisor_source" "${IMAGE_REPO_BASE}/supervisor:latest"
             promote "$sandbox_source" "${IMAGE_REPO_BASE}/sandbox:latest"
           fi
 
           if [ -n "${RELEASE_TAG}" ]; then
-            promote "$cluster_source" "${IMAGE_REPO_BASE}/cluster:${RELEASE_TAG}"
             promote "$gateway_source" "${IMAGE_REPO_BASE}/gateway:${RELEASE_TAG}"
+            promote "$supervisor_source" "${IMAGE_REPO_BASE}/supervisor:${RELEASE_TAG}"
             promote "$sandbox_source" "${IMAGE_REPO_BASE}/sandbox:${RELEASE_TAG}"
           fi

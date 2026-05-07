@@ -1,7 +1,7 @@
 // SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
-use crate::constants::{KUBECONFIG_PATH, container_name};
+use crate::constants::{KUBECONFIG_PATH, container_name, node_name};
 use bollard::Docker;
 use bollard::container::LogOutput;
 use bollard::exec::CreateExecOptions;
@@ -136,7 +136,7 @@ where
                  The file /opt/openshell/bin/openshell-sandbox was not found in the gateway \
                  container. Without it, sandbox pods cannot start.\n\n\
                  This usually means the cluster image was built or published without the \
-                 supervisor-builder stage.\n\n\
+                 staged prebuilt openshell-sandbox binary.\n\n\
                  To fix:\n  \
                  1. Rebuild the cluster image: mise run docker:build:cluster\n  \
                  2. Or update to a cluster image that includes the supervisor binary\n  \
@@ -362,49 +362,93 @@ pub async fn fetch_recent_logs(docker: &Docker, container_name: &str, n: usize) 
     rendered
 }
 
-/// Remove stale k3s nodes from a cluster with a reused persistent volume.
+/// Remove stale k3s nodes and their orphaned pods from a resumed cluster.
 ///
 /// When a cluster container is recreated but the volume is reused, k3s registers
 /// a new node (using the container ID as the hostname) while old node entries
 /// persist in etcd. Pods scheduled on those stale `NotReady` nodes will never run,
 /// causing health checks to fail.
 ///
-/// This function identifies all `NotReady` nodes and deletes them so k3s can
-/// reschedule workloads onto the current (Ready) node.
+/// This function retries with backoff until `kubectl` becomes available (k3s may
+/// still be initialising), then:
+///   1. Deletes all `NotReady` nodes so k3s stops tracking them.
+///   2. Force-deletes any pods stuck in `Terminating` so `StatefulSets` and
+///      Deployments can reschedule replacements on the current (Ready) node.
 ///
 /// Returns the number of stale nodes removed.
 pub async fn clean_stale_nodes(docker: &Docker, name: &str) -> Result<usize> {
+    // Retry until kubectl is responsive.  k3s can take 10-20 s to start the
+    // API server after a container restart, so we allow up to ~45 s.
+    const MAX_ATTEMPTS: u32 = 15;
+    const RETRY_DELAY: Duration = Duration::from_secs(3);
+
     let container_name = container_name(name);
+    let mut stale_nodes: Vec<String> = Vec::new();
 
-    // Get the list of NotReady nodes.
-    // The last condition on a node is always type=Ready; we need to check its
-    // **status** (True/False/Unknown), not its type.  Nodes where the Ready
-    // condition status is not "True" are stale and should be removed.
-    let (output, exit_code) = exec_capture_with_exit(
-        docker,
-        &container_name,
-        vec![
-            "sh".to_string(),
-            "-c".to_string(),
-            format!(
-                "KUBECONFIG={KUBECONFIG_PATH} kubectl get nodes \
-                 --no-headers -o custom-columns=NAME:.metadata.name,STATUS:.status.conditions[-1].status \
-                 2>/dev/null | grep -v '\\bTrue$' | awk '{{print $1}}'"
-            ),
-        ],
-    )
-    .await?;
+    // Determine the current node name.  With the deterministic `--node-name`
+    // entrypoint change the k3s node is `openshell-{gateway}`.  However, older
+    // cluster images (built before that change) still use the container hostname
+    // (= Docker container ID) as the node name.  We must handle both:
+    //
+    //   1. If the expected deterministic name appears in the node list, use it.
+    //   2. Otherwise fall back to the container hostname (old behaviour).
+    //
+    // This ensures backward compatibility during upgrades where the bootstrap
+    // CLI is newer than the cluster image.
+    let deterministic_node = node_name(name);
 
-    if exit_code != 0 {
-        // kubectl not ready yet or no nodes — nothing to clean
-        return Ok(0);
+    for attempt in 1..=MAX_ATTEMPTS {
+        let (output, exit_code) = exec_capture_with_exit(
+            docker,
+            &container_name,
+            vec![
+                "sh".to_string(),
+                "-c".to_string(),
+                format!(
+                    "KUBECONFIG={KUBECONFIG_PATH} kubectl get nodes \
+                     --no-headers -o custom-columns=NAME:.metadata.name \
+                     2>/dev/null"
+                ),
+            ],
+        )
+        .await?;
+
+        if exit_code == 0 {
+            let all_nodes: Vec<&str> = output
+                .lines()
+                .map(str::trim)
+                .filter(|l| !l.is_empty())
+                .collect();
+
+            // Pick the current node identity: prefer the deterministic name,
+            // fall back to the container hostname for older cluster images.
+            let current_node = if all_nodes.contains(&deterministic_node.as_str()) {
+                deterministic_node.clone()
+            } else {
+                // Older cluster image without --node-name: read hostname.
+                let (hostname_out, _) =
+                    exec_capture_with_exit(docker, &container_name, vec!["hostname".to_string()])
+                        .await?;
+                hostname_out.trim().to_string()
+            };
+
+            stale_nodes = all_nodes
+                .into_iter()
+                .filter(|n| *n != current_node)
+                .map(ToString::to_string)
+                .collect();
+            break;
+        }
+
+        if attempt < MAX_ATTEMPTS {
+            tracing::debug!(
+                "kubectl not ready yet (attempt {attempt}/{MAX_ATTEMPTS}), retrying in {}s",
+                RETRY_DELAY.as_secs()
+            );
+            tokio::time::sleep(RETRY_DELAY).await;
+        }
     }
 
-    let stale_nodes: Vec<&str> = output
-        .lines()
-        .map(str::trim)
-        .filter(|l| !l.is_empty())
-        .collect();
     if stale_nodes.is_empty() {
         return Ok(0);
     }
@@ -413,6 +457,7 @@ pub async fn clean_stale_nodes(docker: &Docker, name: &str) -> Result<usize> {
     let count = stale_nodes.len();
     tracing::info!("removing {} stale node(s): {}", count, node_list);
 
+    // Step 1: delete the stale node objects.
     let (_output, exit_code) = exec_capture_with_exit(
         docker,
         &container_name,
@@ -428,6 +473,68 @@ pub async fn clean_stale_nodes(docker: &Docker, name: &str) -> Result<usize> {
 
     if exit_code != 0 {
         tracing::warn!("failed to delete stale nodes (exit code {exit_code})");
+    }
+
+    // Step 2: force-delete pods stuck in Terminating.  After the stale node is
+    // removed, pods that were scheduled on it transition to Terminating but
+    // will never complete graceful shutdown (the node is gone).  StatefulSets
+    // will not create a replacement until the old pod is fully deleted.
+    let (_output, exit_code) = exec_capture_with_exit(
+        docker,
+        &container_name,
+        vec![
+            "sh".to_string(),
+            "-c".to_string(),
+            format!(
+                "KUBECONFIG={KUBECONFIG_PATH} kubectl get pods --all-namespaces \
+                 --field-selector=status.phase=Running -o name 2>/dev/null; \
+                 for pod_line in $(KUBECONFIG={KUBECONFIG_PATH} kubectl get pods --all-namespaces \
+                     --no-headers 2>/dev/null | awk '$4 == \"Terminating\" {{print $1\"/\"$2}}'); do \
+                     ns=${{pod_line%%/*}}; pod=${{pod_line#*/}}; \
+                     KUBECONFIG={KUBECONFIG_PATH} kubectl delete pod \"$pod\" -n \"$ns\" \
+                         --force --grace-period=0 --ignore-not-found 2>/dev/null; \
+                 done"
+            ),
+        ],
+    )
+    .await?;
+
+    if exit_code != 0 {
+        tracing::debug!(
+            "force-delete of terminating pods returned exit code {exit_code} (non-fatal)"
+        );
+    }
+
+    // Step 3: delete PersistentVolumeClaims in the openshell namespace whose
+    // backing PV has node affinity for a stale node.  local-path-provisioner
+    // creates PVs tied to the original node; when the node changes, the PV is
+    // unschedulable and the `StatefulSet` pod stays Pending.  Deleting the PVC
+    // (and its PV) lets the provisioner create a fresh one on the current node.
+    let (_output, exit_code) = exec_capture_with_exit(
+        docker,
+        &container_name,
+        vec![
+            "sh".to_string(),
+            "-c".to_string(),
+            format!(
+                r#"KUBECONFIG={KUBECONFIG_PATH}; export KUBECONFIG; \
+                 CURRENT_NODE=$(kubectl get nodes --no-headers -o custom-columns=NAME:.metadata.name 2>/dev/null | head -1); \
+                 [ -z "$CURRENT_NODE" ] && exit 0; \
+                 for pv in $(kubectl get pv -o jsonpath='{{.items[*].metadata.name}}' 2>/dev/null); do \
+                     NODE=$(kubectl get pv "$pv" -o jsonpath='{{.spec.nodeAffinity.required.nodeSelectorTerms[0].matchExpressions[0].values[0]}}' 2>/dev/null); \
+                     [ "$NODE" = "$CURRENT_NODE" ] && continue; \
+                     NS=$(kubectl get pv "$pv" -o jsonpath='{{.spec.claimRef.namespace}}' 2>/dev/null); \
+                     PVC=$(kubectl get pv "$pv" -o jsonpath='{{.spec.claimRef.name}}' 2>/dev/null); \
+                     [ -n "$PVC" ] && kubectl delete pvc "$PVC" -n "$NS" --ignore-not-found 2>/dev/null; \
+                     kubectl delete pv "$pv" --ignore-not-found 2>/dev/null; \
+                 done"#
+            ),
+        ],
+    )
+    .await?;
+
+    if exit_code != 0 {
+        tracing::debug!("PV/PVC cleanup returned exit code {exit_code} (non-fatal)");
     }
 
     Ok(count)

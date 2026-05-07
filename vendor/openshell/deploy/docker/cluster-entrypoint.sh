@@ -18,15 +18,76 @@
 # embedded DNS resolver at 127.0.0.11. Docker's DNS listens on random high
 # ports (visible in the DOCKER_OUTPUT iptables chain), so we parse those ports
 # and set up DNAT rules to forward DNS traffic from k3s pods. We then point
-# k3s's --resolv-conf at the container's routable eth0 IP.
+# k3s's resolv-conf kubelet arg at the container's routable eth0 IP.
 #
 # Per k3s docs: "Manually specified resolver configuration files are not
 # subject to viability checks."
 
 set -e
 
-REGISTRY_NAMESPACE_DEFAULT="openshell"
-UPSTREAM_DEFAULT_IMAGE_REPO_BASE="ghcr.io/nvidia/openshell"
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
+# Escape a value for safe embedding as a YAML single-quoted scalar.
+# Single quotes are the only character that needs escaping ('  ->  '').
+yaml_quote() {
+    printf "'%s'" "$(printf '%s' "$1" | sed "s/'/''/g")"
+}
+
+# ---------------------------------------------------------------------------
+# Select iptables backend
+# ---------------------------------------------------------------------------
+# Some kernels (e.g. Jetson Linux 5.15-tegra) have the nf_tables subsystem
+# but lack the nft_compat bridge that allows flannel and kube-proxy to use
+# xt extension modules (xt_comment, xt_conntrack). Detect this by probing
+# whether xt_comment is usable via the current iptables backend. If the
+# probe fails, switch to iptables-legacy. Set USE_IPTABLES_LEGACY=1
+# externally to skip the probe and force the legacy backend.
+# ---------------------------------------------------------------------------
+# Check br_netfilter kernel module
+# ---------------------------------------------------------------------------
+# br_netfilter makes the kernel pass bridge (pod-to-pod) traffic through
+# iptables. Without it, kube-proxy's DNAT rules for ClusterIP services are
+# never applied to pod traffic, so pods cannot reach services such as
+# kube-dns (10.43.0.10), breaking all in-cluster DNS resolution.
+#
+# The module must be loaded on the HOST before the container starts —
+# containers cannot load kernel modules themselves. If it is missing, log a
+# warning rather than failing hard: some kernels have bridge netfilter support
+# built-in or expose it differently, and will work correctly without the module
+# being explicitly loaded as a separate .ko.
+if [ ! -f /proc/sys/net/bridge/bridge-nf-call-iptables ]; then
+    echo "Warning: br_netfilter does not appear to be loaded on the host." >&2
+    echo "         Pod-to-service networking (including kube-dns) may not work without it." >&2
+    echo "         If the cluster fails to start or DNS is broken, try loading it on the host:" >&2
+    echo "           sudo modprobe br_netfilter" >&2
+    echo "         To persist across reboots:" >&2
+    echo "           echo br_netfilter | sudo tee /etc/modules-load.d/br_netfilter.conf" >&2
+fi
+
+if [ -z "${USE_IPTABLES_LEGACY:-}" ]; then
+    if iptables -t filter -N _xt_probe 2>/dev/null; then
+        _probe_rc=0
+        iptables -t filter -A _xt_probe -m comment --comment "probe" -j ACCEPT \
+            2>/dev/null || _probe_rc=$?
+        iptables -t filter -D _xt_probe -m comment --comment "probe" -j ACCEPT \
+            2>/dev/null || true
+        iptables -t filter -X _xt_probe 2>/dev/null || true
+        [ "$_probe_rc" -ne 0 ] && USE_IPTABLES_LEGACY=1
+    fi
+fi
+
+if [ "${USE_IPTABLES_LEGACY:-0}" = "1" ]; then
+    echo "iptables nf_tables xt extension bridge unavailable — switching to iptables-legacy"
+    if update-alternatives --set iptables /usr/sbin/iptables-legacy 2>/dev/null && \
+       update-alternatives --set ip6tables /usr/sbin/ip6tables-legacy 2>/dev/null; then
+        echo "Now using iptables-legacy mode"
+    else
+        echo "Warning: could not switch to iptables-legacy — cluster networking may fail"
+    fi
+fi
+
+IPTABLES=$([ "${USE_IPTABLES_LEGACY:-0}" = "1" ] && echo iptables-legacy || echo iptables)
 
 RESOLV_CONF="/etc/rancher/k3s/resolv.conf"
 
@@ -77,11 +138,11 @@ setup_dns_proxy() {
     # Docker sets up rules like:
     #   -A DOCKER_OUTPUT -d 127.0.0.11/32 -p udp --dport 53 -j DNAT --to-destination 127.0.0.11:<port>
     #   -A DOCKER_OUTPUT -d 127.0.0.11/32 -p tcp --dport 53 -j DNAT --to-destination 127.0.0.11:<port>
-    UDP_PORT=$(iptables -t nat -S DOCKER_OUTPUT 2>/dev/null \
+    UDP_PORT=$($IPTABLES -t nat -S DOCKER_OUTPUT 2>/dev/null \
         | grep -- '-p udp.*--dport 53' \
         | sed -n 's/.*--to-destination 127.0.0.11:\([0-9]*\).*/\1/p' \
         | head -1)
-    TCP_PORT=$(iptables -t nat -S DOCKER_OUTPUT 2>/dev/null \
+    TCP_PORT=$($IPTABLES -t nat -S DOCKER_OUTPUT 2>/dev/null \
         | grep -- '-p tcp.*--dport 53' \
         | sed -n 's/.*--to-destination 127.0.0.11:\([0-9]*\).*/\1/p' \
         | head -1)
@@ -104,9 +165,9 @@ setup_dns_proxy() {
     echo "Setting up DNS proxy: ${CONTAINER_IP}:53 -> 127.0.0.11 (udp:${UDP_PORT}, tcp:${TCP_PORT})"
 
     # Forward DNS from pods (PREROUTING) and local processes (OUTPUT) to Docker's DNS
-    iptables -t nat -I PREROUTING -p udp --dport 53 -d "$CONTAINER_IP" -j DNAT \
+    $IPTABLES -t nat -I PREROUTING -p udp --dport 53 -d "$CONTAINER_IP" -j DNAT \
         --to-destination "127.0.0.11:${UDP_PORT}"
-    iptables -t nat -I PREROUTING -p tcp --dport 53 -d "$CONTAINER_IP" -j DNAT \
+    $IPTABLES -t nat -I PREROUTING -p tcp --dport 53 -d "$CONTAINER_IP" -j DNAT \
         --to-destination "127.0.0.11:${TCP_PORT}"
 
     echo "nameserver $CONTAINER_IP" > "$RESOLV_CONF"
@@ -217,8 +278,8 @@ REGEOF
 configs:
   "${REGISTRY_HOST}":
     auth:
-      username: ${REGISTRY_USERNAME}
-      password: ${REGISTRY_PASSWORD}
+      username: $(yaml_quote "${REGISTRY_USERNAME}")
+      password: $(yaml_quote "${REGISTRY_PASSWORD}")
 REGEOF
     fi
 
@@ -232,8 +293,8 @@ REGEOF
             cat >> "$REGISTRIES_YAML" <<REGEOF
   "${COMMUNITY_REGISTRY_HOST}":
     auth:
-      username: ${COMMUNITY_REGISTRY_USERNAME}
-      password: ${COMMUNITY_REGISTRY_PASSWORD}
+      username: $(yaml_quote "${COMMUNITY_REGISTRY_USERNAME}")
+      password: $(yaml_quote "${COMMUNITY_REGISTRY_PASSWORD}")
 REGEOF
         else
             cat >> "$REGISTRIES_YAML" <<REGEOF
@@ -241,8 +302,8 @@ REGEOF
 configs:
   "${COMMUNITY_REGISTRY_HOST}":
     auth:
-      username: ${COMMUNITY_REGISTRY_USERNAME}
-      password: ${COMMUNITY_REGISTRY_PASSWORD}
+      username: $(yaml_quote "${COMMUNITY_REGISTRY_USERNAME}")
+      password: $(yaml_quote "${COMMUNITY_REGISTRY_PASSWORD}")
 REGEOF
         fi
     fi
@@ -362,50 +423,25 @@ fi
 # images already present in containerd instead of pulling from the registry.
 HELMCHART="/var/lib/rancher/k3s/server/manifests/openshell-helmchart.yaml"
 
-EXPLICIT_GATEWAY_IMAGE_REPO_BASE="${IMAGE_REPO_BASE:-}"
-GATEWAY_IMAGE_REPO_BASE="${EXPLICIT_GATEWAY_IMAGE_REPO_BASE}"
-HOST_DEFAULT_GATEWAY_IMAGE_REPO_BASE=""
-
-if [ -n "${REGISTRY_HOST:-}" ]; then
-    HOST_DEFAULT_GATEWAY_IMAGE_REPO_BASE="${REGISTRY_HOST}/${REGISTRY_NAMESPACE_DEFAULT}"
-fi
-
-if [ -n "${OPENERAL_DEFAULT_IMAGE_REPO_BASE:-}" ]; then
-    if [ -n "$EXPLICIT_GATEWAY_IMAGE_REPO_BASE" ] && [ "$EXPLICIT_GATEWAY_IMAGE_REPO_BASE" = "$UPSTREAM_DEFAULT_IMAGE_REPO_BASE" ]; then
-        echo "Error: openeral cluster image cannot resolve the upstream OpenShell gateway image."
-        echo "Use the matching openeral gateway image set baked into the cluster image,"
-        echo "or provide an explicit openeral IMAGE_REPO_BASE override."
-        exit 1
-    fi
-
-    if [ -n "$EXPLICIT_GATEWAY_IMAGE_REPO_BASE" ] && [ -n "$HOST_DEFAULT_GATEWAY_IMAGE_REPO_BASE" ] && [ "$EXPLICIT_GATEWAY_IMAGE_REPO_BASE" = "$HOST_DEFAULT_GATEWAY_IMAGE_REPO_BASE" ]; then
-        echo "Ignoring host-derived IMAGE_REPO_BASE=${EXPLICIT_GATEWAY_IMAGE_REPO_BASE}"
-        echo "Using baked openeral gateway repo base: ${OPENERAL_DEFAULT_IMAGE_REPO_BASE}"
-        GATEWAY_IMAGE_REPO_BASE="${OPENERAL_DEFAULT_IMAGE_REPO_BASE}"
-    fi
-
-    if [ -z "$GATEWAY_IMAGE_REPO_BASE" ]; then
-        GATEWAY_IMAGE_REPO_BASE="${OPENERAL_DEFAULT_IMAGE_REPO_BASE}"
-    fi
-fi
-
-if [ -n "${GATEWAY_IMAGE_REPO_BASE:-}" ] && [ -f "$HELMCHART" ]; then
-    echo "Setting image repository base: ${GATEWAY_IMAGE_REPO_BASE}"
-    sed -i -E "s|repository:[[:space:]]*[^[:space:]]+|repository: ${GATEWAY_IMAGE_REPO_BASE}/gateway|" "$HELMCHART"
+if [ -n "${IMAGE_REPO_BASE:-}" ] && [ -f "$HELMCHART" ]; then
+    echo "Setting image repository base: ${IMAGE_REPO_BASE}"
+    sed -i -E "s|repository:[[:space:]]*[^[:space:]]+|repository: ${IMAGE_REPO_BASE}/gateway|" "$HELMCHART"
     # Sandbox images come from the community registry — do not override
 fi
 
 # In push mode, use the exact image references that were imported into cluster
 # containerd so the Helm release cannot drift back to remote ":latest" tags.
-# Only the gateway image is pushed; sandbox images are pulled from the
-# community registry at runtime.
+# Gateway and supervisor images may be pushed; sandbox base images are pulled
+# from the community registry at runtime.
 if [ -n "${PUSH_IMAGE_REFS:-}" ] && [ -f "$HELMCHART" ]; then
     server_image=""
+    supervisor_image=""
     old_ifs="$IFS"
     IFS=','
     for ref in $PUSH_IMAGE_REFS; do
         case "$ref" in
             */gateway:*) server_image="$ref" ;;
+            */supervisor:*) supervisor_image="$ref" ;;
         esac
     done
     IFS="$old_ifs"
@@ -418,47 +454,40 @@ if [ -n "${PUSH_IMAGE_REFS:-}" ] && [ -f "$HELMCHART" ]; then
         sed -i -E "s|repository:[[:space:]]*[^[:space:]]+|repository: ${server_repo}|" "$HELMCHART"
         sed -i -E "s|tag:[[:space:]]*\"?[^\"[:space:]]+\"?|tag: \"${server_tag}\"|" "$HELMCHART"
     fi
+
+    if [ -n "$supervisor_image" ]; then
+        echo "Setting supervisor image: ${supervisor_image}"
+        sed -i -E "s|supervisorImage:[[:space:]]*\"?[^\"]+\"?|supervisorImage: ${supervisor_image}|" "$HELMCHART"
+    fi
 fi
 
-GATEWAY_IMAGE_TAG="${OPENERAL_DEFAULT_IMAGE_TAG:-${IMAGE_TAG:-}}"
-if [ -n "${GATEWAY_IMAGE_TAG:-}" ] && [ -f "$HELMCHART" ]; then
-    echo "Overriding gateway image tag to: ${GATEWAY_IMAGE_TAG}"
+if [ -n "${IMAGE_TAG:-}" ] && [ -f "$HELMCHART" ]; then
+    echo "Overriding gateway and supervisor image tags to: ${IMAGE_TAG}"
     # server image tag (standalone value field)
     # Handle both quoted and unquoted defaults: tag: "latest" / tag: latest
-    sed -i -E "s|tag:[[:space:]]*\"?latest\"?|tag: \"${GATEWAY_IMAGE_TAG}\"|" "$HELMCHART"
+    sed -i -E "s|tag:[[:space:]]*\"?latest\"?|tag: \"${IMAGE_TAG}\"|" "$HELMCHART"
+    # supervisor image is a full image ref under server.supervisorImage
+    sed -i -E "s|(supervisorImage:[[:space:]]*\"?[^\"]*:)[^\"[:space:]]+(\"?)|\\1${IMAGE_TAG}\\2|" "$HELMCHART"
 fi
-
-if [ -n "${GATEWAY_IMAGE_REPO_BASE:-}" ] && [ -n "${GATEWAY_IMAGE_TAG:-}" ]; then
-    echo "Resolved gateway image: ${GATEWAY_IMAGE_REPO_BASE}/gateway:${GATEWAY_IMAGE_TAG}"
-fi
-
-if [ -n "${IMAGE_PULL_POLICY:-}" ] && [ -f "$HELMCHART" ]; then
-    echo "Overriding image pull policy to: ${IMAGE_PULL_POLICY}"
-    sed -i "s|pullPolicy: Always|pullPolicy: ${IMAGE_PULL_POLICY}|" "$HELMCHART"
-fi
-
-package_proxy_enabled="${OPENERAL_PACKAGE_PROXY_ENABLED:-false}"
-case "$package_proxy_enabled" in
-    1|true|TRUE|yes|YES|on|ON) package_proxy_enabled=true ;;
-    *) package_proxy_enabled=false ;;
-esac
-package_proxy_profile="${OPENERAL_PACKAGE_PROXY_PROFILE:-socket}"
-package_proxy_upstream_url="${OPENERAL_PACKAGE_PROXY_UPSTREAM_URL:-}"
-package_proxy_ca_secret_name="${OPENERAL_PACKAGE_PROXY_CA_SECRET_NAME:-}"
-package_proxy_auth_secret_name="${OPENERAL_PACKAGE_PROXY_AUTH_SECRET_NAME:-}"
 
 if [ -f "$HELMCHART" ]; then
-    sed -i "s|__PACKAGE_PROXY_ENABLED__|${package_proxy_enabled}|g" "$HELMCHART"
-    sed -i "s|__PACKAGE_PROXY_PROFILE__|${package_proxy_profile}|g" "$HELMCHART"
-    sed -i "s|__PACKAGE_PROXY_UPSTREAM_URL__|${package_proxy_upstream_url}|g" "$HELMCHART"
-    sed -i "s|__PACKAGE_PROXY_CA_SECRET_NAME__|${package_proxy_ca_secret_name}|g" "$HELMCHART"
-    sed -i "s|__PACKAGE_PROXY_AUTH_SECRET_NAME__|${package_proxy_auth_secret_name}|g" "$HELMCHART"
+    IMAGE_PULL_POLICY_VALUE="${IMAGE_PULL_POLICY:-Always}"
+    if [ -n "${IMAGE_PULL_POLICY:-}" ]; then
+        echo "Overriding image pull policy to: ${IMAGE_PULL_POLICY}"
+    fi
+    sed -i "s|__IMAGE_PULL_POLICY__|${IMAGE_PULL_POLICY_VALUE}|g" "$HELMCHART"
+
+    SANDBOX_IMAGE_PULL_POLICY_VALUE="${SANDBOX_IMAGE_PULL_POLICY:-\"\"}"
+    sed -i "s|__SANDBOX_IMAGE_PULL_POLICY__|${SANDBOX_IMAGE_PULL_POLICY_VALUE}|g" "$HELMCHART"
+
+    DB_URL_VALUE="${DB_URL:-\"sqlite:/var/openshell/openshell.db\"}"
+    sed -i "s|__DB_URL__|${DB_URL_VALUE}|g" "$HELMCHART"
 fi
 
-# Generate a random SSH handshake secret for the NSSH1 HMAC handshake between
-# the gateway and sandbox SSH servers. This is required — the server will refuse
-# to start without it.
-SSH_HANDSHAKE_SECRET="${SSH_HANDSHAKE_SECRET:-$(head -c 32 /dev/urandom | od -A n -t x1 | tr -d ' \n')}"
+# SSH handshake secret: previously generated here and injected via sed into the
+# HelmChart CR. Now persisted as a Kubernetes Secret (openshell-ssh-handshake)
+# created by the bootstrap process after k3s starts. This ensures the secret
+# survives container restarts without regeneration.
 
 # Inject SSH gateway host/port into the HelmChart manifest so the openshell
 # server returns the correct address to CLI clients for SSH proxy CONNECT.
@@ -477,9 +506,6 @@ if [ -f "$HELMCHART" ]; then
         # Clear the placeholder so the default (8080) is used
         sed -i "s|sshGatewayPort: __SSH_GATEWAY_PORT__|sshGatewayPort: 0|g" "$HELMCHART"
     fi
-    echo "Setting SSH handshake secret"
-    sed -i "s|__SSH_HANDSHAKE_SECRET__|${SSH_HANDSHAKE_SECRET}|g" "$HELMCHART"
-
     # Disable gateway auth: when set, the server accepts connections without
     # client certificates (for reverse-proxy / Cloudflare Tunnel deployments).
     if [ "${DISABLE_GATEWAY_AUTH:-}" = "true" ]; then
@@ -487,6 +513,25 @@ if [ -f "$HELMCHART" ]; then
         sed -i "s|__DISABLE_GATEWAY_AUTH__|true|g" "$HELMCHART"
     else
         sed -i "s|__DISABLE_GATEWAY_AUTH__|false|g" "$HELMCHART"
+    fi
+
+    # OIDC JWT authentication: when OIDC_ISSUER is set, the server validates
+    # Bearer tokens on gRPC requests against the issuer's JWKS endpoint.
+    if [ -n "${OIDC_ISSUER:-}" ]; then
+        echo "Enabling OIDC authentication (issuer: ${OIDC_ISSUER})"
+        sed -i "s|__OIDC_ISSUER__|${OIDC_ISSUER}|g" "$HELMCHART"
+        sed -i "s|__OIDC_AUDIENCE__|${OIDC_AUDIENCE:-openshell-cli}|g" "$HELMCHART"
+        sed -i "s|__OIDC_ROLES_CLAIM__|${OIDC_ROLES_CLAIM:-realm_access.roles}|g" "$HELMCHART"
+        sed -i "s|__OIDC_ADMIN_ROLE__|${OIDC_ADMIN_ROLE:-openshell-admin}|g" "$HELMCHART"
+        sed -i "s|__OIDC_USER_ROLE__|${OIDC_USER_ROLE:-openshell-user}|g" "$HELMCHART"
+        sed -i "s|__OIDC_SCOPES_CLAIM__|${OIDC_SCOPES_CLAIM:-}|g" "$HELMCHART"
+    else
+        sed -i "s|__OIDC_ISSUER__||g" "$HELMCHART"
+        sed -i "s|__OIDC_AUDIENCE__|openshell-cli|g" "$HELMCHART"
+        sed -i "s|__OIDC_ROLES_CLAIM__||g" "$HELMCHART"
+        sed -i "s|__OIDC_ADMIN_ROLE__||g" "$HELMCHART"
+        sed -i "s|__OIDC_USER_ROLE__||g" "$HELMCHART"
+        sed -i "s|__OIDC_SCOPES_CLAIM__||g" "$HELMCHART"
     fi
 
     # Disable TLS entirely: the server listens on plaintext HTTP.
@@ -548,11 +593,38 @@ if [ ! -f /sys/fs/cgroup/cgroup.controllers ]; then
     EXTRA_KUBELET_ARGS="--kubelet-arg=fail-cgroupv1=false"
 fi
 
+# On kernels where xt_comment is unavailable, kube-router's network policy
+# controller panics at startup. Disable it when the iptables-legacy probe
+# triggered; sandbox isolation is enforced by the NSSH1 HMAC handshake instead.
+if [ "${USE_IPTABLES_LEGACY:-0}" = "1" ]; then
+    EXTRA_KUBELET_ARGS="$EXTRA_KUBELET_ARGS --disable-network-policy"
+fi
+
 # Docker Desktop can briefly start the container before its bridge default route
 # is fully installed. k3s exits immediately in that state, so wait briefly for
 # routing to settle first.
 wait_for_default_route
 
-# Execute k3s with explicit resolv-conf.
+# ---------------------------------------------------------------------------
+# Deterministic k3s node name
+# ---------------------------------------------------------------------------
+# By default k3s uses the container hostname (= Docker container ID) as the
+# node name.  When the container is recreated (e.g. after an image upgrade),
+# the container ID changes, registering a new k3s node.  The bootstrap code
+# then deletes PVCs whose backing PVs have node affinity for the old node —
+# wiping the server database and any sandbox persistent volumes.
+#
+# OPENSHELL_NODE_NAME is set by the bootstrap code to a deterministic value
+# derived from the gateway name, so the node identity survives container
+# recreation and PVCs are never orphaned.
+NODE_NAME_ARG=""
+if [ -n "${OPENSHELL_NODE_NAME:-}" ]; then
+    NODE_NAME_ARG="--node-name=${OPENSHELL_NODE_NAME}"
+    echo "Using deterministic k3s node name: ${OPENSHELL_NODE_NAME}"
+fi
+
+# Execute k3s with explicit resolv-conf passed as a kubelet arg.
+# k3s v1.35.2+ no longer accepts --resolv-conf as a top-level server flag;
+# it must be passed via --kubelet-arg instead.
 # shellcheck disable=SC2086
-exec /bin/k3s "$@" --resolv-conf="$RESOLV_CONF" $EXTRA_KUBELET_ARGS
+exec /bin/k3s "$@" $NODE_NAME_ARG --kubelet-arg=resolv-conf="$RESOLV_CONF" $EXTRA_KUBELET_ARGS

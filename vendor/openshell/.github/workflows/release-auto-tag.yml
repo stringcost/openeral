@@ -6,7 +6,7 @@ name: Release Auto-Tag
 on:
   workflow_dispatch: {}
   schedule:
-    - cron: "0 14 * * *" # 7 AM PDT
+    - cron: "0 14 * * 1-5" # 7 AM PDT, weekdays only
 
 permissions:
   contents: write
@@ -20,7 +20,7 @@ jobs:
   create-tag:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
         with:
           fetch-depth: 0
 

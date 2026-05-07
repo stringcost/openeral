@@ -1,7 +1,7 @@
 // SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
-//! Shared sandbox policy parsing and defaults for OpenShell.
+//! Shared sandbox policy parsing and defaults for `OpenShell`.
 //!
 //! Provides bidirectional YAML↔proto conversion for sandbox policies.
 //!
@@ -9,16 +9,26 @@
 //! policy schema. Both parsing (YAML→proto) and serialization (proto→YAML) use
 //! these types, ensuring round-trip fidelity.
 
+mod compose;
+mod merge;
+
 use std::collections::{BTreeMap, HashMap};
 use std::fmt;
 use std::path::Path;
 
 use miette::{IntoDiagnostic, Result, WrapErr};
 use openshell_core::proto::{
-    FilesystemPolicy, L7Allow, L7Rule, LandlockPolicy, NetworkBinary, NetworkEndpoint,
-    NetworkPolicyRule, ProcessPolicy, SandboxPolicy, SecretInjectionRule,
+    FilesystemPolicy, GraphqlOperation, L7Allow, L7DenyRule, L7QueryMatcher, L7Rule,
+    LandlockPolicy, NetworkBinary, NetworkEndpoint, NetworkPolicyRule, ProcessPolicy,
+    SandboxPolicy, SecretInjectionRule,
 };
 use serde::{Deserialize, Serialize};
+
+pub use compose::{ProviderPolicyLayer, compose_effective_policy, provider_rule_name};
+pub use merge::{
+    PolicyMergeError, PolicyMergeOp, PolicyMergeResult, PolicyMergeWarning, generated_rule_name,
+    merge_policy,
+};
 
 // ---------------------------------------------------------------------------
 // YAML serde types (canonical — used for both parsing and serialization)
@@ -81,12 +91,15 @@ struct NetworkPolicyRuleDef {
 struct NetworkEndpointDef {
     #[serde(default, skip_serializing_if = "String::is_empty")]
     host: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    path: String,
     /// Single port (backwards compat). Mutually exclusive with `ports`.
+    /// Uses `u16` to reject invalid values >65535 at parse time.
     #[serde(default, skip_serializing_if = "is_zero")]
-    port: u32,
+    port: u16,
     /// Multiple ports. When non-empty, this endpoint covers all listed ports.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    ports: Vec<u32>,
+    ports: Vec<u16>,
     #[serde(default, skip_serializing_if = "String::is_empty")]
     protocol: String,
     #[serde(default, skip_serializing_if = "String::is_empty")]
@@ -99,6 +112,20 @@ struct NetworkEndpointDef {
     rules: Vec<L7RuleDef>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     allowed_ips: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    deny_rules: Vec<L7DenyRuleDef>,
+    /// When true, percent-encoded `/` (`%2F`) is preserved in path segments
+    /// rather than rejected by the L7 path canonicalizer. Required for
+    /// upstreams like GitLab that embed `%2F` in namespaced resource paths.
+    /// Defaults to false (strict).
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    allow_encoded_slash: bool,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    persisted_queries: String,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    graphql_persisted_queries: BTreeMap<String, GraphqlOperationDef>,
+    #[serde(default, skip_serializing_if = "is_zero_u32")]
+    graphql_max_body_bytes: u32,
     #[serde(default, skip_serializing_if = "String::is_empty")]
     egress_via: String,
     #[serde(default, skip_serializing_if = "String::is_empty")]
@@ -107,8 +134,41 @@ struct NetworkEndpointDef {
     secret_injection: Vec<SecretInjectionRuleDef>,
 }
 
-fn is_zero(v: &u32) -> bool {
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct SecretInjectionRuleDef {
+    env_var: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    proxy_value: String,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    match_headers: Vec<String>,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    match_query: bool,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    match_body: bool,
+}
+
+// Signature dictated by serde's `skip_serializing_if`, which requires `&T`.
+#[allow(clippy::trivially_copy_pass_by_ref)]
+fn is_zero(v: &u16) -> bool {
     *v == 0
+}
+
+// Signature dictated by serde's `skip_serializing_if`, which requires `&T`.
+#[allow(clippy::trivially_copy_pass_by_ref)]
+fn is_zero_u32(v: &u32) -> bool {
+    *v == 0
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct GraphqlOperationDef {
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    operation_type: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    operation_name: String,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    fields: Vec<String>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -126,6 +186,47 @@ struct L7AllowDef {
     path: String,
     #[serde(default, skip_serializing_if = "String::is_empty")]
     command: String,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    query: BTreeMap<String, QueryMatcherDef>,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    operation_type: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    operation_name: String,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    fields: Vec<String>,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(untagged)]
+enum QueryMatcherDef {
+    Glob(String),
+    Any(QueryAnyDef),
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct QueryAnyDef {
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    any: Vec<String>,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct L7DenyRuleDef {
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    method: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    path: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    command: String,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    query: BTreeMap<String, QueryMatcherDef>,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    operation_type: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    operation_name: String,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    fields: Vec<String>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -136,21 +237,6 @@ struct NetworkBinaryDef {
     #[serde(default, skip_serializing)]
     #[allow(dead_code)]
     harness: bool,
-}
-
-#[derive(Debug, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-struct SecretInjectionRuleDef {
-    #[serde(default, skip_serializing_if = "String::is_empty")]
-    env_var: String,
-    #[serde(default, skip_serializing_if = "String::is_empty")]
-    proxy_value: String,
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    match_headers: Vec<String>,
-    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
-    match_query: bool,
-    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
-    match_body: bool,
 }
 
 // ---------------------------------------------------------------------------
@@ -174,15 +260,16 @@ fn to_proto(raw: PolicyFile) -> SandboxPolicy {
                     .map(|e| {
                         // Normalize port/ports: ports takes precedence, else
                         // single port is promoted to ports array.
-                        let normalized_ports = if !e.ports.is_empty() {
-                            e.ports
+                        let normalized_ports: Vec<u32> = if !e.ports.is_empty() {
+                            e.ports.into_iter().map(u32::from).collect()
                         } else if e.port > 0 {
-                            vec![e.port]
+                            vec![u32::from(e.port)]
                         } else {
                             vec![]
                         };
                         NetworkEndpoint {
                             host: e.host,
+                            path: e.path,
                             port: normalized_ports.first().copied().unwrap_or(0),
                             ports: normalized_ports,
                             protocol: e.protocol,
@@ -197,10 +284,75 @@ fn to_proto(raw: PolicyFile) -> SandboxPolicy {
                                         method: r.allow.method,
                                         path: r.allow.path,
                                         command: r.allow.command,
+                                        operation_type: r.allow.operation_type,
+                                        operation_name: r.allow.operation_name,
+                                        fields: r.allow.fields,
+                                        query: r
+                                            .allow
+                                            .query
+                                            .into_iter()
+                                            .map(|(key, matcher)| {
+                                                let proto = match matcher {
+                                                    QueryMatcherDef::Glob(glob) => {
+                                                        L7QueryMatcher { glob, any: vec![] }
+                                                    }
+                                                    QueryMatcherDef::Any(any) => L7QueryMatcher {
+                                                        glob: String::new(),
+                                                        any: any.any,
+                                                    },
+                                                };
+                                                (key, proto)
+                                            })
+                                            .collect(),
                                     }),
                                 })
                                 .collect(),
                             allowed_ips: e.allowed_ips,
+                            deny_rules: e
+                                .deny_rules
+                                .into_iter()
+                                .map(|d| L7DenyRule {
+                                    method: d.method,
+                                    path: d.path,
+                                    command: d.command,
+                                    operation_type: d.operation_type,
+                                    operation_name: d.operation_name,
+                                    fields: d.fields,
+                                    query: d
+                                        .query
+                                        .into_iter()
+                                        .map(|(key, matcher)| {
+                                            let proto = match matcher {
+                                                QueryMatcherDef::Glob(glob) => {
+                                                    L7QueryMatcher { glob, any: vec![] }
+                                                }
+                                                QueryMatcherDef::Any(any) => L7QueryMatcher {
+                                                    glob: String::new(),
+                                                    any: any.any,
+                                                },
+                                            };
+                                            (key, proto)
+                                        })
+                                        .collect(),
+                                })
+                                .collect(),
+                            allow_encoded_slash: e.allow_encoded_slash,
+                            persisted_queries: e.persisted_queries,
+                            graphql_persisted_queries: e
+                                .graphql_persisted_queries
+                                .into_iter()
+                                .map(|(key, op)| {
+                                    (
+                                        key,
+                                        GraphqlOperation {
+                                            operation_type: op.operation_type,
+                                            operation_name: op.operation_name,
+                                            fields: op.fields,
+                                        },
+                                    )
+                                })
+                                .collect(),
+                            graphql_max_body_bytes: e.graphql_max_body_bytes,
                             egress_via: e.egress_via,
                             egress_profile: e.egress_profile,
                             secret_injection: e
@@ -286,13 +438,16 @@ fn from_proto(policy: &SandboxPolicy) -> PolicyFile {
                     .map(|e| {
                         // Use compact form: if ports has exactly 1 element,
                         // emit port (scalar). If >1, emit ports (array).
+                        // Proto uses u32; YAML uses u16. Clamp at boundary.
+                        let clamp = |v: u32| -> u16 { v.min(65535) as u16 };
                         let (port, ports) = if e.ports.len() > 1 {
-                            (0, e.ports.clone())
+                            (0, e.ports.iter().map(|&p| clamp(p)).collect())
                         } else {
-                            (e.ports.first().copied().unwrap_or(e.port), vec![])
+                            (clamp(e.ports.first().copied().unwrap_or(e.port)), vec![])
                         };
                         NetworkEndpointDef {
                             host: e.host.clone(),
+                            path: e.path.clone(),
                             port,
                             ports,
                             protocol: e.protocol.clone(),
@@ -309,11 +464,71 @@ fn from_proto(policy: &SandboxPolicy) -> PolicyFile {
                                             method: a.method,
                                             path: a.path,
                                             command: a.command,
+                                            operation_type: a.operation_type,
+                                            operation_name: a.operation_name,
+                                            fields: a.fields,
+                                            query: a
+                                                .query
+                                                .into_iter()
+                                                .map(|(key, matcher)| {
+                                                    let yaml_matcher = if matcher.any.is_empty() {
+                                                        QueryMatcherDef::Glob(matcher.glob)
+                                                    } else {
+                                                        QueryMatcherDef::Any(QueryAnyDef {
+                                                            any: matcher.any,
+                                                        })
+                                                    };
+                                                    (key, yaml_matcher)
+                                                })
+                                                .collect(),
                                         },
                                     }
                                 })
                                 .collect(),
                             allowed_ips: e.allowed_ips.clone(),
+                            deny_rules: e
+                                .deny_rules
+                                .iter()
+                                .map(|d| L7DenyRuleDef {
+                                    method: d.method.clone(),
+                                    path: d.path.clone(),
+                                    command: d.command.clone(),
+                                    operation_type: d.operation_type.clone(),
+                                    operation_name: d.operation_name.clone(),
+                                    fields: d.fields.clone(),
+                                    query: d
+                                        .query
+                                        .iter()
+                                        .map(|(key, matcher)| {
+                                            let yaml_matcher = if matcher.any.is_empty() {
+                                                QueryMatcherDef::Glob(matcher.glob.clone())
+                                            } else {
+                                                QueryMatcherDef::Any(QueryAnyDef {
+                                                    any: matcher.any.clone(),
+                                                })
+                                            };
+                                            (key.clone(), yaml_matcher)
+                                        })
+                                        .collect(),
+                                })
+                                .collect(),
+                            allow_encoded_slash: e.allow_encoded_slash,
+                            persisted_queries: e.persisted_queries.clone(),
+                            graphql_persisted_queries: e
+                                .graphql_persisted_queries
+                                .iter()
+                                .map(|(key, op)| {
+                                    (
+                                        key.clone(),
+                                        GraphqlOperationDef {
+                                            operation_type: op.operation_type.clone(),
+                                            operation_name: op.operation_name.clone(),
+                                            fields: op.fields.clone(),
+                                        },
+                                    )
+                                })
+                                .collect(),
+                            graphql_max_body_bytes: e.graphql_max_body_bytes,
                             egress_via: e.egress_via.clone(),
                             egress_profile: e.egress_profile.clone(),
                             secret_injection: e
@@ -358,7 +573,7 @@ fn from_proto(policy: &SandboxPolicy) -> PolicyFile {
 
 /// Parse a sandbox policy from a YAML string.
 pub fn parse_sandbox_policy(yaml: &str) -> Result<SandboxPolicy> {
-    let raw: PolicyFile = serde_yaml::from_str(yaml)
+    let raw: PolicyFile = serde_yml::from_str(yaml)
         .into_diagnostic()
         .wrap_err("failed to parse sandbox policy YAML")?;
     Ok(to_proto(raw))
@@ -371,7 +586,7 @@ pub fn parse_sandbox_policy(yaml: &str) -> Result<SandboxPolicy> {
 /// and is round-trippable through `parse_sandbox_policy`.
 pub fn serialize_sandbox_policy(policy: &SandboxPolicy) -> Result<String> {
     let yaml_repr = from_proto(policy);
-    serde_yaml::to_string(&yaml_repr)
+    serde_yml::to_string(&yaml_repr)
         .into_diagnostic()
         .wrap_err("failed to serialize policy to YAML")
 }
@@ -454,9 +669,7 @@ pub fn restrictive_default_policy() -> SandboxPolicy {
 /// the required `"sandbox"` value. Call this before validation so that
 /// policies without an explicit process section get the correct default.
 pub fn ensure_sandbox_process_identity(policy: &mut SandboxPolicy) {
-    let process = policy
-        .process
-        .get_or_insert_with(|| ProcessPolicy::default());
+    let process = policy.process.get_or_insert_with(ProcessPolicy::default);
     if process.run_as_user.is_empty() {
         process.run_as_user = "sandbox".into();
     }
@@ -490,6 +703,8 @@ pub enum PolicyViolation {
     FieldTooLong { path: String, length: usize },
     /// Too many filesystem paths in the policy.
     TooManyPaths { count: usize },
+    /// A network endpoint uses a TLD wildcard (e.g. `*.com`).
+    TldWildcard { policy_name: String, host: String },
 }
 
 impl fmt::Display for PolicyViolation {
@@ -519,6 +734,13 @@ impl fmt::Display for PolicyViolation {
                     "too many filesystem paths ({count} > {MAX_FILESYSTEM_PATHS})"
                 )
             }
+            Self::TldWildcard { policy_name, host } => {
+                write!(
+                    f,
+                    "network policy '{policy_name}': TLD wildcard '{host}' is not allowed; \
+                     use subdomain wildcards like '*.example.com' instead"
+                )
+            }
         }
     }
 }
@@ -536,6 +758,7 @@ impl fmt::Display for PolicyViolation {
 /// - Read-write paths must not be overly broad (just `/`)
 /// - Individual path lengths must not exceed [`MAX_PATH_LENGTH`]
 /// - Total path count must not exceed [`MAX_FILESYSTEM_PATHS`]
+/// - Network endpoint hosts must not use TLD wildcards (e.g. `*.com`)
 pub fn validate_sandbox_policy(
     policy: &SandboxPolicy,
 ) -> std::result::Result<(), Vec<PolicyViolation>> {
@@ -601,6 +824,26 @@ pub fn validate_sandbox_policy(
                 violations.push(PolicyViolation::OverlyBroadPath {
                     path: path_str.clone(),
                 });
+            }
+        }
+    }
+
+    // Check network policy endpoint hosts for TLD wildcards.
+    for (key, rule) in &policy.network_policies {
+        let name = if rule.name.is_empty() {
+            key.clone()
+        } else {
+            rule.name.clone()
+        };
+        for ep in &rule.endpoints {
+            if ep.host.contains('*') && (ep.host.starts_with("*.") || ep.host.starts_with("**.")) {
+                let label_count = ep.host.split('.').count();
+                if label_count <= 2 {
+                    violations.push(PolicyViolation::TldWildcard {
+                        policy_name: name.clone(),
+                        host: ep.host.clone(),
+                    });
+                }
             }
         }
     }
@@ -698,77 +941,10 @@ network_policies:
         assert_eq!(ep1.allowed_ips, vec!["10.0.5.0/24", "10.0.6.0/24"]);
     }
 
-    #[test]
-    fn round_trip_preserves_package_proxy_metadata() {
-        let yaml = r#"
-version: 1
-network_policies:
-  packages:
-    name: packages
-    endpoints:
-      - host: registry.npmjs.org
-        port: 443
-        egress_via: package_proxy
-        egress_profile: socket
-    binaries:
-      - path: /usr/bin/npm
-"#;
-        let proto1 = parse_sandbox_policy(yaml).expect("parse failed");
-        let yaml_out = serialize_sandbox_policy(&proto1).expect("serialize failed");
-        let proto2 = parse_sandbox_policy(&yaml_out).expect("re-parse failed");
-
-        let ep1 = &proto1.network_policies["packages"].endpoints[0];
-        let ep2 = &proto2.network_policies["packages"].endpoints[0];
-        assert_eq!(ep1.egress_via, "package_proxy");
-        assert_eq!(ep1.egress_profile, "socket");
-        assert_eq!(ep1.egress_via, ep2.egress_via);
-        assert_eq!(ep1.egress_profile, ep2.egress_profile);
-    }
-
-    #[test]
-    fn round_trip_preserves_secret_injection_rules() {
-        let yaml = r#"
-version: 1
-network_policies:
-  api:
-    name: api
-    endpoints:
-      - host: api.example.com
-        port: 443
-        protocol: rest
-        tls: terminate
-        rules:
-          - allow:
-              method: GET
-              path: /v1/**
-        secret_injection:
-          - env_var: OPENAI_API_KEY
-            match_headers:
-              - Authorization
-            match_query: true
-    binaries:
-      - path: /usr/bin/curl
-"#;
-        let proto1 = parse_sandbox_policy(yaml).expect("parse failed");
-        let yaml_out = serialize_sandbox_policy(&proto1).expect("serialize failed");
-        let proto2 = parse_sandbox_policy(&yaml_out).expect("re-parse failed");
-
-        let rule1 = &proto1.network_policies["api"].endpoints[0].secret_injection[0];
-        let rule2 = &proto2.network_policies["api"].endpoints[0].secret_injection[0];
-        assert_eq!(rule1.env_var, "OPENAI_API_KEY");
-        assert_eq!(rule1.match_headers, vec!["Authorization"]);
-        assert!(rule1.match_query);
-        assert_eq!(rule1.env_var, rule2.env_var);
-        assert_eq!(rule1.proxy_value, rule2.proxy_value);
-        assert_eq!(rule1.match_headers, rule2.match_headers);
-        assert_eq!(rule1.match_query, rule2.match_query);
-        assert_eq!(rule1.match_body, rule2.match_body);
-    }
-
     /// Verify that the network policy `name` field survives the round-trip.
     #[test]
     fn round_trip_preserves_policy_name() {
-        let yaml = r#"
+        let yaml = r"
 version: 1
 network_policies:
   my_api:
@@ -778,7 +954,7 @@ network_policies:
         port: 443
     binaries:
       - path: /usr/bin/curl
-"#;
+";
         let proto1 = parse_sandbox_policy(yaml).expect("parse failed");
         assert_eq!(proto1.network_policies["my_api"].name, "my-custom-api-name");
 
@@ -847,7 +1023,7 @@ network_policies:
 
     #[test]
     fn parse_policy_with_network_rules() {
-        let yaml = r#"
+        let yaml = r"
 version: 1
 network_policies:
   test:
@@ -856,7 +1032,7 @@ network_policies:
       - { host: example.com, port: 443 }
     binaries:
       - { path: /usr/bin/curl }
-"#;
+";
         let policy = parse_sandbox_policy(yaml).expect("should parse");
         assert_eq!(policy.network_policies.len(), 1);
         let rule = &policy.network_policies["test"];
@@ -866,6 +1042,49 @@ network_policies:
         assert_eq!(rule.endpoints[0].port, 443);
         assert_eq!(rule.binaries.len(), 1);
         assert_eq!(rule.binaries[0].path, "/usr/bin/curl");
+    }
+
+    #[test]
+    fn parse_l7_query_matchers_and_round_trip() {
+        let yaml = r#"
+version: 1
+network_policies:
+  query_test:
+    name: query_test
+    endpoints:
+      - host: api.example.com
+        port: 8080
+        protocol: rest
+        rules:
+          - allow:
+              method: GET
+              path: /download
+              query:
+                slug: "my-*"
+                tag:
+                  any: ["foo-*", "bar-*"]
+    binaries:
+      - path: /usr/bin/curl
+"#;
+        let proto = parse_sandbox_policy(yaml).expect("parse failed");
+        let allow = proto.network_policies["query_test"].endpoints[0].rules[0]
+            .allow
+            .as_ref()
+            .expect("allow");
+        assert_eq!(allow.query["slug"].glob, "my-*");
+        assert_eq!(allow.query["slug"].any, Vec::<String>::new());
+        assert_eq!(allow.query["tag"].any, vec!["foo-*", "bar-*"]);
+        assert!(allow.query["tag"].glob.is_empty());
+
+        let yaml_out = serialize_sandbox_policy(&proto).expect("serialize failed");
+        let proto_round_trip = parse_sandbox_policy(&yaml_out).expect("re-parse failed");
+        let allow_round_trip = proto_round_trip.network_policies["query_test"].endpoints[0].rules
+            [0]
+        .allow
+        .as_ref()
+        .expect("allow");
+        assert_eq!(allow_round_trip.query["slug"].glob, "my-*");
+        assert_eq!(allow_round_trip.query["tag"].any, vec!["foo-*", "bar-*"]);
     }
 
     #[test]
@@ -1080,6 +1299,88 @@ network_policies:
     }
 
     #[test]
+    fn validate_rejects_tld_wildcard() {
+        let mut policy = restrictive_default_policy();
+        policy.network_policies.insert(
+            "bad".into(),
+            NetworkPolicyRule {
+                name: "bad-rule".into(),
+                endpoints: vec![NetworkEndpoint {
+                    host: "*.com".into(),
+                    port: 443,
+                    ..Default::default()
+                }],
+                ..Default::default()
+            },
+        );
+        let violations = validate_sandbox_policy(&policy).unwrap_err();
+        assert!(
+            violations
+                .iter()
+                .any(|v| matches!(v, PolicyViolation::TldWildcard { .. }))
+        );
+    }
+
+    #[test]
+    fn validate_rejects_double_star_tld_wildcard() {
+        let mut policy = restrictive_default_policy();
+        policy.network_policies.insert(
+            "bad".into(),
+            NetworkPolicyRule {
+                name: "bad-rule".into(),
+                endpoints: vec![NetworkEndpoint {
+                    host: "**.org".into(),
+                    port: 443,
+                    ..Default::default()
+                }],
+                ..Default::default()
+            },
+        );
+        let violations = validate_sandbox_policy(&policy).unwrap_err();
+        assert!(
+            violations
+                .iter()
+                .any(|v| matches!(v, PolicyViolation::TldWildcard { .. }))
+        );
+    }
+
+    #[test]
+    fn validate_accepts_subdomain_wildcard() {
+        let mut policy = restrictive_default_policy();
+        policy.network_policies.insert(
+            "ok".into(),
+            NetworkPolicyRule {
+                name: "ok-rule".into(),
+                endpoints: vec![NetworkEndpoint {
+                    host: "*.example.com".into(),
+                    port: 443,
+                    ..Default::default()
+                }],
+                ..Default::default()
+            },
+        );
+        assert!(validate_sandbox_policy(&policy).is_ok());
+    }
+
+    #[test]
+    fn validate_accepts_explicit_domain() {
+        let mut policy = restrictive_default_policy();
+        policy.network_policies.insert(
+            "ok".into(),
+            NetworkPolicyRule {
+                name: "ok-rule".into(),
+                endpoints: vec![NetworkEndpoint {
+                    host: "example.com".into(),
+                    port: 443,
+                    ..Default::default()
+                }],
+                ..Default::default()
+            },
+        );
+        assert!(validate_sandbox_policy(&policy).is_ok());
+    }
+
+    #[test]
     fn normalize_path_collapses_separators() {
         assert_eq!(normalize_path("/usr//lib"), "/usr/lib");
         assert_eq!(normalize_path("/usr/./lib"), "/usr/lib");
@@ -1108,7 +1409,7 @@ network_policies:
 
     #[test]
     fn parse_ports_array() {
-        let yaml = r#"
+        let yaml = r"
 version: 1
 network_policies:
   test:
@@ -1117,7 +1418,7 @@ network_policies:
       - { host: api.example.com, ports: [80, 443] }
     binaries:
       - { path: /usr/bin/curl }
-"#;
+";
         let policy = parse_sandbox_policy(yaml).expect("should parse");
         let ep = &policy.network_policies["test"].endpoints[0];
         assert_eq!(ep.ports, vec![80, 443]);
@@ -1127,7 +1428,7 @@ network_policies:
 
     #[test]
     fn parse_single_port_normalized_to_ports() {
-        let yaml = r#"
+        let yaml = r"
 version: 1
 network_policies:
   test:
@@ -1136,7 +1437,7 @@ network_policies:
       - { host: api.example.com, port: 443 }
     binaries:
       - { path: /usr/bin/curl }
-"#;
+";
         let policy = parse_sandbox_policy(yaml).expect("should parse");
         let ep = &policy.network_policies["test"].endpoints[0];
         assert_eq!(ep.ports, vec![443]);
@@ -1144,8 +1445,36 @@ network_policies:
     }
 
     #[test]
-    fn round_trip_preserves_multi_port() {
+    fn round_trip_preserves_endpoint_path() {
         let yaml = r#"
+version: 1
+network_policies:
+  test:
+    name: test
+    endpoints:
+      - host: api.example.com
+        port: 443
+        path: "/graphql"
+        protocol: graphql
+        rules:
+          - allow:
+              operation_type: query
+    binaries:
+      - { path: /usr/bin/curl }
+"#;
+        let proto1 = parse_sandbox_policy(yaml).expect("parse failed");
+        let yaml_out = serialize_sandbox_policy(&proto1).expect("serialize failed");
+        let proto2 = parse_sandbox_policy(&yaml_out).expect("re-parse failed");
+
+        let ep1 = &proto1.network_policies["test"].endpoints[0];
+        let ep2 = &proto2.network_policies["test"].endpoints[0];
+        assert_eq!(ep1.path, "/graphql");
+        assert_eq!(ep1.path, ep2.path);
+    }
+
+    #[test]
+    fn round_trip_preserves_multi_port() {
+        let yaml = r"
 version: 1
 network_policies:
   test:
@@ -1157,7 +1486,7 @@ network_policies:
           - 443
     binaries:
       - { path: /usr/bin/curl }
-"#;
+";
         let proto1 = parse_sandbox_policy(yaml).expect("parse failed");
         let yaml_out = serialize_sandbox_policy(&proto1).expect("serialize failed");
         let proto2 = parse_sandbox_policy(&yaml_out).expect("re-parse failed");
@@ -1170,7 +1499,7 @@ network_policies:
 
     #[test]
     fn serialize_single_port_uses_compact_form() {
-        let yaml = r#"
+        let yaml = r"
 version: 1
 network_policies:
   test:
@@ -1179,7 +1508,7 @@ network_policies:
       - { host: api.example.com, port: 443 }
     binaries:
       - { path: /usr/bin/curl }
-"#;
+";
         let proto = parse_sandbox_policy(yaml).expect("parse failed");
         let yaml_out = serialize_sandbox_policy(&proto).expect("serialize failed");
         // Should use compact `port: 443` form, not `ports: [443]`
@@ -1229,6 +1558,180 @@ network_policies:
         assert_eq!(
             proto1.network_policies["test"].endpoints[0].host,
             proto2.network_policies["test"].endpoints[0].host
+        );
+    }
+
+    #[test]
+    fn parse_deny_rules_from_yaml() {
+        let yaml = r#"
+version: 1
+network_policies:
+  github:
+    name: github
+    endpoints:
+      - host: api.github.com
+        port: 443
+        protocol: rest
+        access: read-write
+        deny_rules:
+          - method: POST
+            path: "/repos/*/pulls/*/reviews"
+          - method: PUT
+            path: "/repos/*/branches/*/protection"
+    binaries:
+      - path: /usr/bin/curl
+"#;
+        let proto = parse_sandbox_policy(yaml).expect("parse failed");
+        let ep = &proto.network_policies["github"].endpoints[0];
+        assert_eq!(ep.deny_rules.len(), 2);
+        assert_eq!(ep.deny_rules[0].method, "POST");
+        assert_eq!(ep.deny_rules[0].path, "/repos/*/pulls/*/reviews");
+        assert_eq!(ep.deny_rules[1].method, "PUT");
+        assert_eq!(ep.deny_rules[1].path, "/repos/*/branches/*/protection");
+    }
+
+    #[test]
+    fn round_trip_preserves_deny_rules() {
+        let yaml = r#"
+version: 1
+network_policies:
+  github:
+    name: github
+    endpoints:
+      - host: api.github.com
+        port: 443
+        protocol: rest
+        access: full
+        deny_rules:
+          - method: POST
+            path: "/repos/*/pulls/*/reviews"
+          - method: DELETE
+            path: "/repos/*/branches/*/protection"
+            query:
+              force: "true"
+    binaries:
+      - path: /usr/bin/curl
+"#;
+        let proto1 = parse_sandbox_policy(yaml).expect("parse failed");
+        let yaml_out = serialize_sandbox_policy(&proto1).expect("serialize failed");
+        let proto2 = parse_sandbox_policy(&yaml_out).expect("re-parse failed");
+
+        let ep1 = &proto1.network_policies["github"].endpoints[0];
+        let ep2 = &proto2.network_policies["github"].endpoints[0];
+        assert_eq!(ep1.deny_rules.len(), ep2.deny_rules.len());
+        assert_eq!(ep2.deny_rules[0].method, "POST");
+        assert_eq!(ep2.deny_rules[0].path, "/repos/*/pulls/*/reviews");
+        assert_eq!(ep2.deny_rules[1].method, "DELETE");
+        assert_eq!(ep2.deny_rules[1].query["force"].glob, "true");
+    }
+
+    #[test]
+    fn parse_deny_rules_with_query_any() {
+        let yaml = r#"
+version: 1
+network_policies:
+  test:
+    name: test
+    endpoints:
+      - host: api.example.com
+        port: 443
+        protocol: rest
+        access: full
+        deny_rules:
+          - method: POST
+            path: /action
+            query:
+              type:
+                any: ["admin-*", "root-*"]
+    binaries:
+      - path: /usr/bin/curl
+"#;
+        let proto = parse_sandbox_policy(yaml).expect("parse failed");
+        let deny = &proto.network_policies["test"].endpoints[0].deny_rules[0];
+        assert_eq!(deny.query["type"].any, vec!["admin-*", "root-*"]);
+    }
+
+    #[test]
+    fn round_trip_preserves_graphql_policy_fields() {
+        let yaml = r"
+version: 1
+network_policies:
+  github_graphql:
+    name: github_graphql
+    endpoints:
+      - host: api.github.com
+        port: 443
+        protocol: graphql
+        enforcement: enforce
+        persisted_queries: allow_registered
+        graphql_max_body_bytes: 131072
+        graphql_persisted_queries:
+          abc123:
+            operation_type: query
+            operation_name: Viewer
+            fields: [viewer]
+        rules:
+          - allow:
+              operation_type: query
+              fields: [viewer, repository]
+          - allow:
+              operation_type: mutation
+              operation_name: Issue*
+              fields: [createIssue]
+        deny_rules:
+          - operation_type: mutation
+            fields: [deleteRepository]
+    binaries:
+      - path: /usr/bin/curl
+";
+        let proto1 = parse_sandbox_policy(yaml).expect("parse failed");
+        let yaml_out = serialize_sandbox_policy(&proto1).expect("serialize failed");
+        let proto2 = parse_sandbox_policy(&yaml_out).expect("re-parse failed");
+
+        let ep = &proto2.network_policies["github_graphql"].endpoints[0];
+        assert_eq!(ep.protocol, "graphql");
+        assert_eq!(ep.persisted_queries, "allow_registered");
+        assert_eq!(ep.graphql_max_body_bytes, 131_072);
+        assert_eq!(
+            ep.graphql_persisted_queries["abc123"].operation_type,
+            "query"
+        );
+        assert_eq!(ep.rules[0].allow.as_ref().unwrap().operation_type, "query");
+        assert_eq!(ep.rules[1].allow.as_ref().unwrap().operation_name, "Issue*");
+        assert_eq!(ep.deny_rules[0].operation_type, "mutation");
+        assert_eq!(ep.deny_rules[0].fields, vec!["deleteRepository"]);
+    }
+
+    #[test]
+    fn parse_rejects_unknown_fields_in_deny_rule() {
+        let yaml = r"
+version: 1
+network_policies:
+  test:
+    endpoints:
+      - host: example.com
+        port: 443
+        deny_rules:
+          - method: POST
+            path: /foo
+            bogus: true
+";
+        assert!(parse_sandbox_policy(yaml).is_err());
+    }
+
+    #[test]
+    fn rejects_port_above_65535() {
+        let yaml = r"
+version: 1
+network_policies:
+  test:
+    endpoints:
+      - host: example.com
+        port: 70000
+";
+        assert!(
+            parse_sandbox_policy(yaml).is_err(),
+            "port >65535 should fail to parse"
         );
     }
 }

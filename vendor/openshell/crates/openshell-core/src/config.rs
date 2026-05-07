@@ -1,11 +1,128 @@
 // SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
-//! Configuration management for OpenShell components.
+//! Configuration management for `OpenShell` components.
 
 use serde::{Deserialize, Serialize};
+use std::fmt;
 use std::net::SocketAddr;
 use std::path::PathBuf;
+use std::process::Command;
+use std::str::FromStr;
+
+// ── Public default constants ────────────────────────────────────────────
+//
+// Canonical source for default values used across multiple crates.
+// Clap `default_value_t` annotations and runtime fallbacks should
+// reference these constants instead of hardcoding literals.
+
+/// Default SSH port inside sandbox containers.
+pub const DEFAULT_SSH_PORT: u16 = 2222;
+
+/// Default server / SSH gateway port.
+pub const DEFAULT_SERVER_PORT: u16 = 8080;
+
+/// Default container stop timeout in seconds (SIGTERM → SIGKILL).
+pub const DEFAULT_STOP_TIMEOUT_SECS: u32 = 10;
+
+/// Default allowed clock skew for SSH handshake validation, in seconds.
+pub const DEFAULT_SSH_HANDSHAKE_SKEW_SECS: u64 = 300;
+
+/// Default Podman bridge network name.
+pub const DEFAULT_NETWORK_NAME: &str = "openshell";
+
+/// Default Docker bridge network name for local sandboxes.
+pub const DEFAULT_DOCKER_NETWORK_NAME: &str = "openshell-docker";
+
+/// Default OCI image for the openshell-sandbox supervisor binary.
+pub const DEFAULT_SUPERVISOR_IMAGE: &str = "openshell/supervisor:latest";
+
+/// Default image pull policy for sandbox images.
+pub const DEFAULT_IMAGE_PULL_POLICY: &str = "missing";
+
+/// Default Kubernetes namespace for sandbox resources.
+pub const DEFAULT_K8S_NAMESPACE: &str = "openshell";
+
+/// CDI device identifier for requesting all NVIDIA GPUs.
+pub const CDI_GPU_DEVICE_ALL: &str = "nvidia.com/gpu=all";
+
+/// Compute backends the gateway can orchestrate sandboxes through.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ComputeDriverKind {
+    Kubernetes,
+    Vm,
+    Docker,
+    Podman,
+}
+
+impl ComputeDriverKind {
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Kubernetes => "kubernetes",
+            Self::Vm => "vm",
+            Self::Docker => "docker",
+            Self::Podman => "podman",
+        }
+    }
+}
+
+impl fmt::Display for ComputeDriverKind {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+impl FromStr for ComputeDriverKind {
+    type Err = String;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        match value.trim().to_ascii_lowercase().as_str() {
+            "kubernetes" => Ok(Self::Kubernetes),
+            "vm" => Ok(Self::Vm),
+            "docker" => Ok(Self::Docker),
+            "podman" => Ok(Self::Podman),
+            other => Err(format!(
+                "unsupported compute driver '{other}'. expected one of: kubernetes, vm, docker, podman"
+            )),
+        }
+    }
+}
+
+/// Auto-detect the appropriate compute driver based on the runtime environment.
+///
+/// Priority order: Kubernetes → Podman → Docker.
+/// VM is never auto-detected (requires explicit `--drivers vm`).
+///
+/// Returns the first driver where the environment check passes.
+/// Returns `None` if no compatible driver is found.
+pub fn detect_driver() -> Option<ComputeDriverKind> {
+    // Kubernetes: check for KUBERNETES_SERVICE_HOST env var (set inside pods)
+    if std::env::var_os("KUBERNETES_SERVICE_HOST").is_some() {
+        return Some(ComputeDriverKind::Kubernetes);
+    }
+
+    // Podman: check if podman binary is available
+    if is_binary_available("podman") {
+        return Some(ComputeDriverKind::Podman);
+    }
+
+    // Docker: check if docker binary is available
+    if is_binary_available("docker") {
+        return Some(ComputeDriverKind::Docker);
+    }
+
+    None
+}
+
+/// Check if a binary is available on the system PATH.
+fn is_binary_available(name: &str) -> bool {
+    Command::new(name)
+        .arg("--version")
+        .output()
+        .is_ok_and(|output| output.status.success())
+}
 
 /// Server configuration.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -14,6 +131,27 @@ pub struct Config {
     #[serde(default = "default_bind_address")]
     pub bind_address: SocketAddr,
 
+    /// Address to bind the unauthenticated health endpoint to.
+    ///
+    /// When `None`, the dedicated health listener is disabled.
+    #[serde(default)]
+    pub health_bind_address: Option<SocketAddr>,
+
+    /// Address to bind the Prometheus metrics endpoint to.
+    ///
+    /// When `None`, the dedicated metrics listener is disabled.
+    #[serde(default)]
+    pub metrics_bind_address: Option<SocketAddr>,
+
+    /// Additional bind addresses that serve the same multiplexed gRPC/HTTP
+    /// surface as `bind_address`.
+    ///
+    /// Compute drivers may register extra listeners during startup so that
+    /// sandbox workloads can call back into the gateway over an interface
+    /// that the operator-supplied `bind_address` does not expose.
+    #[serde(default)]
+    pub extra_bind_addresses: Vec<SocketAddr>,
+
     /// Log level (trace, debug, info, warn, error).
     #[serde(default = "default_log_level")]
     pub log_level: String,
@@ -21,15 +159,27 @@ pub struct Config {
     /// TLS configuration.  When `None`, the server listens on plaintext HTTP.
     pub tls: Option<TlsConfig>,
 
+    /// OIDC configuration. When `Some`, the server validates Bearer JWTs.
+    #[serde(default)]
+    pub oidc: Option<OidcConfig>,
+
     /// Database URL for persistence.
     pub database_url: String,
+
+    /// Compute drivers configured for the gateway.
+    ///
+    /// The config shape allows multiple drivers so the gateway can evolve
+    /// toward multi-backend routing. Current releases require exactly one
+    /// configured driver.
+    #[serde(default)]
+    pub compute_drivers: Vec<ComputeDriverKind>,
 
     /// Kubernetes namespace for sandboxes.
     #[serde(default = "default_sandbox_namespace")]
     pub sandbox_namespace: String,
 
     /// Default container image for sandboxes.
-    #[serde(default)]
+    #[serde(default = "default_sandbox_image")]
     pub sandbox_image: String,
 
     /// Kubernetes `imagePullPolicy` for sandbox pods (e.g. `Always`,
@@ -39,7 +189,7 @@ pub struct Config {
     #[serde(default)]
     pub sandbox_image_pull_policy: String,
 
-    /// gRPC endpoint for sandboxes to connect back to OpenShell.
+    /// gRPC endpoint for sandboxes to connect back to `OpenShell`.
     /// Used by sandbox pods to fetch their policy at startup.
     #[serde(default)]
     pub grpc_endpoint: String,
@@ -56,9 +206,21 @@ pub struct Config {
     #[serde(default = "default_ssh_connect_path")]
     pub ssh_connect_path: String,
 
-    /// SSH listen port inside sandbox pods.
+    /// SSH listen port inside sandbox containers that expose a TCP endpoint.
     #[serde(default = "default_sandbox_ssh_port")]
     pub sandbox_ssh_port: u16,
+
+    /// Filesystem path where the sandbox supervisor binds its SSH Unix
+    /// socket. The supervisor is passed this path via
+    /// `OPENSHELL_SSH_SOCKET_PATH` / `--ssh-socket-path` and connects its
+    /// relay bridge to the same path.
+    ///
+    /// When the gateway orchestrates sandboxes that each live in their own
+    /// filesystem (K8s pod, libkrun VM, etc.), the default is safe. For
+    /// local dev where multiple supervisors share `/run`, override this to
+    /// something unique per sandbox.
+    #[serde(default = "default_sandbox_ssh_socket_path")]
+    pub sandbox_ssh_socket_path: String,
 
     /// Shared secret for gateway-to-sandbox SSH handshake.
     #[serde(default)]
@@ -84,32 +246,6 @@ pub struct Config {
     /// allowing them to reach services running on the Docker host.
     #[serde(default)]
     pub host_gateway_ip: String,
-
-    /// Extended resource name to request on sandbox pods for FUSE device injection.
-    /// When set (for example `github.com/fuse`), the gateway adds a container
-    /// resource limit of `1`, which triggers kubelet device-plugin allocation.
-    #[serde(default)]
-    pub sandbox_fuse_resource_name: String,
-
-    /// Whether sandbox pods should default to package-proxy routing support.
-    #[serde(default)]
-    pub package_proxy_enabled: bool,
-
-    /// Routing profile for package-proxy endpoints (for example `socket`).
-    #[serde(default)]
-    pub package_proxy_profile: String,
-
-    /// Upstream proxy URL used for `egress_via=package_proxy` endpoints.
-    #[serde(default)]
-    pub package_proxy_upstream_url: String,
-
-    /// Kubernetes secret name containing the package-proxy CA bundle for sandbox pods.
-    #[serde(default)]
-    pub package_proxy_ca_secret_name: String,
-
-    /// Kubernetes secret name containing package-proxy auth material for sandbox pods.
-    #[serde(default)]
-    pub package_proxy_auth_secret_name: String,
 }
 
 /// TLS configuration.
@@ -138,33 +274,91 @@ pub struct TlsConfig {
     pub allow_unauthenticated: bool,
 }
 
+/// OIDC (`OpenID` Connect) configuration for JWT-based authentication.
+///
+/// When configured, the server validates `authorization: Bearer <JWT>`
+/// headers on gRPC requests against the specified issuer's JWKS endpoint.
+///
+/// The roles claim path is configurable to support different providers:
+/// - Keycloak: `realm_access.roles` (default)
+/// - Entra ID / Okta: `roles`
+/// - Custom: any dot-separated path into the JWT claims
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct OidcConfig {
+    /// OIDC issuer URL (e.g., `http://localhost:8180/realms/openshell`).
+    pub issuer: String,
+
+    /// Expected audience (`aud`) claim. Typically the OIDC client ID.
+    pub audience: String,
+
+    /// JWKS cache TTL in seconds. Defaults to 3600 (1 hour).
+    #[serde(default = "default_jwks_ttl_secs")]
+    pub jwks_ttl_secs: u64,
+
+    /// Dot-separated path to the roles array in the JWT claims.
+    /// Defaults to `realm_access.roles` (Keycloak).
+    /// Examples: `roles` (Entra ID), `groups` (Okta), `custom.path.roles`.
+    #[serde(default = "default_roles_claim")]
+    pub roles_claim: String,
+
+    /// Role name that grants admin access. Defaults to `openshell-admin`.
+    #[serde(default = "default_admin_role")]
+    pub admin_role: String,
+
+    /// Role name that grants standard user access. Defaults to `openshell-user`.
+    #[serde(default = "default_user_role")]
+    pub user_role: String,
+
+    /// Dot-separated path to the scopes value in the JWT claims.
+    /// When non-empty, the server enforces scope-based permissions on top of roles.
+    /// Keycloak: `scope` (space-delimited string). Okta: `scp` (JSON array).
+    #[serde(default)]
+    pub scopes_claim: String,
+}
+
+const fn default_jwks_ttl_secs() -> u64 {
+    3600
+}
+
+fn default_roles_claim() -> String {
+    "realm_access.roles".to_string()
+}
+
+fn default_admin_role() -> String {
+    "openshell-admin".to_string()
+}
+
+fn default_user_role() -> String {
+    "openshell-user".to_string()
+}
+
 impl Config {
     /// Create a new config with optional TLS.
     pub fn new(tls: Option<TlsConfig>) -> Self {
         Self {
             bind_address: default_bind_address(),
+            health_bind_address: None,
+            metrics_bind_address: None,
+            extra_bind_addresses: Vec::new(),
             log_level: default_log_level(),
             tls,
+            oidc: None,
             database_url: String::new(),
+            compute_drivers: vec![],
             sandbox_namespace: default_sandbox_namespace(),
-            sandbox_image: String::new(),
+            sandbox_image: default_sandbox_image(),
             sandbox_image_pull_policy: String::new(),
             grpc_endpoint: String::new(),
             ssh_gateway_host: default_ssh_gateway_host(),
             ssh_gateway_port: default_ssh_gateway_port(),
             ssh_connect_path: default_ssh_connect_path(),
             sandbox_ssh_port: default_sandbox_ssh_port(),
+            sandbox_ssh_socket_path: default_sandbox_ssh_socket_path(),
             ssh_handshake_secret: String::new(),
             ssh_handshake_skew_secs: default_ssh_handshake_skew_secs(),
             ssh_session_ttl_secs: default_ssh_session_ttl_secs(),
             client_tls_secret_name: String::new(),
             host_gateway_ip: String::new(),
-            sandbox_fuse_resource_name: String::new(),
-            package_proxy_enabled: false,
-            package_proxy_profile: String::new(),
-            package_proxy_upstream_url: String::new(),
-            package_proxy_ca_secret_name: String::new(),
-            package_proxy_auth_secret_name: String::new(),
         }
     }
 
@@ -172,6 +366,31 @@ impl Config {
     #[must_use]
     pub const fn with_bind_address(mut self, addr: SocketAddr) -> Self {
         self.bind_address = addr;
+        self
+    }
+
+    #[must_use]
+    pub const fn with_health_bind_address(mut self, addr: SocketAddr) -> Self {
+        self.health_bind_address = Some(addr);
+        self
+    }
+
+    #[must_use]
+    pub const fn with_metrics_bind_address(mut self, addr: SocketAddr) -> Self {
+        self.metrics_bind_address = Some(addr);
+        self
+    }
+
+    /// Append an extra listener address to the multiplex service.
+    ///
+    /// Duplicate entries (matching `bind_address` or any existing entry) are
+    /// silently dropped so callers can naively push driver-derived addresses
+    /// without checking for collisions.
+    #[must_use]
+    pub fn with_extra_bind_address(mut self, addr: SocketAddr) -> Self {
+        if addr != self.bind_address && !self.extra_bind_addresses.contains(&addr) {
+            self.extra_bind_addresses.push(addr);
+        }
         self
     }
 
@@ -186,6 +405,16 @@ impl Config {
     #[must_use]
     pub fn with_database_url(mut self, url: impl Into<String>) -> Self {
         self.database_url = url.into();
+        self
+    }
+
+    /// Create a new configuration with the configured compute drivers.
+    #[must_use]
+    pub fn with_compute_drivers<I>(mut self, drivers: I) -> Self
+    where
+        I: IntoIterator<Item = ComputeDriverKind>,
+    {
+        self.compute_drivers = drivers.into_iter().collect();
         self
     }
 
@@ -280,51 +509,16 @@ impl Config {
         self
     }
 
-    /// Set the extended resource name requested on sandbox pods for FUSE.
+    /// Set the OIDC configuration for JWT-based authentication.
     #[must_use]
-    pub fn with_sandbox_fuse_resource_name(mut self, name: impl Into<String>) -> Self {
-        self.sandbox_fuse_resource_name = name.into();
-        self
-    }
-
-    /// Set whether sandbox pods should default to package-proxy routing support.
-    #[must_use]
-    pub const fn with_package_proxy_enabled(mut self, enabled: bool) -> Self {
-        self.package_proxy_enabled = enabled;
-        self
-    }
-
-    /// Set the package-proxy routing profile.
-    #[must_use]
-    pub fn with_package_proxy_profile(mut self, profile: impl Into<String>) -> Self {
-        self.package_proxy_profile = profile.into();
-        self
-    }
-
-    /// Set the upstream proxy URL used for package-proxy routing.
-    #[must_use]
-    pub fn with_package_proxy_upstream_url(mut self, url: impl Into<String>) -> Self {
-        self.package_proxy_upstream_url = url.into();
-        self
-    }
-
-    /// Set the secret name containing the package-proxy CA bundle.
-    #[must_use]
-    pub fn with_package_proxy_ca_secret_name(mut self, name: impl Into<String>) -> Self {
-        self.package_proxy_ca_secret_name = name.into();
-        self
-    }
-
-    /// Set the secret name containing package-proxy auth material.
-    #[must_use]
-    pub fn with_package_proxy_auth_secret_name(mut self, name: impl Into<String>) -> Self {
-        self.package_proxy_auth_secret_name = name.into();
+    pub fn with_oidc(mut self, oidc: OidcConfig) -> Self {
+        self.oidc = Some(oidc);
         self
     }
 }
 
 fn default_bind_address() -> SocketAddr {
-    "0.0.0.0:8080".parse().expect("valid default address")
+    "127.0.0.1:8080".parse().expect("valid default address")
 }
 
 fn default_log_level() -> String {
@@ -335,26 +529,117 @@ fn default_sandbox_namespace() -> String {
     "default".to_string()
 }
 
+fn default_sandbox_image() -> String {
+    format!("{}/base:latest", crate::image::DEFAULT_COMMUNITY_REGISTRY)
+}
+
 fn default_ssh_gateway_host() -> String {
     "127.0.0.1".to_string()
 }
 
 const fn default_ssh_gateway_port() -> u16 {
-    8080
+    DEFAULT_SERVER_PORT
 }
 
 fn default_ssh_connect_path() -> String {
     "/connect/ssh".to_string()
 }
 
+fn default_sandbox_ssh_socket_path() -> String {
+    "/run/openshell/ssh.sock".to_string()
+}
+
 const fn default_sandbox_ssh_port() -> u16 {
-    2222
+    DEFAULT_SSH_PORT
 }
 
 const fn default_ssh_handshake_skew_secs() -> u64 {
-    300
+    DEFAULT_SSH_HANDSHAKE_SKEW_SECS
 }
 
 const fn default_ssh_session_ttl_secs() -> u64 {
     86400 // 24 hours
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{ComputeDriverKind, Config, detect_driver};
+    use std::net::SocketAddr;
+
+    #[test]
+    fn compute_driver_kind_parses_supported_values() {
+        assert_eq!(
+            "kubernetes".parse::<ComputeDriverKind>().unwrap(),
+            ComputeDriverKind::Kubernetes
+        );
+        assert_eq!(
+            "vm".parse::<ComputeDriverKind>().unwrap(),
+            ComputeDriverKind::Vm
+        );
+        assert_eq!(
+            "podman".parse::<ComputeDriverKind>().unwrap(),
+            ComputeDriverKind::Podman
+        );
+        assert_eq!(
+            "docker".parse::<ComputeDriverKind>().unwrap(),
+            ComputeDriverKind::Docker
+        );
+    }
+
+    #[test]
+    fn compute_driver_kind_rejects_unknown_values() {
+        let err = "firecracker".parse::<ComputeDriverKind>().unwrap_err();
+        assert!(err.contains("unsupported compute driver 'firecracker'"));
+    }
+
+    #[test]
+    fn config_defaults_to_loopback_bind_address() {
+        let expected: SocketAddr = "127.0.0.1:8080".parse().expect("valid address");
+        assert_eq!(Config::new(None).bind_address, expected);
+    }
+
+    #[test]
+    fn config_new_disables_health_bind_by_default() {
+        let cfg = Config::new(None);
+        assert!(cfg.health_bind_address.is_none());
+    }
+
+    #[test]
+    fn config_with_health_bind_address_sets_address() {
+        let addr: SocketAddr = "0.0.0.0:9090".parse().expect("valid address");
+        let cfg = Config::new(None).with_health_bind_address(addr);
+        assert_eq!(cfg.health_bind_address, Some(addr));
+    }
+
+    #[test]
+    fn detect_driver_returns_none_without_k8s_env_or_binaries() {
+        // When KUBERNETES_SERVICE_HOST is not set and no docker/podman binaries
+        // are available, detect_driver should return None.
+        // This test may pass or fail depending on the test environment,
+        // but it documents the expected behavior.
+        let _ = detect_driver(); // Returns Some or None based on environment
+    }
+
+    #[test]
+    #[allow(unsafe_code)] // std::env::set_var/remove_var require unsafe in Rust 2024
+    fn detect_driver_prefers_kubernetes_when_k8s_env_is_set() {
+        // Save the original env var
+        let original = std::env::var("KUBERNETES_SERVICE_HOST").ok();
+
+        // Set the env var
+        unsafe {
+            std::env::set_var("KUBERNETES_SERVICE_HOST", "127.0.0.1");
+        }
+
+        let result = detect_driver();
+        assert_eq!(result, Some(ComputeDriverKind::Kubernetes));
+
+        // Restore the original env var
+        unsafe {
+            match original {
+                Some(val) => std::env::set_var("KUBERNETES_SERVICE_HOST", val),
+                None => std::env::remove_var("KUBERNETES_SERVICE_HOST"),
+            }
+        }
+    }
 }

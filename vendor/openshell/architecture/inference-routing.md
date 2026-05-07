@@ -28,9 +28,12 @@ sequenceDiagram
     Backend->>Router: Response headers + body stream
     Router->>Proxy: StreamingProxyResponse (headers first)
     Proxy->>Agent: HTTP/1.1 headers (chunked TE)
-    loop Each body chunk
+    loop Each body chunk (120s idle timeout per chunk)
         Router->>Proxy: chunk via next_chunk()
         Proxy->>Agent: Chunked-encoded frame
+    end
+    alt Stream truncated (idle timeout, byte limit, upstream error)
+        Proxy->>Agent: SSE error event (proxy_stream_error)
     end
     Proxy->>Agent: Chunk terminator (0\r\n\r\n)
 ```
@@ -59,7 +62,7 @@ File: `crates/openshell-server/src/inference.rs`
 
 The gateway implements the `Inference` gRPC service defined in `proto/inference.proto`.
 
-### Cluster inference set/get
+### Gateway inference set/get
 
 `SetClusterInference` takes a `provider_name` and `model_id`. It:
 
@@ -70,7 +73,7 @@ The gateway implements the `Inference` gRPC service defined in `proto/inference.
 5. Builds a managed route spec that stores only `provider_name` and `model_id`. The spec intentionally leaves `base_url`, `api_key`, and `protocols` empty -- these are resolved dynamically at bundle time from the provider record.
 6. Upserts the route with name `inference.local`. Version starts at 1 and increments monotonically on each update.
 
-`GetClusterInference` returns `provider_name`, `model_id`, and `version` for the managed route. Returns `NOT_FOUND` if cluster inference is not configured.
+`GetClusterInference` returns `provider_name`, `model_id`, and `version` for the managed route. Returns `NOT_FOUND` if gateway inference is not configured.
 
 ### Bundle delivery
 
@@ -84,7 +87,7 @@ The gateway implements the `Inference` gRPC service defined in `proto/inference.
 
 Because resolution happens at request time, credential rotation and endpoint changes on the provider record take effect on the next bundle fetch without re-running `SetClusterInference`.
 
-An empty route list is valid and indicates cluster inference is not yet configured.
+An empty route list is valid and indicates gateway inference is not yet configured.
 
 ### Proto definitions
 
@@ -92,21 +95,21 @@ File: `proto/inference.proto`
 
 Key messages:
 
-- `SetClusterInferenceRequest` -- `provider_name` + `model_id` + optional `no_verify` override, with verification enabled by default
-- `SetClusterInferenceResponse` -- `provider_name` + `model_id` + `version`
+- `SetClusterInferenceRequest` -- `provider_name` + `model_id` + `timeout_secs` + optional `no_verify` override, with verification enabled by default
+- `SetClusterInferenceResponse` -- `provider_name` + `model_id` + `timeout_secs` + `version`
 - `GetInferenceBundleResponse` -- `repeated ResolvedRoute routes` + `revision` + `generated_at_ms`
-- `ResolvedRoute` -- `name`, `base_url`, `protocols`, `api_key`, `model_id`, `provider_type`
+- `ResolvedRoute` -- `name`, `base_url`, `protocols`, `api_key`, `model_id`, `provider_type`, `timeout_secs`
 
 ## Data Plane (Sandbox)
 
 Files:
 
 - `crates/openshell-sandbox/src/proxy.rs` -- proxy interception, inference context, request routing
-- `crates/openshell-sandbox/src/l7/inference.rs` -- pattern detection, HTTP parsing, response formatting
+- `crates/openshell-sandbox/src/l7/inference.rs` -- pattern detection, HTTP parsing, response formatting, SSE error generation (`format_sse_error()`)
 - `crates/openshell-sandbox/src/lib.rs` -- inference context initialization, route refresh
 - `crates/openshell-sandbox/src/grpc_client.rs` -- `fetch_inference_bundle()`
 
-In cluster mode, the sandbox starts a background refresh loop as soon as the inference context is created. The loop polls the gateway every 5 seconds by default (`OPENSHELL_ROUTE_REFRESH_INTERVAL_SECS` override) and uses the bundle revision hash to skip no-op cache writes.
+In gateway bundle mode, the sandbox starts a background refresh loop as soon as the inference context is created. The loop polls the gateway every 5 seconds by default (`OPENSHELL_ROUTE_REFRESH_INTERVAL_SECS` override) and uses the bundle revision hash to skip no-op cache writes. The revision hash covers all route fields including `timeout_secs`, so any configuration change (provider, model, or timeout) triggers a cache update on the next poll.
 
 ### Interception flow
 
@@ -143,9 +146,9 @@ If no pattern matches, the proxy returns `403 Forbidden` with `{"error": "connec
 ### Route cache
 
 - `InferenceContext` holds a `Router`, the pattern list, and an `Arc<RwLock<Vec<ResolvedRoute>>>` route cache.
-- In cluster mode, `spawn_route_refresh()` polls `GetInferenceBundle` every 30 seconds (`ROUTE_REFRESH_INTERVAL_SECS`). On failure, stale routes are kept.
+- In gateway bundle mode, `spawn_route_refresh()` polls `GetInferenceBundle` every 5 seconds (`OPENSHELL_ROUTE_REFRESH_INTERVAL_SECS`). On failure, stale routes are kept.
 - In file mode (`--inference-routes`), routes load once at startup from YAML. No refresh task is spawned.
-- In cluster mode, an empty initial bundle still enables the inference context so the refresh task can pick up later configuration.
+- In gateway bundle mode, an empty initial bundle still enables the inference context so the refresh task can pick up later configuration.
 
 ### Bundle-to-route conversion
 
@@ -156,7 +159,7 @@ If no pattern matches, the proxy returns `403 Forbidden` with `{"error": "connec
 Files:
 
 - `crates/openshell-router/src/lib.rs` -- `Router`, `proxy_with_candidates()`, `proxy_with_candidates_streaming()`
-- `crates/openshell-router/src/backend.rs` -- `proxy_to_backend()`, `proxy_to_backend_streaming()`, URL construction
+- `crates/openshell-router/src/backend.rs` -- `prepare_backend_request()`, `send_backend_request()`, `send_backend_request_streaming()`, `proxy_to_backend()`, `proxy_to_backend_streaming()`, URL construction
 - `crates/openshell-router/src/config.rs` -- `RouteConfig`, `ResolvedRoute`, YAML loading
 
 ### Route selection
@@ -165,19 +168,20 @@ Files:
 
 ### Request rewriting
 
-`proxy_to_backend()` rewrites outgoing requests:
+`prepare_backend_request()` (shared by both buffered and streaming paths) rewrites outgoing requests:
 
 1. **Auth injection**: Uses the route's `AuthHeader` -- either `Authorization: Bearer <key>` or a custom header (e.g. `x-api-key: <key>` for Anthropic).
-2. **Header stripping**: Removes `authorization`, `x-api-key`, `host`, and any header names that will be set from route defaults.
-3. **Default headers**: Applies route-level default headers (e.g. `anthropic-version: 2023-06-01`) unless the client already sent them.
-4. **Model rewrite**: Parses the request body as JSON and replaces the `model` field with the route's configured model. Non-JSON bodies are forwarded unchanged.
-5. **URL construction**: `build_backend_url()` appends the request path to the route endpoint. If the endpoint already ends with `/v1` and the request path starts with `/v1/`, the duplicate prefix is deduplicated.
+2. **Header allowlist**: Keeps only explicitly approved request headers: common inference headers (`content-type`, `accept`, `accept-encoding`, `user-agent`), route-specific passthrough headers (for example `openai-organization`, `x-model-id`, `anthropic-version`, `anthropic-beta`), and any route default header names.
+3. **Header stripping**: Removes `authorization`, `x-api-key`, `host`, `content-length`, hop-by-hop headers, and any non-allowlisted request headers.
+4. **Default headers**: Applies route-level default headers (e.g. `anthropic-version: 2023-06-01`) unless the client already sent them.
+5. **Model rewrite**: Parses the request body as JSON and replaces the `model` field with the route's configured model. Non-JSON bodies are forwarded unchanged.
+6. **URL construction**: `build_backend_url()` appends the request path to the route endpoint. If the endpoint already ends with `/v1` and the request path starts with `/v1/`, the duplicate prefix is deduplicated.
 
 ### Header sanitization
 
-Before forwarding inference requests, the proxy strips sensitive and hop-by-hop headers from both requests and responses:
+Before forwarding inference requests, the router enforces a route-aware request allowlist and strips sensitive/framing headers. Response sanitization remains framing-only:
 
-- **Request**: `authorization`, `x-api-key`, `host`, `content-length`, and hop-by-hop headers (`connection`, `keep-alive`, `proxy-authenticate`, `proxy-authorization`, `proxy-connection`, `te`, `trailer`, `transfer-encoding`, `upgrade`).
+- **Request**: forwards only common inference headers plus route-specific passthrough headers and route default header names. Always strips `authorization`, `x-api-key`, `host`, `content-length`, unknown headers such as `cookie`, and hop-by-hop headers (`connection`, `keep-alive`, `proxy-authenticate`, `proxy-authorization`, `proxy-connection`, `te`, `trailer`, `transfer-encoding`, `upgrade`).
 - **Response**: `content-length` and hop-by-hop headers.
 
 ### Response streaming
@@ -198,10 +202,31 @@ The sandbox proxy (`route_inference_request()` in `proxy.rs`) uses the streaming
 
 1. Calls `proxy_with_candidates_streaming()` to get headers immediately.
 2. Formats and sends the HTTP/1.1 response header with `Transfer-Encoding: chunked` via `format_http_response_header()`.
-3. Loops on `body.next_chunk()`, wrapping each fragment in HTTP chunked encoding via `format_chunk()`.
-4. Sends the chunk terminator (`0\r\n\r\n`) via `format_chunk_terminator()`.
+3. Wraps the TLS client stream in a `BufWriter` (16 KiB capacity) to coalesce small SSE chunks into fewer TLS records, reducing per-chunk flush overhead.
+4. Loops on `body.next_chunk()` with a per-chunk idle timeout (`CHUNK_IDLE_TIMEOUT`, 120 seconds), wrapping each fragment in HTTP chunked encoding via `format_chunk()`. The 120-second timeout accommodates reasoning models (e.g. nemotron-3-super, o1, o3) that pause 60+ seconds between thinking and output phases.
+5. Enforces a total streaming body cap (`MAX_STREAMING_BODY`, 32 MiB).
+6. On truncation (idle timeout, byte limit, or upstream read error), injects an SSE error event before the chunk terminator so clients can detect the truncation rather than silently losing data.
+7. Sends the chunk terminator (`0\r\n\r\n`) via `format_chunk_terminator()` and flushes the `BufWriter`.
 
 This eliminates full-body buffering for streaming responses (SSE). Time-to-first-byte is determined by the backend's first chunk latency rather than the full generation time.
+
+#### Truncation signaling
+
+When the proxy truncates a streaming response, it injects an SSE error event via `format_sse_error()` (in `crates/openshell-sandbox/src/l7/inference.rs`) before sending the HTTP chunked terminator:
+
+```text
+data: {"error":{"message":"<reason>","type":"proxy_stream_error"}}
+```
+
+Three truncation paths exist:
+
+| Cause | SSE error message | OCSF severity |
+|-------|-------------------|---------------|
+| Per-chunk idle timeout (120s) | `response truncated: chunk idle timeout exceeded` | Medium |
+| Upstream read error | `response truncated: upstream read error` | Medium |
+| Streaming body exceeds 32 MiB | `response truncated: exceeded maximum streaming body size` | *(warn log only)* |
+
+The `reason` field in the SSE event is sanitized — it never contains internal URLs, hostnames, or credentials. Full details are captured server-side in the OCSF log.
 
 ### Mock routes
 
@@ -209,9 +234,17 @@ File: `crates/openshell-router/src/mock.rs`
 
 Routes with `mock://` scheme endpoints return canned responses without making HTTP requests. Mock responses are protocol-aware (OpenAI chat completion, OpenAI completion, Anthropic messages, or generic JSON). Mock routes include an `x-openshell-mock: true` response header.
 
-### HTTP client
+### Timeout model
 
-The router uses a `reqwest::Client` with a 60-second timeout. Timeouts and connection failures map to `RouterError::UpstreamUnavailable`.
+The router uses a layered timeout strategy with separate handling for buffered and streaming responses.
+
+**Client connect timeout**: The `reqwest::Client` is built with a 30-second `connect_timeout` (in `crates/openshell-router/src/lib.rs` → `Router::new()`). This bounds TCP connection establishment and applies to all outgoing requests regardless of response mode.
+
+**Buffered responses** (`proxy_to_backend()` via `send_backend_request()`): Apply the route's `timeout` as a total request timeout covering the entire lifecycle (connect + headers + body). When `timeout_secs` is `0` in the proto message, the default of 60 seconds is used (defined as `DEFAULT_ROUTE_TIMEOUT` in `config.rs`). Timeouts and connection failures map to `RouterError::UpstreamUnavailable`.
+
+**Streaming responses** (`proxy_to_backend_streaming()` via `send_backend_request_streaming()`): Do **not** apply a total request timeout. The total duration of a streaming response is unbounded — liveness is enforced by the sandbox proxy's per-chunk idle timeout (`CHUNK_IDLE_TIMEOUT`, 120 seconds in `proxy.rs`) instead. This separation exists because streaming inference responses (especially from reasoning models) can legitimately take minutes to complete while still sending data. The `prepare_backend_request()` helper in `backend.rs` builds the request identically for both paths; the caller decides whether to chain `.timeout()` before sending.
+
+Timeout changes propagate dynamically to running sandboxes. The bundle revision hash includes `timeout_secs`, so when the timeout is updated via `openshell inference update --timeout`, the refresh loop detects the revision change and updates the route cache within one polling interval (5 seconds by default).
 
 ## Standalone Route File
 
@@ -247,7 +280,7 @@ Validation at load time requires either `api_key` or `api_key_env` to resolve, a
 | Status | Condition |
 |--------|-----------|
 | `403` | Request on `inference.local` does not match a recognized inference API pattern |
-| `503` | Pattern matched but route cache is empty (cluster inference not configured) |
+| `503` | Pattern matched but route cache is empty (gateway inference not configured) |
 | `400` | No compatible route for the detected source protocol |
 | `401` | Upstream returned unauthorized |
 | `502` | Upstream protocol error or internal router error |
@@ -295,14 +328,17 @@ The system route is stored as a separate `InferenceRoute` record in the gateway 
 
 ## CLI Surface
 
-Cluster inference commands:
+Gateway inference commands:
 
-- `openshell inference set --provider <name> --model <id>` -- configures user-facing cluster inference
-- `openshell inference set --system --provider <name> --model <id>` -- configures system inference
+- `openshell inference set --provider <name> --model <id> [--timeout <secs>]` -- configures user-facing gateway inference
+- `openshell inference set --system --provider <name> --model <id> [--timeout <secs>]` -- configures system inference
+- `openshell inference update [--provider <name>] [--model <id>] [--timeout <secs>]` -- updates individual fields without resetting others
 - `openshell inference get` -- displays both user and system inference configuration
 - `openshell inference get --system` -- displays only the system inference configuration
 
-The `--provider` flag references a provider record name (not a provider type). The provider must already exist in the cluster and have a supported inference type (`openai`, `anthropic`, or `nvidia`).
+The `--provider` flag references a provider record name (not a provider type). The provider must already exist on the gateway and have a supported inference type (`openai`, `anthropic`, or `nvidia`).
+
+The `--timeout` flag sets the per-request timeout in seconds for upstream inference calls. When omitted or set to `0`, the default of 60 seconds applies. Timeout changes propagate to running sandboxes within the route refresh interval (5 seconds by default).
 
 Inference writes verify by default. `--no-verify` is the explicit opt-out for endpoints that are not up yet.
 

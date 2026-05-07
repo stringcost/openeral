@@ -6,10 +6,46 @@
 //! Provides functions to resolve binary paths and compute file hashes
 //! for process-identity binding in the OPA proxy policy engine.
 
-use miette::{IntoDiagnostic, Result};
+use miette::Result;
+#[cfg(target_os = "linux")]
+use std::collections::HashSet;
 use std::path::Path;
 #[cfg(target_os = "linux")]
 use std::path::PathBuf;
+use tracing::debug;
+
+/// Where a socket owner was discovered while scanning `/proc`.
+#[cfg(target_os = "linux")]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum SocketOwnerSource {
+    /// Owner was found in the entrypoint process tree at the given BFS depth.
+    Descendant { depth: usize },
+    /// Owner was found by scanning all of `/proc` after the descendant scan.
+    ProcFallback,
+}
+
+/// A process with an fd pointing at a target socket inode.
+#[cfg(target_os = "linux")]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct SocketOwner {
+    pub pid: u32,
+    pub source: SocketOwnerSource,
+}
+
+/// All process owners for a TCP peer socket.
+#[cfg(target_os = "linux")]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct TcpPeerSocketOwners {
+    pub inode: u64,
+    pub owners: Vec<SocketOwner>,
+}
+
+#[cfg(target_os = "linux")]
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct DescendantPid {
+    pid: u32,
+    depth: usize,
+}
 
 /// Read the binary path of a process via `/proc/{pid}/exe` symlink.
 ///
@@ -18,17 +54,63 @@ use std::path::PathBuf;
 /// `/proc/{pid}/cmdline` because `argv[0]` is trivially spoofable by any
 /// process and must not be used as a trusted identity source.
 ///
-/// If this fails, ensure the proxy process has permission to read
-/// `/proc/<pid>/exe` (e.g. same user, or `CAP_SYS_PTRACE`).
+/// ### Unlinked binaries (`(deleted)` suffix)
+///
+/// When a running binary is unlinked from its filesystem path — the common
+/// case is a `docker cp` hot-swap of `/opt/openshell/bin/openshell-sandbox`
+/// during a `cluster-deploy-fast` dev upgrade — the kernel appends the
+/// literal string `" (deleted)"` to the `/proc/<pid>/exe` readlink target.
+/// The raw tainted path (e.g. `"/opt/openshell/bin/openshell-sandbox (deleted)"`)
+/// is not a real filesystem path: any downstream `stat()` fails with `ENOENT`.
+///
+/// We strip the suffix so callers see a clean, grep-friendly path suitable
+/// for cache keys and log messages. The strip is guarded: we only strip when
+/// `stat()` on the raw readlink target reports `NotFound`, so a live executable
+/// whose basename literally ends with `" (deleted)"` is returned unchanged.
+/// The comparison is done on raw bytes via `OsStrExt`, so filenames that are
+/// not valid UTF-8 are still handled correctly. Exactly one kernel-added
+/// suffix is stripped.
+///
+/// This does NOT claim the file at the stripped path is the same binary that
+/// the process is executing — the on-disk inode may now be arbitrary. Callers
+/// that need to verify the running binary's *contents* (for integrity
+/// checking) should read the magic `/proc/<pid>/exe` symlink directly via
+/// `File::open`, which procfs resolves to the live in-memory executable even
+/// when the original inode has been unlinked.
+///
+/// If the readlink itself fails, ensure the proxy process has permission
+/// to read `/proc/<pid>/exe` (e.g. same user, or `CAP_SYS_PTRACE`).
 #[cfg(target_os = "linux")]
 pub fn binary_path(pid: i32) -> Result<PathBuf> {
-    std::fs::read_link(format!("/proc/{pid}/exe")).map_err(|e| {
+    use std::ffi::OsString;
+    use std::io::ErrorKind;
+    use std::os::unix::ffi::{OsStrExt, OsStringExt};
+
+    const DELETED_SUFFIX: &[u8] = b" (deleted)";
+
+    let link = format!("/proc/{pid}/exe");
+    let target = std::fs::read_link(&link).map_err(|e| {
         miette::miette!(
             "Failed to read /proc/{pid}/exe: {e}. \
              Cannot determine binary identity — denying request. \
              Hint: the proxy may need CAP_SYS_PTRACE or to run as the same user."
         )
-    })
+    })?;
+
+    // Only strip when the raw readlink target cannot be stat'd and its bytes
+    // end with the kernel-added suffix. This preserves live executables whose
+    // basename legitimately ends with " (deleted)" and handles non-UTF-8
+    // filenames correctly.
+    let raw_target_missing =
+        matches!(std::fs::metadata(&target), Err(err) if err.kind() == ErrorKind::NotFound);
+
+    let bytes = target.as_os_str().as_bytes();
+    if raw_target_missing && bytes.ends_with(DELETED_SUFFIX) {
+        let stripped = bytes[..bytes.len() - DELETED_SUFFIX.len()].to_vec();
+        return Ok(PathBuf::from(OsString::from_vec(stripped)));
+    }
+
+    Ok(target)
 }
 
 /// Resolve the binary path of the TCP peer inside a sandbox network namespace.
@@ -38,20 +120,54 @@ pub fn binary_path(pid: i32) -> Result<PathBuf> {
 /// that socket, and finally reads `/proc/<pid>/exe` to get the binary path.
 #[cfg(target_os = "linux")]
 pub fn resolve_tcp_peer_binary(entrypoint_pid: u32, peer_port: u16) -> Result<PathBuf> {
+    let owner = resolve_single_tcp_peer_owner(entrypoint_pid, peer_port)?;
+    binary_path(owner.pid.cast_signed())
+}
+
+/// Resolve all process owners for the TCP peer inside a sandbox network namespace.
+///
+/// Multiple processes can legitimately hold the same socket inode after `fork()`
+/// or fd passing. Callers that make security decisions must evaluate the full
+/// owner set instead of selecting the first PID returned by `/proc` traversal.
+#[cfg(target_os = "linux")]
+pub fn resolve_tcp_peer_socket_owners(
+    entrypoint_pid: u32,
+    peer_port: u16,
+) -> Result<TcpPeerSocketOwners> {
     let inode = parse_proc_net_tcp(entrypoint_pid, peer_port)?;
-    let pid = find_pid_by_socket_inode(inode, entrypoint_pid)?;
-    binary_path(pid.cast_signed())
+    let owners = find_socket_inode_owners(inode, entrypoint_pid)?;
+    Ok(TcpPeerSocketOwners { inode, owners })
+}
+
+/// Resolve exactly one owner for the TCP peer, failing closed on ambiguity.
+#[cfg(target_os = "linux")]
+fn resolve_single_tcp_peer_owner(entrypoint_pid: u32, peer_port: u16) -> Result<SocketOwner> {
+    let socket_owners = resolve_tcp_peer_socket_owners(entrypoint_pid, peer_port)?;
+    match socket_owners.owners.as_slice() {
+        [owner] => Ok(owner.clone()),
+        owners => {
+            let mut pids: Vec<u32> = owners.iter().map(|owner| owner.pid).collect();
+            pids.sort_unstable();
+            Err(miette::miette!(
+                "Ambiguous socket ownership for inode {}: PIDs [{}] all hold the same socket",
+                socket_owners.inode,
+                pids.iter()
+                    .map(u32::to_string)
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            ))
+        }
+    }
 }
 
 /// Like `resolve_tcp_peer_binary`, but also returns the PID that owns the socket.
 ///
-/// Needed for the ancestor walk: we must know the PID to walk `/proc/<pid>/status` PPid chain.
+/// Needed for the ancestor walk: we must know the PID to walk `/proc/<pid>/status` `PPid` chain.
 #[cfg(target_os = "linux")]
 pub fn resolve_tcp_peer_identity(entrypoint_pid: u32, peer_port: u16) -> Result<(PathBuf, u32)> {
-    let inode = parse_proc_net_tcp(entrypoint_pid, peer_port)?;
-    let pid = find_pid_by_socket_inode(inode, entrypoint_pid)?;
-    let path = binary_path(pid.cast_signed())?;
-    Ok((path, pid))
+    let owner = resolve_single_tcp_peer_owner(entrypoint_pid, peer_port)?;
+    let path = binary_path(owner.pid.cast_signed())?;
+    Ok((path, owner.pid))
 }
 
 /// Read the `PPid` (parent PID) from `/proc/<pid>/status`.
@@ -220,40 +336,59 @@ fn parse_proc_net_tcp(pid: u32, peer_port: u16) -> Result<u64> {
     ))
 }
 
-/// Scan process tree to find which PID owns a given socket inode.
+/// Scan `/proc` to find every PID that owns a given socket inode.
 ///
 /// First scans descendants of `entrypoint_pid` (most likely owners), then falls
 /// back to scanning all of `/proc`. Requires `CAP_SYS_PTRACE` to read
 /// `/proc/<pid>/fd/` for processes running as a different user.
 #[cfg(target_os = "linux")]
-fn find_pid_by_socket_inode(inode: u64, entrypoint_pid: u32) -> Result<u32> {
+fn find_socket_inode_owners(inode: u64, entrypoint_pid: u32) -> Result<Vec<SocketOwner>> {
     let target = format!("socket:[{inode}]");
+    let mut owners = Vec::new();
+    let mut checked = HashSet::new();
 
-    // First: scan descendants of the entrypoint process (targeted, most likely to succeed)
-    let descendants = collect_descendant_pids(entrypoint_pid);
-    for &pid in &descendants {
-        if let Some(found) = check_pid_fds(pid, &target) {
-            return Ok(found);
+    // First: scan descendants of the entrypoint process
+    let descendants = collect_descendant_pids_with_depth(entrypoint_pid);
+
+    for descendant in &descendants {
+        checked.insert(descendant.pid);
+        if check_pid_fds(descendant.pid, &target) {
+            owners.push(SocketOwner {
+                pid: descendant.pid,
+                source: SocketOwnerSource::Descendant {
+                    depth: descendant.depth,
+                },
+            });
         }
     }
 
     // Fallback: scan all of /proc in case the process isn't in the tree
-    // (e.g., if /proc/<pid>/task/<tid>/children wasn't available)
     if let Ok(proc_dir) = std::fs::read_dir("/proc") {
+        let mut proc_pids = Vec::new();
         for entry in proc_dir.flatten() {
             let name = entry.file_name();
-            let pid: u32 = match name.to_string_lossy().parse() {
-                Ok(p) => p,
-                Err(_) => continue,
-            };
-            // Skip PIDs we already checked
-            if descendants.contains(&pid) {
-                continue;
-            }
-            if let Some(found) = check_pid_fds(pid, &target) {
-                return Ok(found);
+            if let Ok(pid) = name.to_string_lossy().parse::<u32>() {
+                proc_pids.push(pid);
             }
         }
+        proc_pids.sort_unstable();
+
+        for pid in proc_pids {
+            if checked.contains(&pid) {
+                continue;
+            }
+            checked.insert(pid);
+            if check_pid_fds(pid, &target) {
+                owners.push(SocketOwner {
+                    pid,
+                    source: SocketOwnerSource::ProcFallback,
+                });
+            }
+        }
+    }
+
+    if !owners.is_empty() {
+        return Ok(owners);
     }
 
     Err(miette::miette!(
@@ -269,37 +404,58 @@ fn find_pid_by_socket_inode(inode: u64, entrypoint_pid: u32) -> Result<u32> {
 
 /// Check if a PID has an fd pointing to the given socket target string.
 #[cfg(target_os = "linux")]
-fn check_pid_fds(pid: u32, target: &str) -> Option<u32> {
+fn check_pid_fds(pid: u32, target: &str) -> bool {
     let fd_dir = format!("/proc/{pid}/fd");
-    let fds = std::fs::read_dir(&fd_dir).ok()?;
+    let Some(fds) = std::fs::read_dir(&fd_dir).ok() else {
+        return false;
+    };
     for fd_entry in fds.flatten() {
         if let Ok(link) = std::fs::read_link(fd_entry.path())
             && link.to_string_lossy() == target
         {
-            return Some(pid);
+            return true;
         }
     }
-    None
+    false
 }
 
 /// Collect all descendant PIDs of a root process using `/proc/<pid>/task/<tid>/children`.
 ///
 /// Performs a BFS walk of the process tree. If `/proc/<pid>/task/<tid>/children`
 /// is not available (requires `CONFIG_PROC_CHILDREN`), returns only the root PID.
-#[cfg(target_os = "linux")]
+#[cfg(all(test, target_os = "linux"))]
 fn collect_descendant_pids(root_pid: u32) -> Vec<u32> {
-    let mut pids = vec![root_pid];
+    collect_descendant_pids_with_depth(root_pid)
+        .into_iter()
+        .map(|descendant| descendant.pid)
+        .collect()
+}
+
+/// Collect descendant PIDs with BFS depth, deduping children reported by multiple tasks.
+#[cfg(target_os = "linux")]
+fn collect_descendant_pids_with_depth(root_pid: u32) -> Vec<DescendantPid> {
+    let mut pids = vec![DescendantPid {
+        pid: root_pid,
+        depth: 0,
+    }];
+    let mut seen = HashSet::from([root_pid]);
     let mut i = 0;
     while i < pids.len() {
-        let pid = pids[i];
+        let pid = pids[i].pid;
+        let child_depth = pids[i].depth + 1;
         let task_dir = format!("/proc/{pid}/task");
         if let Ok(tasks) = std::fs::read_dir(&task_dir) {
             for task_entry in tasks.flatten() {
                 let children_path = task_entry.path().join("children");
                 if let Ok(children_str) = std::fs::read_to_string(&children_path) {
                     for child in children_str.split_whitespace() {
-                        if let Ok(child_pid) = child.parse::<u32>() {
-                            pids.push(child_pid);
+                        if let Ok(child_pid) = child.parse::<u32>()
+                            && seen.insert(child_pid)
+                        {
+                            pids.push(DescendantPid {
+                                pid: child_pid,
+                                depth: child_depth,
+                            });
                         }
                     }
                 }
@@ -318,9 +474,32 @@ fn collect_descendant_pids(root_pid: u32) -> Vec<u32> {
 /// same hash, or the request is denied.
 pub fn file_sha256(path: &Path) -> Result<String> {
     use sha2::{Digest, Sha256};
+    use std::io::Read;
 
-    let bytes = std::fs::read(path).into_diagnostic()?;
-    let hash = Sha256::digest(&bytes);
+    let start = std::time::Instant::now();
+    let mut file = std::fs::File::open(path)
+        .map_err(|e| miette::miette!("Failed to open {}: {e}", path.display()))?;
+    let mut hasher = Sha256::new();
+    let mut buf = vec![0u8; 65536].into_boxed_slice();
+    let mut total_read = 0u64;
+    loop {
+        let n = file
+            .read(&mut buf)
+            .map_err(|e| miette::miette!("Failed to read {}: {e}", path.display()))?;
+        if n == 0 {
+            break;
+        }
+        total_read += n as u64;
+        hasher.update(&buf[..n]);
+    }
+
+    let hash = hasher.finalize();
+    debug!(
+        "        file_sha256: {}ms size={} path={}",
+        start.elapsed().as_millis(),
+        total_read,
+        path.display()
+    );
     Ok(hex::encode(hash))
 }
 
@@ -328,6 +507,52 @@ pub fn file_sha256(path: &Path) -> Result<String> {
 mod tests {
     use super::*;
     use std::io::Write;
+
+    /// Block until `/proc/<pid>/exe` points at `target`. `Command::spawn` returns
+    /// once the child is scheduled, not once it has completed `exec()`; on
+    /// contended runners the readlink can still show the parent (test harness)
+    /// binary for a brief window. Byte-level `starts_with` tolerates the kernel's
+    /// `" (deleted)"` suffix on unlinked executables.
+    #[cfg(target_os = "linux")]
+    fn wait_for_child_exec(pid: i32, target: &Path) {
+        use std::os::unix::ffi::OsStrExt as _;
+        let target_bytes = target.as_os_str().as_bytes();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        loop {
+            if let Ok(link) = std::fs::read_link(format!("/proc/{pid}/exe"))
+                && link.as_os_str().as_bytes().starts_with(target_bytes)
+            {
+                return;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "child pid {pid} did not exec into {target:?} within 2s"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+    }
+
+    /// Retry `Command::spawn` on `ETXTBSY`. The kernel rejects `execve` when
+    /// `inode->i_writecount > 0`, and the release of that counter after the
+    /// writer fd is closed isn't synchronous with `close(2)` under contention —
+    /// so the very-next-instruction `execve` can still race it. Any other error
+    /// surfaces immediately.
+    #[cfg(target_os = "linux")]
+    fn spawn_retrying_on_etxtbsy(cmd: &mut std::process::Command) -> std::process::Child {
+        let mut attempts = 0;
+        loop {
+            match cmd.spawn() {
+                Ok(child) => return child,
+                Err(err)
+                    if err.kind() == std::io::ErrorKind::ExecutableFileBusy && attempts < 20 =>
+                {
+                    attempts += 1;
+                    std::thread::sleep(std::time::Duration::from_millis(50));
+                }
+                Err(err) => panic!("spawn failed after {attempts} ETXTBSY retries: {err}"),
+            }
+        }
+    }
 
     #[test]
     fn file_sha256_computes_correct_hash() {
@@ -367,12 +592,230 @@ mod tests {
         assert!(path.exists());
     }
 
+    /// Verify that an unlinked binary's path is returned without the
+    /// kernel's " (deleted)" suffix. This is the common case during a
+    /// `docker cp` hot-swap of the supervisor binary — before this strip,
+    /// callers that `stat()` the returned path get `ENOENT` and the
+    /// ancestor integrity check in the CONNECT proxy denies every request.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn binary_path_strips_deleted_suffix() {
+        use std::os::unix::fs::PermissionsExt;
+
+        // Copy /bin/sleep to a temp path we control so we can unlink it.
+        let tmp = tempfile::TempDir::new().unwrap();
+        let exe_path = tmp.path().join("deleted-sleep");
+        std::fs::copy("/bin/sleep", &exe_path).unwrap();
+        std::fs::set_permissions(&exe_path, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        // Spawn a child from the temp binary, then unlink it while the
+        // child is still running. The child keeps the exec mapping via
+        // `/proc/<pid>/exe`, but readlink will now return the tainted
+        // "<path> (deleted)" string.
+        let mut cmd = std::process::Command::new(&exe_path);
+        cmd.arg("5");
+        let mut child = spawn_retrying_on_etxtbsy(&mut cmd);
+        let pid: i32 = child.id().cast_signed();
+        wait_for_child_exec(pid, &exe_path);
+        std::fs::remove_file(&exe_path).unwrap();
+
+        // Sanity check: the raw readlink should contain " (deleted)".
+        let raw = std::fs::read_link(format!("/proc/{pid}/exe"))
+            .unwrap()
+            .to_string_lossy()
+            .into_owned();
+        assert!(
+            raw.ends_with(" (deleted)"),
+            "kernel should append ' (deleted)' to unlinked exe readlink; got {raw:?}"
+        );
+
+        // The public API should return the stripped path, not the tainted one.
+        let resolved = binary_path(pid).expect("binary_path should succeed for deleted binary");
+        assert_eq!(
+            resolved, exe_path,
+            "binary_path should strip the ' (deleted)' suffix"
+        );
+        let resolved_str = resolved.to_string_lossy();
+        assert!(
+            !resolved_str.contains("(deleted)"),
+            "stripped path must not contain '(deleted)'; got {resolved_str:?}"
+        );
+
+        let _ = child.kill();
+        let _ = child.wait();
+    }
+
+    /// A live executable whose basename literally ends with `" (deleted)"`
+    /// must be returned unchanged — we only strip when `stat()` reports
+    /// the raw readlink target missing. This guards against the trusted
+    /// identity source misattributing a running binary to a truncated
+    /// sibling path.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn binary_path_preserves_live_deleted_basename() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let tmp = tempfile::TempDir::new().unwrap();
+        // Basename literally ends with " (deleted)" while the file is still
+        // on disk — a pathological but legal filename.
+        let exe_path = tmp.path().join("sleepy (deleted)");
+        std::fs::copy("/bin/sleep", &exe_path).unwrap();
+        std::fs::set_permissions(&exe_path, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        let mut cmd = std::process::Command::new(&exe_path);
+        cmd.arg("5");
+        let mut child = spawn_retrying_on_etxtbsy(&mut cmd);
+        let pid: i32 = child.id().cast_signed();
+        wait_for_child_exec(pid, &exe_path);
+
+        // File is still linked — binary_path must return the path unchanged,
+        // suffix and all.
+        let resolved = binary_path(pid).expect("binary_path should succeed for live binary");
+        assert_eq!(
+            resolved, exe_path,
+            "binary_path must NOT strip ' (deleted)' from a live executable's basename"
+        );
+        assert!(
+            resolved.to_string_lossy().ends_with(" (deleted)"),
+            "stripped path unexpectedly trimmed a real filename: {resolved:?}"
+        );
+
+        let _ = child.kill();
+        let _ = child.wait();
+    }
+
+    /// An unlinked executable whose filename contains non-UTF-8 bytes must
+    /// still strip exactly one kernel-added `" (deleted)"` suffix. We operate
+    /// on raw bytes via `OsStrExt`, so invalid UTF-8 is not a reason to skip
+    /// the strip and return a path that downstream `stat()` calls will reject.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn binary_path_strips_suffix_for_non_utf8_filename() {
+        use std::ffi::OsString;
+        use std::os::unix::ffi::{OsStrExt, OsStringExt};
+        use std::os::unix::fs::PermissionsExt;
+
+        let tmp = tempfile::TempDir::new().unwrap();
+        // 0xFF is not valid UTF-8. Build the filename on raw bytes.
+        let mut raw_name: Vec<u8> = b"badname-".to_vec();
+        raw_name.push(0xFF);
+        raw_name.extend_from_slice(b".bin");
+        let exe_path = tmp.path().join(OsString::from_vec(raw_name));
+
+        std::fs::copy("/bin/sleep", &exe_path).unwrap();
+        std::fs::set_permissions(&exe_path, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        let mut cmd = std::process::Command::new(&exe_path);
+        cmd.arg("5");
+        let mut child = spawn_retrying_on_etxtbsy(&mut cmd);
+        let pid: i32 = child.id().cast_signed();
+        wait_for_child_exec(pid, &exe_path);
+        std::fs::remove_file(&exe_path).unwrap();
+
+        // Sanity: raw readlink ends with " (deleted)" and is not valid UTF-8.
+        let raw = std::fs::read_link(format!("/proc/{pid}/exe")).unwrap();
+        let raw_bytes = raw.as_os_str().as_bytes();
+        assert!(
+            raw_bytes.ends_with(b" (deleted)"),
+            "kernel should append ' (deleted)' to unlinked exe readlink"
+        );
+        assert!(
+            std::str::from_utf8(raw_bytes).is_err(),
+            "test precondition: raw readlink must contain non-UTF-8 bytes"
+        );
+
+        let resolved =
+            binary_path(pid).expect("binary_path should succeed for non-UTF-8 unlinked path");
+        assert_eq!(
+            resolved, exe_path,
+            "binary_path must strip exactly one ' (deleted)' suffix for non-UTF-8 paths"
+        );
+        assert!(
+            !resolved.as_os_str().as_bytes().ends_with(b" (deleted)"),
+            "stripped path must not end with ' (deleted)'"
+        );
+
+        let _ = child.kill();
+        let _ = child.wait();
+    }
+
     #[cfg(target_os = "linux")]
     #[test]
     fn collect_descendants_includes_self() {
         let pid = std::process::id();
         let pids = collect_descendant_pids(pid);
         assert!(pids.contains(&pid));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn collect_descendants_dedupes_pids() {
+        let pid = std::process::id();
+        let pids = collect_descendant_pids(pid);
+        let unique = pids.iter().copied().collect::<HashSet<_>>();
+        assert_eq!(pids.len(), unique.len());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn resolve_tcp_peer_socket_owners_returns_all_forked_socket_holders() {
+        use std::net::{TcpListener, TcpStream};
+        use std::time::{Duration, Instant};
+
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind listener");
+        let listener_port = listener.local_addr().unwrap().port();
+        let stream = TcpStream::connect(("127.0.0.1", listener_port)).expect("connect");
+        let peer_port = stream.local_addr().unwrap().port();
+        let (_accepted, _) = listener.accept().expect("accept");
+
+        // libc/syscall FFI requires unsafe
+        #[allow(unsafe_code)]
+        let child_pid = unsafe { libc::fork() };
+        assert!(child_pid >= 0, "fork failed");
+        if child_pid == 0 {
+            // libc/syscall FFI requires unsafe
+            #[allow(unsafe_code)]
+            unsafe {
+                libc::sleep(30);
+                libc::_exit(0);
+            }
+        }
+
+        let child_pid_u32 = child_pid.cast_unsigned();
+        let entrypoint_pid = std::process::id();
+        let deadline = Instant::now() + Duration::from_secs(2);
+        let owners = loop {
+            let owners = resolve_tcp_peer_socket_owners(entrypoint_pid, peer_port)
+                .expect("resolve socket owners");
+            let owner_pids = owners
+                .owners
+                .iter()
+                .map(|owner| owner.pid)
+                .collect::<HashSet<_>>();
+            if owner_pids.contains(&entrypoint_pid) && owner_pids.contains(&child_pid_u32) {
+                break owners;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "timed out waiting for forked child to appear as a socket owner; got {owner_pids:?}"
+            );
+            std::thread::sleep(Duration::from_millis(20));
+        };
+
+        // libc/syscall FFI requires unsafe
+        #[allow(unsafe_code)]
+        unsafe {
+            libc::kill(child_pid, libc::SIGKILL);
+            libc::waitpid(child_pid, std::ptr::null_mut(), 0);
+        }
+
+        let owner_pids = owners
+            .owners
+            .iter()
+            .map(|owner| owner.pid)
+            .collect::<HashSet<_>>();
+        assert!(owner_pids.contains(&entrypoint_pid));
+        assert!(owner_pids.contains(&child_pid_u32));
     }
 
     #[cfg(target_os = "linux")]

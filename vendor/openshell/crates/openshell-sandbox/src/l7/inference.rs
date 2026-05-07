@@ -96,6 +96,8 @@ pub enum ParseResult {
     Complete(ParsedHttpRequest, usize),
     /// Headers are incomplete — caller should read more data.
     Incomplete,
+    /// The request is malformed and must be rejected (e.g., duplicate Content-Length).
+    Invalid(String),
 }
 
 /// Try to parse an HTTP/1.1 request from raw bytes.
@@ -125,6 +127,7 @@ pub fn try_parse_http_request(buf: &[u8]) -> ParseResult {
 
     let mut headers = Vec::new();
     let mut content_length: usize = 0;
+    let mut has_content_length = false;
     let mut is_chunked = false;
     for line in lines {
         if line.is_empty() {
@@ -134,7 +137,21 @@ pub fn try_parse_http_request(buf: &[u8]) -> ParseResult {
             let name = name.trim().to_string();
             let value = value.trim().to_string();
             if name.eq_ignore_ascii_case("content-length") {
-                content_length = value.parse().unwrap_or(0);
+                let new_len: usize = match value.parse() {
+                    Ok(v) => v,
+                    Err(_) => {
+                        return ParseResult::Invalid(format!(
+                            "invalid Content-Length value: {value}"
+                        ));
+                    }
+                };
+                if has_content_length && new_len != content_length {
+                    return ParseResult::Invalid(format!(
+                        "duplicate Content-Length headers with differing values ({content_length} vs {new_len})"
+                    ));
+                }
+                content_length = new_len;
+                has_content_length = true;
             }
             if name.eq_ignore_ascii_case("transfer-encoding")
                 && value
@@ -145,6 +162,12 @@ pub fn try_parse_http_request(buf: &[u8]) -> ParseResult {
             }
             headers.push((name, value));
         }
+    }
+
+    if is_chunked && has_content_length {
+        return ParseResult::Invalid(
+            "Request contains both Transfer-Encoding and Content-Length headers".to_string(),
+        );
     }
 
     let (body, consumed) = if is_chunked {
@@ -171,43 +194,69 @@ pub fn try_parse_http_request(buf: &[u8]) -> ParseResult {
     )
 }
 
+/// Maximum decoded body size from chunked transfer encoding (10 MiB).
+/// Matches the caller's `MAX_INFERENCE_BUF` limit.
+const MAX_CHUNKED_BODY: usize = 10 * 1024 * 1024;
+
+/// Maximum number of chunks to process.  Normal HTTP clients send the body
+/// in a handful of large chunks; thousands of tiny chunks indicate abuse.
+const MAX_CHUNK_COUNT: usize = 4096;
+
 /// Parse an HTTP chunked body from `buf[start..]`.
 ///
 /// Returns `(decoded_body, total_consumed_bytes_from_buf_start)` when complete,
-/// or `None` if more bytes are needed.
+/// or `None` if more bytes are needed or resource limits are exceeded.
 fn parse_chunked_body(buf: &[u8], start: usize) -> Option<(Vec<u8>, usize)> {
     let mut pos = start;
     let mut body = Vec::new();
+    let mut chunk_count: usize = 0;
 
     loop {
+        chunk_count += 1;
+        if chunk_count > MAX_CHUNK_COUNT {
+            return None;
+        }
+
         let size_line_end = find_crlf(buf, pos)?;
         let size_line = std::str::from_utf8(&buf[pos..size_line_end]).ok()?;
         let size_token = size_line.split(';').next()?.trim();
         let chunk_size = usize::from_str_radix(size_token, 16).ok()?;
-        pos = size_line_end + 2;
+        pos = size_line_end.checked_add(2)?;
 
         if chunk_size == 0 {
             // Parse trailers (if any). Terminates on empty trailer line.
             loop {
                 let trailer_end = find_crlf(buf, pos)?;
                 let trailer_line = &buf[pos..trailer_end];
-                pos = trailer_end + 2;
+                pos = trailer_end.checked_add(2)?;
                 if trailer_line.is_empty() {
                     return Some((body, pos));
                 }
             }
         }
 
-        let chunk_end = pos.checked_add(chunk_size)?;
-        if buf.len() < chunk_end + 2 {
+        // Early reject: chunk cannot possibly fit in remaining buffer.
+        let remaining = buf.len().saturating_sub(pos);
+        if chunk_size > remaining {
             return None;
         }
-        if &buf[chunk_end..chunk_end + 2] != b"\r\n" {
+
+        // Reject if decoded body would exceed size limit.
+        if body.len().saturating_add(chunk_size) > MAX_CHUNKED_BODY {
+            return None;
+        }
+
+        let chunk_end = pos.checked_add(chunk_size)?;
+        let chunk_crlf_end = chunk_end.checked_add(2)?;
+        if buf.len() < chunk_crlf_end {
+            return None;
+        }
+        if &buf[chunk_end..chunk_crlf_end] != b"\r\n" {
             return None;
         }
 
         body.extend_from_slice(&buf[pos..chunk_end]);
-        pos = chunk_end + 2;
+        pos = chunk_crlf_end;
     }
 }
 
@@ -301,6 +350,33 @@ pub fn format_chunk(data: &[u8]) -> Vec<u8> {
 /// The HTTP chunked transfer-encoding terminator: `0\r\n\r\n`.
 pub fn format_chunk_terminator() -> &'static [u8] {
     b"0\r\n\r\n"
+}
+
+/// Format an SSE error event for injection into a streaming response.
+///
+/// Sent just before the chunked terminator when the proxy truncates a stream
+/// due to timeout, byte limit, or upstream error. Clients parsing SSE events
+/// can detect this and surface the error instead of silently losing data.
+///
+/// The `reason` must NOT contain internal URLs, hostnames, or credentials —
+/// the OCSF log captures full detail server-side.
+pub fn format_sse_error(reason: &str) -> Vec<u8> {
+    // Use serde_json to escape control characters, quotes, and backslashes
+    // correctly. A handwritten escape can't safely cover \u0000-\u001F, and
+    // an unescaped \n\n in `reason` would split the SSE event into two
+    // frames, allowing a malicious upstream to inject a forged event.
+    let payload = serde_json::json!({
+        "error": {
+            "message": reason,
+            "type": "proxy_stream_error",
+        }
+    });
+    let mut out = Vec::with_capacity(reason.len() + 64);
+    out.extend_from_slice(b"data: ");
+    // serde_json::to_writer is infallible for in-memory Vec<u8>.
+    serde_json::to_writer(&mut out, &payload).expect("serializing static schema cannot fail");
+    out.extend_from_slice(b"\n\n");
+    out
 }
 
 #[cfg(test)]
@@ -483,5 +559,204 @@ mod tests {
         assert!(chunk.starts_with(b"100\r\n"));
         assert!(chunk.ends_with(b"\r\n"));
         assert_eq!(chunk.len(), 3 + 2 + 256 + 2); // "100" + \r\n + data + \r\n
+    }
+
+    // ---- SEC-010: parse_chunked_body resource limits ----
+
+    #[test]
+    fn parse_chunked_multi_chunk_body() {
+        // Two chunks: 5 bytes + 6 bytes
+        let request = b"POST /v1/chat HTTP/1.1\r\nTransfer-Encoding: chunked\r\n\r\n5\r\nhello\r\n6\r\n world\r\n0\r\n\r\n";
+        let ParseResult::Complete(parsed, _) = try_parse_http_request(request) else {
+            panic!("expected Complete");
+        };
+        assert_eq!(parsed.body, b"hello world");
+    }
+
+    #[test]
+    fn parse_chunked_rejects_too_many_chunks() {
+        // Build a request with MAX_CHUNK_COUNT + 1 tiny chunks
+        let mut buf = Vec::new();
+        buf.extend_from_slice(b"POST /v1/chat HTTP/1.1\r\nTransfer-Encoding: chunked\r\n\r\n");
+        for _ in 0..=MAX_CHUNK_COUNT {
+            buf.extend_from_slice(b"1\r\nX\r\n");
+        }
+        buf.extend_from_slice(b"0\r\n\r\n");
+        assert!(matches!(
+            try_parse_http_request(&buf),
+            ParseResult::Incomplete
+        ));
+    }
+
+    #[test]
+    fn parse_chunked_within_chunk_count_limit() {
+        // MAX_CHUNK_COUNT chunks should succeed
+        let mut buf = Vec::new();
+        buf.extend_from_slice(b"POST /v1/chat HTTP/1.1\r\nTransfer-Encoding: chunked\r\n\r\n");
+        for _ in 0..100 {
+            buf.extend_from_slice(b"1\r\nX\r\n");
+        }
+        buf.extend_from_slice(b"0\r\n\r\n");
+        let ParseResult::Complete(parsed, _) = try_parse_http_request(&buf) else {
+            panic!("expected Complete for 100 chunks");
+        };
+        assert_eq!(parsed.body.len(), 100);
+    }
+
+    /// SEC: Transfer-Encoding substring match must not match partial tokens.
+    #[test]
+    fn te_substring_not_chunked() {
+        let body = r#"{"model":"m","messages":[]}"#;
+        let request = format!(
+            "POST /v1/chat/completions HTTP/1.1\r\n\
+             Host: x\r\n\
+             Transfer-Encoding: chunkedx\r\n\
+             Content-Length: {}\r\n\
+             \r\n{body}",
+            body.len(),
+        );
+        let ParseResult::Complete(parsed, _) = try_parse_http_request(request.as_bytes()) else {
+            panic!("expected Complete for non-matching TE with valid CL");
+        };
+        assert_eq!(parsed.body.len(), body.len());
+    }
+
+    // ---- SEC: Content-Length validation ----
+
+    #[test]
+    fn reject_differing_duplicate_content_length() {
+        let request = b"POST /v1/chat/completions HTTP/1.1\r\nHost: x\r\nContent-Length: 0\r\nContent-Length: 50\r\n\r\n";
+        assert!(matches!(
+            try_parse_http_request(request),
+            ParseResult::Invalid(reason) if reason.contains("differing values")
+        ));
+    }
+
+    #[test]
+    fn accept_identical_duplicate_content_length() {
+        let request = b"POST /v1/chat/completions HTTP/1.1\r\nHost: x\r\nContent-Length: 5\r\nContent-Length: 5\r\n\r\nhello";
+        let ParseResult::Complete(parsed, _) = try_parse_http_request(request) else {
+            panic!("expected Complete for identical duplicate CL");
+        };
+        assert_eq!(parsed.body, b"hello");
+    }
+
+    #[test]
+    fn reject_non_numeric_content_length() {
+        let request =
+            b"POST /v1/chat/completions HTTP/1.1\r\nHost: x\r\nContent-Length: abc\r\n\r\n";
+        assert!(matches!(
+            try_parse_http_request(request),
+            ParseResult::Invalid(reason) if reason.contains("invalid Content-Length")
+        ));
+    }
+
+    #[test]
+    fn reject_two_non_numeric_content_lengths() {
+        let request = b"POST /v1/chat/completions HTTP/1.1\r\nHost: x\r\nContent-Length: abc\r\nContent-Length: def\r\n\r\n";
+        assert!(matches!(
+            try_parse_http_request(request),
+            ParseResult::Invalid(_)
+        ));
+    }
+
+    // ---- SEC-009: CL/TE desynchronisation ----
+
+    /// Reject requests with both Content-Length and Transfer-Encoding to
+    /// prevent CL/TE request smuggling (RFC 7230 Section 3.3.3).
+    #[test]
+    fn reject_dual_content_length_and_transfer_encoding() {
+        let request = b"POST /v1/chat/completions HTTP/1.1\r\nHost: x\r\nContent-Length: 5\r\nTransfer-Encoding: chunked\r\n\r\n";
+        assert!(
+            matches!(
+                try_parse_http_request(request),
+                ParseResult::Invalid(reason)
+                    if reason.contains("Transfer-Encoding")
+                        && reason.contains("Content-Length")
+            ),
+            "Must reject request with both CL and TE"
+        );
+    }
+
+    /// Same rejection regardless of header order.
+    #[test]
+    fn reject_dual_transfer_encoding_and_content_length() {
+        let request = b"POST /v1/chat/completions HTTP/1.1\r\nHost: x\r\nTransfer-Encoding: chunked\r\nContent-Length: 5\r\n\r\n";
+        assert!(
+            matches!(
+                try_parse_http_request(request),
+                ParseResult::Invalid(reason)
+                    if reason.contains("Transfer-Encoding")
+                        && reason.contains("Content-Length")
+            ),
+            "Must reject request with both TE and CL"
+        );
+    }
+
+    #[test]
+    fn format_sse_error_produces_valid_sse_json() {
+        let output = format_sse_error("chunk idle timeout exceeded");
+        let text = std::str::from_utf8(&output).expect("should be valid utf8");
+
+        // Must start with "data: " (SSE format)
+        assert!(text.starts_with("data: "), "must be an SSE data line");
+
+        // Must end with double newline (SSE event boundary)
+        assert!(text.ends_with("\n\n"), "must end with SSE event boundary");
+
+        // The JSON payload between "data: " and "\n\n" must parse
+        let json_str = text.trim_start_matches("data: ").trim_end();
+        let parsed: serde_json::Value = serde_json::from_str(json_str).expect("must be valid JSON");
+
+        assert_eq!(parsed["error"]["type"], "proxy_stream_error");
+        assert_eq!(parsed["error"]["message"], "chunk idle timeout exceeded");
+    }
+
+    #[test]
+    fn format_sse_error_escapes_quotes_in_reason() {
+        let output = format_sse_error("error: \"bad\" response");
+        let text = std::str::from_utf8(&output).unwrap();
+        let json_str = text.trim_start_matches("data: ").trim_end();
+        let parsed: serde_json::Value =
+            serde_json::from_str(json_str).expect("must produce valid JSON with escaped quotes");
+        assert_eq!(parsed["error"]["message"], "error: \"bad\" response");
+    }
+
+    #[test]
+    fn format_sse_error_escapes_control_characters_in_reason() {
+        // A future caller passing a dynamic upstream error message (containing
+        // \n, \r, or \t — common in connection-reset errors and tracebacks)
+        // must still produce parseable SSE JSON.
+        let output = format_sse_error("upstream error: connection\nreset\tafter 0 bytes");
+        let text = std::str::from_utf8(&output).unwrap();
+        let json_str = text.trim_start_matches("data: ").trim_end();
+        let parsed: serde_json::Value = serde_json::from_str(json_str)
+            .expect("must produce valid JSON when reason contains control characters");
+        assert_eq!(
+            parsed["error"]["message"],
+            "upstream error: connection\nreset\tafter 0 bytes"
+        );
+    }
+
+    #[test]
+    fn format_sse_error_does_not_inject_extra_sse_events() {
+        // SSE events are separated by `\n\n`. If the reason string contains
+        // `\n\n`, an unescaped formatter would split the single error event
+        // into two SSE frames, allowing a malicious upstream to inject a
+        // forged event into the client's perceived stream
+        // (e.g. a fake tool_call delta).
+        let output = format_sse_error(
+            "safe prefix\n\ndata: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"id\":\"FORGED\"}]}}]}",
+        );
+        let text = std::str::from_utf8(&output).unwrap();
+
+        // Exactly one SSE event boundary (the trailing one) — the reason
+        // string must not introduce additional `\n\n` sequences.
+        let boundary_count = text.matches("\n\n").count();
+        assert_eq!(
+            boundary_count, 1,
+            "format_sse_error must emit exactly one SSE event boundary; \
+             reason string must not be able to inject extra events"
+        );
     }
 }

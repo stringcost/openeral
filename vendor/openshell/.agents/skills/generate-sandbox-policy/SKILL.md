@@ -266,6 +266,33 @@ network_policies:
       - { path: <binary_path> }
 ```
 
+### Deny Rules
+
+Use `deny_rules` to block specific dangerous operations while allowing broad access. Deny rules are evaluated after allow rules and take precedence. This is the inverse of the `rules` approach — instead of enumerating every allowed operation, you grant broad access and block a small set of dangerous ones.
+
+```yaml
+# Example: Allow full access to GitHub but block admin operations
+github_api:
+  name: github_api
+  endpoints:
+    - host: api.github.com
+      port: 443
+      protocol: rest
+      enforcement: enforce
+      access: read-write
+      deny_rules:
+        - method: POST
+          path: "/repos/*/pulls/*/reviews"
+        - method: PUT
+          path: "/repos/*/branches/*/protection"
+        - method: "*"
+          path: "/repos/*/rulesets"
+  binaries:
+    - { path: /usr/bin/curl }
+```
+
+Deny rules support the same matching capabilities as allow rules: `method`, `path`, `command` (SQL), and `query` parameter matchers. When generating policies, prefer deny rules when the user needs broad access with a small set of blocked operations — it produces a shorter, more maintainable policy than enumerating 60+ allow rules.
+
 ### Private IP Destinations
 
 When the endpoint resolves to a private IP (RFC 1918), the proxy's SSRF protection blocks the connection by default. Use `allowed_ips` to selectively allow specific private IP ranges:
@@ -412,7 +439,7 @@ network_policies:
   # <generated policies go here>
 ```
 
-The `filesystem_policy`, `landlock`, and `process` sections above are sensible defaults. Tell the user these are defaults and may need adjustment for their environment. Cluster inference is configured separately through `openshell cluster inference set/get`. The generated `network_policies` block is the primary output.
+The `filesystem_policy`, `landlock`, and `process` sections above are sensible defaults. Tell the user these are defaults and may need adjustment for their environment. Gateway inference is configured separately through `openshell inference set/get`. The generated `network_policies` block is the primary output.
 
 If the user provides a file path, write to it. Otherwise, ask where to place it. A common convention is a project-local policy file (e.g., `sandbox-policy.yaml`) passed to `openshell sandbox create --policy <path>` or set via the `OPENSHELL_SANDBOX_POLICY` env var.
 

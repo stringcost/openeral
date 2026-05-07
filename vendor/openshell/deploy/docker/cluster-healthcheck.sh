@@ -54,8 +54,8 @@ kubectl -n openshell wait --for=jsonpath='{.status.readyReplicas}'=1 statefulset
 # Verify the sandbox supervisor binary exists on the node filesystem.
 # Sandbox pods mount /opt/openshell/bin as a read-only hostPath volume and
 # exec /opt/openshell/bin/openshell-sandbox as their entrypoint. If the binary
-# is missing (e.g. cluster image was built without the supervisor-builder
-# stage), every sandbox pod will crash with "no such file or directory".
+# is missing (e.g. cluster image was built without the staged prebuilt
+# binary), every sandbox pod will crash with "no such file or directory".
 # ---------------------------------------------------------------------------
 if [ ! -x /opt/openshell/bin/openshell-sandbox ]; then
     echo "HEALTHCHECK_MISSING_SUPERVISOR: /opt/openshell/bin/openshell-sandbox not found" >&2
@@ -68,3 +68,17 @@ if [ "${DISABLE_TLS:-}" != "true" ]; then
     kubectl -n openshell get secret openshell-server-tls >/dev/null 2>&1 || exit 1
     kubectl -n openshell get secret openshell-client-tls >/dev/null 2>&1 || exit 1
 fi
+
+# Verify SSH handshake secret exists (created by openshell-bootstrap alongside TLS secrets)
+kubectl -n openshell get secret openshell-ssh-handshake >/dev/null 2>&1 || exit 1
+
+# ---------------------------------------------------------------------------
+# Verify the gateway NodePort (30051) is actually accepting TCP connections.
+# After a container restart, kube-proxy may need extra time to re-program
+# iptables rules for NodePort routing.  Without this check the health check
+# can pass before the port is routable, causing "Connection refused" on the
+# host-mapped port.
+# Use </dev/tcp (no echo) to avoid sending plaintext bytes into the TLS
+# listener, which would log InvalidContentType errors in the gateway.
+# ---------------------------------------------------------------------------
+timeout 2 bash -c 'exec 3<>/dev/tcp/127.0.0.1/30051 && exec 3>&-' 2>/dev/null || exit 1

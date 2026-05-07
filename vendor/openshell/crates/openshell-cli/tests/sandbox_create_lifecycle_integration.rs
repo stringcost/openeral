@@ -8,17 +8,19 @@ use openshell_core::proto::open_shell_server::{OpenShell, OpenShellServer};
 use openshell_core::proto::{
     CreateProviderRequest, CreateSandboxRequest, CreateSshSessionRequest, CreateSshSessionResponse,
     DeleteProviderRequest, DeleteProviderResponse, DeleteSandboxRequest, DeleteSandboxResponse,
-    ExecSandboxEvent, ExecSandboxRequest, GetProviderRequest, GetSandboxPolicyRequest,
-    GetSandboxPolicyResponse, GetSandboxProviderEnvironmentRequest,
+    ExecSandboxEvent, ExecSandboxRequest, GatewayMessage, GetGatewayConfigRequest,
+    GetGatewayConfigResponse, GetProviderRequest, GetSandboxConfigRequest,
+    GetSandboxConfigResponse, GetSandboxProviderEnvironmentRequest,
     GetSandboxProviderEnvironmentResponse, GetSandboxRequest, HealthRequest, HealthResponse,
     ListProvidersRequest, ListProvidersResponse, ListSandboxesRequest, ListSandboxesResponse,
     PlatformEvent, ProviderResponse, RevokeSshSessionRequest, RevokeSshSessionResponse, Sandbox,
-    SandboxPhase, SandboxResponse, SandboxStreamEvent, ServiceStatus, UpdateProviderRequest,
-    WatchSandboxRequest, sandbox_stream_event,
+    SandboxPhase, SandboxResponse, SandboxStreamEvent, ServiceStatus, SupervisorMessage,
+    UpdateProviderRequest, WatchSandboxRequest, sandbox_stream_event,
 };
 use rcgen::{
     BasicConstraints, Certificate, CertificateParams, ExtendedKeyUsagePurpose, IsCa, KeyPair,
 };
+use std::collections::HashMap;
 use std::fs;
 use std::os::unix::fs::PermissionsExt;
 use std::sync::Arc;
@@ -111,9 +113,12 @@ impl OpenShell for TestOpenShell {
 
         Ok(Response::new(SandboxResponse {
             sandbox: Some(Sandbox {
-                id: format!("id-{sandbox_name}"),
-                name: sandbox_name,
-                namespace: "default".to_string(),
+                metadata: Some(openshell_core::proto::datamodel::v1::ObjectMeta {
+                    id: format!("id-{sandbox_name}"),
+                    name: sandbox_name,
+                    created_at_ms: 0,
+                    labels: HashMap::new(),
+                }),
                 phase: SandboxPhase::Provisioning as i32,
                 ..Sandbox::default()
             }),
@@ -127,9 +132,12 @@ impl OpenShell for TestOpenShell {
         let name = request.into_inner().name;
         Ok(Response::new(SandboxResponse {
             sandbox: Some(Sandbox {
-                id: format!("id-{name}"),
-                name,
-                namespace: "default".to_string(),
+                metadata: Some(openshell_core::proto::datamodel::v1::ObjectMeta {
+                    id: format!("id-{name}"),
+                    name,
+                    created_at_ms: 0,
+                    labels: HashMap::new(),
+                }),
                 phase: SandboxPhase::Ready as i32,
                 ..Sandbox::default()
             }),
@@ -156,11 +164,18 @@ impl OpenShell for TestOpenShell {
         Ok(Response::new(DeleteSandboxResponse { deleted: true }))
     }
 
-    async fn get_sandbox_policy(
+    async fn get_sandbox_config(
         &self,
-        _request: tonic::Request<GetSandboxPolicyRequest>,
-    ) -> Result<Response<GetSandboxPolicyResponse>, Status> {
-        Ok(Response::new(GetSandboxPolicyResponse::default()))
+        _request: tonic::Request<GetSandboxConfigRequest>,
+    ) -> Result<Response<GetSandboxConfigResponse>, Status> {
+        Ok(Response::new(GetSandboxConfigResponse::default()))
+    }
+
+    async fn get_gateway_config(
+        &self,
+        _request: tonic::Request<GetGatewayConfigRequest>,
+    ) -> Result<Response<GetGatewayConfigResponse>, Status> {
+        Ok(Response::new(GetGatewayConfigResponse::default()))
     }
 
     async fn get_sandbox_provider_environment(
@@ -216,6 +231,20 @@ impl OpenShell for TestOpenShell {
         Ok(Response::new(ListProvidersResponse::default()))
     }
 
+    async fn list_provider_profiles(
+        &self,
+        _request: tonic::Request<openshell_core::proto::ListProviderProfilesRequest>,
+    ) -> Result<Response<openshell_core::proto::ListProviderProfilesResponse>, Status> {
+        Err(Status::unimplemented("not implemented in test"))
+    }
+
+    async fn get_provider_profile(
+        &self,
+        _request: tonic::Request<openshell_core::proto::GetProviderProfileRequest>,
+    ) -> Result<Response<openshell_core::proto::ProviderProfileResponse>, Status> {
+        Err(Status::unimplemented("not implemented in test"))
+    }
+
     async fn update_provider(
         &self,
         _request: tonic::Request<UpdateProviderRequest>,
@@ -234,6 +263,8 @@ impl OpenShell for TestOpenShell {
         tokio_stream::wrappers::ReceiverStream<Result<SandboxStreamEvent, Status>>;
     type ExecSandboxStream =
         tokio_stream::wrappers::ReceiverStream<Result<ExecSandboxEvent, Status>>;
+    type ConnectSupervisorStream =
+        tokio_stream::wrappers::ReceiverStream<Result<GatewayMessage, Status>>;
 
     async fn watch_sandbox(
         &self,
@@ -244,9 +275,12 @@ impl OpenShell for TestOpenShell {
 
         tokio::spawn(async move {
             let provisioning = Sandbox {
-                id: sandbox_id.clone(),
-                name: sandbox_id.trim_start_matches("id-").to_string(),
-                namespace: "default".to_string(),
+                metadata: Some(openshell_core::proto::datamodel::v1::ObjectMeta {
+                    id: sandbox_id.clone(),
+                    name: sandbox_id.trim_start_matches("id-").to_string(),
+                    created_at_ms: 0,
+                    labels: HashMap::new(),
+                }),
                 phase: SandboxPhase::Provisioning as i32,
                 ..Sandbox::default()
             };
@@ -291,10 +325,10 @@ impl OpenShell for TestOpenShell {
         )))
     }
 
-    async fn update_sandbox_policy(
+    async fn update_config(
         &self,
-        _request: tonic::Request<openshell_core::proto::UpdateSandboxPolicyRequest>,
-    ) -> Result<Response<openshell_core::proto::UpdateSandboxPolicyResponse>, Status> {
+        _request: tonic::Request<openshell_core::proto::UpdateConfigRequest>,
+    ) -> Result<Response<openshell_core::proto::UpdateConfigResponse>, Status> {
         Err(Status::unimplemented("not implemented in test"))
     }
 
@@ -393,6 +427,23 @@ impl OpenShell for TestOpenShell {
         &self,
         _request: tonic::Request<openshell_core::proto::GetDraftHistoryRequest>,
     ) -> Result<Response<openshell_core::proto::GetDraftHistoryResponse>, Status> {
+        Err(Status::unimplemented("not implemented in test"))
+    }
+
+    async fn connect_supervisor(
+        &self,
+        _request: tonic::Request<tonic::Streaming<SupervisorMessage>>,
+    ) -> Result<Response<Self::ConnectSupervisorStream>, Status> {
+        Err(Status::unimplemented("not implemented in test"))
+    }
+
+    type RelayStreamStream =
+        tokio_stream::wrappers::ReceiverStream<Result<openshell_core::proto::RelayFrame, Status>>;
+
+    async fn relay_stream(
+        &self,
+        _request: tonic::Request<tonic::Streaming<openshell_core::proto::RelayFrame>>,
+    ) -> Result<Response<Self::RelayStreamStream>, Status> {
         Err(Status::unimplemented("not implemented in test"))
     }
 }
@@ -536,6 +587,7 @@ async fn sandbox_create_keeps_command_sessions_by_default() {
         None,
         None,
         None,
+        None,
         &[],
         None,
         None,
@@ -543,6 +595,7 @@ async fn sandbox_create_keeps_command_sessions_by_default() {
         Some(false),
         Some(false),
         Some(false),
+        &HashMap::new(),
         &tls,
     )
     .await
@@ -576,6 +629,7 @@ async fn sandbox_create_deletes_command_sessions_with_no_keep() {
         None,
         None,
         None,
+        None,
         &[],
         None,
         None,
@@ -583,6 +637,7 @@ async fn sandbox_create_deletes_command_sessions_with_no_keep() {
         Some(false),
         Some(false),
         Some(false),
+        &HashMap::new(),
         &tls,
     )
     .await
@@ -619,6 +674,7 @@ async fn sandbox_create_deletes_shell_sessions_with_no_keep() {
         None,
         None,
         None,
+        None,
         &[],
         None,
         None,
@@ -626,6 +682,7 @@ async fn sandbox_create_deletes_shell_sessions_with_no_keep() {
         Some(true),
         Some(false),
         Some(false),
+        &HashMap::new(),
         &tls,
     )
     .await
@@ -662,6 +719,7 @@ async fn sandbox_create_keeps_sandbox_with_hidden_keep_flag() {
         None,
         None,
         None,
+        None,
         &[],
         None,
         None,
@@ -669,6 +727,7 @@ async fn sandbox_create_keeps_sandbox_with_hidden_keep_flag() {
         Some(false),
         Some(false),
         Some(false),
+        &HashMap::new(),
         &tls,
     )
     .await
@@ -690,6 +749,10 @@ async fn sandbox_create_keeps_sandbox_with_forwarding() {
     let _env = test_env(&fake_ssh_dir, &xdg_dir);
     let tls = test_tls(&server);
     install_fake_ssh(&fake_ssh_dir);
+    let forward_port = {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        listener.local_addr().unwrap().port()
+    };
 
     run::sandbox_create(
         &server.endpoint,
@@ -702,13 +765,15 @@ async fn sandbox_create_keeps_sandbox_with_forwarding() {
         None,
         None,
         None,
+        None,
         &[],
         None,
-        Some(openshell_core::forward::ForwardSpec::new(8080)),
+        Some(openshell_core::forward::ForwardSpec::new(forward_port)),
         &["echo".to_string(), "OK".to_string()],
         Some(false),
         Some(false),
         Some(false),
+        &HashMap::new(),
         &tls,
     )
     .await

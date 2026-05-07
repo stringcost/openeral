@@ -1,4 +1,4 @@
-# OpenShell
+# NVIDIA OpenShell
 
 [![License](https://img.shields.io/badge/License-Apache_2.0-blue)](https://github.com/NVIDIA/OpenShell/blob/main/LICENSE)
 [![PyPI](https://img.shields.io/badge/PyPI-openshell-orange?logo=pypi)](https://pypi.org/project/openshell/)
@@ -8,16 +8,16 @@
 
 OpenShell is the safe, private runtime for autonomous AI agents. It provides sandboxed execution environments that protect your data, credentials, and infrastructure — governed by declarative YAML policies that prevent unauthorized file access, data exfiltration, and uncontrolled network activity.
 
-OpenShell is built agent-first. The project ships with agent skills for everything from cluster debugging to policy generation, and we expect contributors to use them.
+OpenShell is built agent-first. The project ships with agent skills for everything from gateway troubleshooting to policy generation, and we expect contributors to use them.
 
 > **Alpha software — single-player mode.** OpenShell is proof-of-life: one developer, one environment, one gateway. We are building toward multi-tenant enterprise deployments, but the starting point is getting your own environment up and running. Expect rough edges. Bring your agent.
 
 ## Quickstart
 
-
 ### Prerequisites
 
-- **Docker** — Docker Desktop (or a Docker daemon) must be running.
+- **A supported host** — macOS, Windows with WSL 2, or Linux.
+- **A local runtime** — Docker, Podman, or host virtualization enabled for MicroVM-backed sandboxes.
 
 ### Install
 
@@ -33,19 +33,31 @@ curl -LsSf https://raw.githubusercontent.com/NVIDIA/OpenShell/main/install.sh | 
 uv tool install -U openshell
 ```
 
+Both methods install the latest stable release by default. To install a specific version, set `OPENSHELL_VERSION` (binary) or pin the version with `uv tool install openshell==<version>`. A [`dev` release](https://github.com/NVIDIA/OpenShell/releases/tag/dev) is also available that tracks the latest commit on `main`.
+
+**Helm chart:**
+
+> **Experimental** — the Kubernetes deployment path is under active development. Expect rough edges and breaking changes.
+
+Deploy the OpenShell gateway into a Kubernetes cluster from the OCI chart published to GHCR:
+
+```bash
+helm install openshell oci://ghcr.io/nvidia/openshell/helm-chart
+```
+
+See [`deploy/helm/openshell/README.md`](deploy/helm/openshell/README.md) for available versions, dev tag conventions, and configuration.
+
 ### Create a sandbox
 
 ```bash
-openshell sandbox create -- claude  # or opencode, codex, ollama
+openshell sandbox create -- claude  # or opencode, codex, copilot
 ```
-
-A gateway is created automatically on first use. To deploy on a remote host instead, pass `--remote user@host` to the create command.
 
 The sandbox container includes the following tools by default:
 
 | Category   | Tools                                                    |
 | ---------- | -------------------------------------------------------- |
-| Agent      | `claude`, `opencode`, `codex`                            |
+| Agent      | `claude`, `opencode`, `codex`, `copilot`                 |
 | Language   | `python` (3.13), `node` (22)                             |
 | Developer  | `gh`, `git`, `vim`, `nano`                               |
 | Networking | `ping`, `dig`, `nslookup`, `nc`, `traceroute`, `netstat` |
@@ -98,7 +110,7 @@ OpenShell isolates each sandbox in its own container with policy-enforced egress
 | **Policy Engine**  | Enforces filesystem, network, and process constraints from application layer down to kernel. |
 | **Privacy Router** | Privacy-aware LLM routing that keeps sensitive context on sandbox compute.                   |
 
-Under the hood, all these components run as a [K3s](https://k3s.io/) Kubernetes cluster inside a single Docker container — no separate K8s install required. The `openshell gateway` commands take care of provisioning the container and cluster.
+OpenShell runs a gateway control plane that manages sandbox lifecycle through a configured compute driver. Supported compute platforms include Docker, Podman, MicroVM, and Kubernetes.
 
 ## Protection Layers
 
@@ -115,9 +127,11 @@ Policies are declarative YAML files. Static sections (filesystem, process) are l
 
 ## Providers
 
-Agents need credentials — API keys, tokens, service accounts. OpenShell manages these as **providers**: named credential bundles that are injected into sandboxes at creation. The CLI auto-discovers credentials for recognized agents (Claude, Codex, OpenCode) from your shell environment, or you can create providers explicitly with `openshell provider create`. Credentials never leak into the sandbox filesystem; they are injected as environment variables at runtime.
+Agents need credentials — API keys, tokens, service accounts. OpenShell manages these as **providers**: named credential bundles that are injected into sandboxes at creation. The CLI auto-discovers credentials for recognized agents (Claude, Codex, OpenCode, Copilot) from your shell environment, or you can create providers explicitly with `openshell provider create`. Credentials never leak into the sandbox filesystem; they are injected as environment variables at runtime.
 
-## GPU Support
+## GPU Support (Experimental)
+
+> **Experimental** — GPU passthrough works on supported hosts but is under active development. Expect rough edges and breaking changes.
 
 OpenShell can pass host GPUs into sandboxes for local inference, fine-tuning, or any GPU workload. Add `--gpu` when creating a sandbox:
 
@@ -125,7 +139,7 @@ OpenShell can pass host GPUs into sandboxes for local inference, fine-tuning, or
 openshell sandbox create --gpu --from [gpu-enabled-sandbox] -- claude
 ```
 
-The CLI auto-bootstraps a GPU-enabled gateway on first use. GPU intent is also inferred automatically for community images with `gpu` in the name.
+Docker-backed GPU sandboxes auto-select CDI when available and otherwise fall back to Docker's NVIDIA GPU request path (`--gpus all`). GPU intent is also inferred automatically for community images with `gpu` in the name.
 
 **Requirements:** NVIDIA drivers and the [NVIDIA Container Toolkit](https://docs.nvidia.com/datacenter/cloud-native/container-toolkit/latest/install-guide.html) must be installed on the host. The sandbox image itself must include the appropriate GPU drivers and libraries for your workload — the default `base` image does not. See the [BYOC example](https://github.com/NVIDIA/OpenShell/tree/main/examples/bring-your-own-container) for building a custom sandbox image with GPU support.
 
@@ -136,8 +150,9 @@ The CLI auto-bootstraps a GPU-enabled gateway on first use. GPU intent is also i
 | [Claude Code](https://docs.anthropic.com/en/docs/claude-code) | [`base`](https://github.com/NVIDIA/OpenShell-Community/tree/main/sandboxes/base) | Works out of the box. Provider uses `ANTHROPIC_API_KEY`.                      |
 | [OpenCode](https://opencode.ai/)                              | [`base`](https://github.com/NVIDIA/OpenShell-Community/tree/main/sandboxes/base) | Works out of the box. Provider uses `OPENAI_API_KEY` or `OPENROUTER_API_KEY`. |
 | [Codex](https://developers.openai.com/codex)                  | [`base`](https://github.com/NVIDIA/OpenShell-Community/tree/main/sandboxes/base) | Works out of the box. Provider uses `OPENAI_API_KEY`.                         |
+| [GitHub Copilot CLI](https://docs.github.com/en/copilot/github-copilot-in-the-cli) | [`base`](https://github.com/NVIDIA/OpenShell-Community/tree/main/sandboxes/base) | Works out of the box. Provider uses `GITHUB_TOKEN` or `COPILOT_GITHUB_TOKEN`. |
 | [OpenClaw](https://openclaw.ai/)                              | [Community](https://github.com/NVIDIA/OpenShell-Community)                       | Launch with `openshell sandbox create --from openclaw`.                       |
-| [Ollama](https://ollama.com/)                              | [Community](https://github.com/NVIDIA/OpenShell-Community)                       | Launch with `openshell sandbox create --from ollama`.                       |
+| [Ollama](https://ollama.com/)                                 | [Community](https://github.com/NVIDIA/OpenShell-Community)                       | Launch with `openshell sandbox create --from ollama`.                         |
 
 ## Key Commands
 
@@ -153,7 +168,7 @@ The CLI auto-bootstraps a GPU-enabled gateway on first use. GPU intent is also i
 | `openshell logs [name] --tail`                             | Stream sandbox logs.                            |
 | `openshell term`                                           | Launch the real-time terminal UI for debugging. |
 
-See the full [CLI reference](https://github.com/NVIDIA/OpenShell/blob/main/docs/reference/cli.md) for all commands, flags, and environment variables.
+See the [full documentation](https://docs.nvidia.com/openshell/latest) for command guides, tutorials, and reference material.
 
 ## Terminal UI
 
@@ -164,10 +179,10 @@ openshell term
 ```
 
 <p align="center">
-  <img src="docs/assets/openshell-terminal.png" alt="OpenShell Terminal UI">
+  <img src="fern/assets/images/openshell-terminal.png" alt="OpenShell Terminal UI">
 </p>
 
-The TUI gives you a live, keyboard-driven view of your cluster. Navigate with `Tab` to switch panels, `j`/`k` to move through lists, `Enter` to select, and `:` for command mode. Cluster health and sandbox status auto-refresh every two seconds.
+The TUI gives you a live, keyboard-driven view of your gateway and sandboxes. Navigate with `Tab` to switch panels, `j`/`k` to move through lists, `Enter` to select, and `:` for command mode. Gateway health and sandbox status auto-refresh every two seconds.
 
 ## Community Sandboxes and BYOC
 
@@ -179,7 +194,7 @@ openshell sandbox create --from ./my-sandbox-dir   # local Dockerfile
 openshell sandbox create --from registry.io/img:v1 # container image
 ```
 
-See the [community sandboxes](https://github.com/NVIDIA/OpenShell/blob/main/docs/sandboxes/community-sandboxes.md) catalog and the [BYOC example](https://github.com/NVIDIA/OpenShell/tree/main/examples/bring-your-own-container) for details.
+See the [community sandboxes](https://docs.nvidia.com/openshell/latest/sandboxes/community-sandboxes) catalog and the [BYOC example](https://github.com/NVIDIA/OpenShell/tree/main/examples/bring-your-own-container) for details.
 
 ## Explore with Your Agent
 
@@ -191,7 +206,7 @@ cd OpenShell
 # Point your agent here — it will discover the skills in .agents/skills/ automatically
 ```
 
-Your agent can load skills for CLI usage (`openshell-cli`), cluster troubleshooting (`debug-openshell-cluster`), inference troubleshooting (`debug-inference`), policy generation (`generate-sandbox-policy`), and more. See [CONTRIBUTING.md](CONTRIBUTING.md) for the full skills table.
+Your agent can load skills for CLI usage (`openshell-cli`), gateway troubleshooting (`debug-openshell-cluster`), inference troubleshooting (`debug-inference`), policy generation (`generate-sandbox-policy`), and more. See [CONTRIBUTING.md](CONTRIBUTING.md) for the full skills table.
 
 ## Built With Agents
 
@@ -214,16 +229,20 @@ All implementation work is human-gated — agents propose plans, humans approve,
 ## Learn More
 
 - [Full Documentation](https://docs.nvidia.com/openshell/latest/index.html) — overview, architecture, tutorials, and reference
-- [Quickstart](https://github.com/NVIDIA/OpenShell/blob/main/docs/get-started/quickstart.md) — detailed install and first sandbox walkthrough
-- [GitHub Sandbox Tutorial](https://github.com/NVIDIA/OpenShell/blob/main/docs/tutorials/github-sandbox.md) — end-to-end scoped GitHub repo access
+- [Quickstart](https://docs.nvidia.com/openshell/latest/get-started/quickstart) — detailed install and first sandbox walkthrough
+- [GitHub Sandbox Tutorial](https://docs.nvidia.com/openshell/latest/tutorials/github-sandbox) — end-to-end scoped GitHub repo access
 - [Architecture](https://github.com/NVIDIA/OpenShell/tree/main/architecture) — detailed architecture docs and design decisions
-- [Support Matrix](https://github.com/NVIDIA/OpenShell/blob/main/docs/reference/support-matrix.md) — platforms, versions, and kernel requirements
+- [Support Matrix](https://docs.nvidia.com/openshell/latest/reference/support-matrix) — platforms, versions, and kernel requirements
 - [Brev Launchable](https://brev.nvidia.com/launchable/deploy/now?launchableID=env-3Ap3tL55zq4a8kew1AuW0FpSLsg) — try OpenShell on cloud compute without local setup
 - [Agent Instructions](AGENTS.md) — system prompt and workflow documentation for agent contributors
 
 ## Contributing
 
 OpenShell is built agent-first — your agent is your first collaborator. Before opening issues or submitting code, point your agent at the repo and let it use the skills in `.agents/skills/` to investigate, diagnose, and prototype. See [CONTRIBUTING.md](CONTRIBUTING.md) for the full agent skills table, contribution workflow, and development setup.
+
+## Notice and Disclaimer
+
+This software automatically retrieves, accesses or interacts with external materials. Those retrieved materials are not distributed with this software and are governed solely by separate terms, conditions and licenses. You are solely responsible for finding, reviewing and complying with all applicable terms, conditions, and licenses, and for verifying the security, integrity and suitability of any retrieved materials for your specific use case. This software is provided "AS IS", without warranty of any kind. The author makes no representations or warranties regarding any retrieved materials, and assumes no liability for any losses, damages, liabilities or legal consequences from your use or inability to use this software or any retrieved materials. Use this software and the retrieved materials at your own risk.
 
 ## License
 

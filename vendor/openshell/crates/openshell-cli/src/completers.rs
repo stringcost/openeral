@@ -7,6 +7,7 @@ use std::time::Duration;
 
 use clap_complete::engine::CompletionCandidate;
 use openshell_bootstrap::{list_gateways, load_active_gateway, load_gateway_metadata};
+use openshell_core::ObjectName;
 use openshell_core::proto::open_shell_client::OpenShellClient;
 use openshell_core::proto::{ListProvidersRequest, ListSandboxesRequest};
 use tonic::transport::{Channel, Endpoint};
@@ -33,6 +34,7 @@ pub fn complete_sandbox_names(_prefix: &OsStr) -> Vec<CompletionCandidate> {
             .list_sandboxes(ListSandboxesRequest {
                 limit: 200,
                 offset: 0,
+                label_selector: String::new(),
             })
             .await
             .ok()?;
@@ -41,7 +43,7 @@ pub fn complete_sandbox_names(_prefix: &OsStr) -> Vec<CompletionCandidate> {
                 .into_inner()
                 .sandboxes
                 .into_iter()
-                .map(|s| CompletionCandidate::new(s.name))
+                .map(|s| CompletionCandidate::new(s.object_name()))
                 .collect(),
         )
     })
@@ -64,7 +66,7 @@ pub fn complete_provider_names(_prefix: &OsStr) -> Vec<CompletionCandidate> {
                 .into_inner()
                 .providers
                 .into_iter()
-                .map(|p| CompletionCandidate::new(p.name))
+                .map(|p| CompletionCandidate::new(p.object_name()))
                 .collect(),
         )
     })
@@ -175,22 +177,19 @@ mod tests {
                     name: "alpha".to_string(),
                     gateway_endpoint: "https://alpha.example.com".to_string(),
                     is_remote: true,
-                    gateway_port: 0,
-                    remote_host: None,
-                    resolved_host: None,
                     auth_mode: Some("cloudflare_jwt".to_string()),
-                    edge_team_domain: None,
-                    edge_auth_url: None,
+                    client_lifecycle_managed: Some(false),
+                    ..Default::default()
                 },
             )
             .unwrap();
 
             let result = complete_gateway_names(OsStr::new("a"));
-            let names: Vec<String> = result
-                .iter()
-                .map(|candidate| candidate.get_value().to_string_lossy().into_owned())
-                .collect();
-            assert!(names.contains(&"alpha".to_string()));
+            assert!(
+                result
+                    .iter()
+                    .any(|candidate| candidate.get_value().to_string_lossy() == "alpha")
+            );
         });
     }
 }

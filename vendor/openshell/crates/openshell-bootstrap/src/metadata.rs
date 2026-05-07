@@ -9,7 +9,7 @@ use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 
 /// Gateway metadata stored alongside deployment info.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct GatewayMetadata {
     /// The gateway name.
     pub name: String,
@@ -26,7 +26,8 @@ pub struct GatewayMetadata {
     #[serde(skip_serializing_if = "Option::is_none", default)]
     pub resolved_host: Option<String>,
 
-    /// Auth mode: `None` or `"mtls"` = mTLS (default), `"cloudflare_jwt"` = CF JWT.
+    /// Auth mode: `None` or `"mtls"` = mTLS (default), `"plaintext"` = direct HTTP,
+    /// `"cloudflare_jwt"` = CF JWT.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub auth_mode: Option<String>,
 
@@ -45,6 +46,69 @@ pub struct GatewayMetadata {
         alias = "cf_auth_url"
     )]
     pub edge_auth_url: Option<String>,
+
+    /// OIDC issuer URL (set when `auth_mode == "oidc"`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub oidc_issuer: Option<String>,
+
+    /// OIDC client ID for the CLI login flow (set when `auth_mode == "oidc"`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub oidc_client_id: Option<String>,
+
+    /// OIDC audience for the resource server (API). When different from
+    /// `client_id`, the CLI requests this audience in the token exchange.
+    /// When `None`, defaults to the `client_id`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub oidc_audience: Option<String>,
+
+    /// Space-separated `OAuth2` scopes to request during OIDC login.
+    /// When set, tokens will include these scopes for fine-grained access control.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub oidc_scopes: Option<String>,
+
+    /// Local VM driver state directory for standalone VM gateways.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub vm_driver_state_dir: Option<PathBuf>,
+
+    /// Whether the CLI manages this gateway's full lifecycle (deploy,
+    /// stop, destroy).
+    ///
+    /// - `Some(true)` — deployed via `gateway start`; destroy/stop operate on
+    ///   the underlying container or VM.
+    /// - `Some(false)` — registered via `gateway add`; destroy/stop only remove
+    ///   the local registration metadata.
+    /// - `None` — legacy metadata written before this field existed; the CLI
+    ///   falls back to the previous heuristic (`is_remote`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub client_lifecycle_managed: Option<bool>,
+}
+
+impl GatewayMetadata {
+    /// Extract the host portion from the stored `gateway_endpoint` URL.
+    ///
+    /// Returns `None` if the endpoint is malformed or uses a default loopback
+    /// address (`127.0.0.1`, `localhost`, `::1`) — those are never meaningful
+    /// as a `--gateway-host` override.
+    pub fn gateway_host(&self) -> Option<&str> {
+        // Endpoint format: "https://host:port" or "http://host:port"
+        let after_scheme = self
+            .gateway_endpoint
+            .strip_prefix("https://")
+            .or_else(|| self.gateway_endpoint.strip_prefix("http://"))?;
+        // Strip port suffix (":8082")
+        let host = after_scheme
+            .rsplit_once(':')
+            .map_or(after_scheme, |(h, _)| h);
+        if host.is_empty()
+            || host == "127.0.0.1"
+            || host == "localhost"
+            || host == "::1"
+            || host == "[::1]"
+        {
+            return None;
+        }
+        Some(host)
+    }
 }
 
 pub fn create_gateway_metadata(
@@ -104,9 +168,9 @@ pub fn create_gateway_metadata_with_host(
         gateway_port: port,
         remote_host,
         resolved_host,
-        auth_mode: None,
-        edge_team_domain: None,
-        edge_auth_url: None,
+        auth_mode: disable_tls.then(|| "plaintext".to_string()),
+        client_lifecycle_managed: Some(true),
+        ..Default::default()
     }
 }
 
@@ -271,6 +335,19 @@ pub fn load_last_sandbox(gateway: &str) -> Option<String> {
     if name.is_empty() { None } else { Some(name) }
 }
 
+/// Clear the last-used sandbox record for a gateway if it matches the given name.
+///
+/// This should be called after a sandbox is deleted so that subsequent commands
+/// don't try to connect to a sandbox that no longer exists.
+pub fn clear_last_sandbox_if_matches(gateway: &str, sandbox: &str) {
+    if let Some(current) = load_last_sandbox(gateway)
+        && current == sandbox
+        && let Ok(path) = last_sandbox_path(gateway)
+    {
+        let _ = std::fs::remove_file(path);
+    }
+}
+
 /// List all gateways that have stored metadata.
 ///
 /// Scans `$XDG_CONFIG_HOME/openshell/gateways/` for subdirectories containing
@@ -418,9 +495,7 @@ mod tests {
             gateway_port: 8080,
             remote_host: Some("user@openshell-dev".to_string()),
             resolved_host: Some("10.0.0.5".to_string()),
-            auth_mode: None,
-            edge_team_domain: None,
-            edge_auth_url: None,
+            ..Default::default()
         };
         let json = serde_json::to_string(&meta).unwrap();
         let parsed: GatewayMetadata = serde_json::from_str(&json).unwrap();
@@ -442,6 +517,53 @@ mod tests {
         }"#;
         let parsed: GatewayMetadata = serde_json::from_str(json).unwrap();
         assert!(parsed.resolved_host.is_none());
+    }
+
+    #[test]
+    fn metadata_deserialize_without_client_lifecycle_managed_field() {
+        // Legacy metadata files won't have the client_lifecycle_managed field.
+        // Ensure backwards compatibility: defaults to None.
+        let json = r#"{
+            "name": "test",
+            "gateway_endpoint": "https://127.0.0.1:8080",
+            "is_remote": false,
+            "gateway_port": 8080
+        }"#;
+        let parsed: GatewayMetadata = serde_json::from_str(json).unwrap();
+        assert_eq!(parsed.client_lifecycle_managed, None);
+    }
+
+    #[test]
+    fn metadata_roundtrip_with_client_lifecycle_managed_field() {
+        let meta = GatewayMetadata {
+            name: "test".to_string(),
+            gateway_endpoint: "https://127.0.0.1:8080".to_string(),
+            gateway_port: 8080,
+            client_lifecycle_managed: Some(false),
+            ..Default::default()
+        };
+        let json = serde_json::to_string(&meta).unwrap();
+        assert!(json.contains(r#""client_lifecycle_managed":false"#));
+        let parsed: GatewayMetadata = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed.client_lifecycle_managed, Some(false));
+    }
+
+    #[test]
+    fn metadata_omits_client_lifecycle_managed_when_none() {
+        let meta = GatewayMetadata {
+            name: "test".to_string(),
+            gateway_endpoint: "https://127.0.0.1:8080".to_string(),
+            gateway_port: 8080,
+            ..Default::default()
+        };
+        let json = serde_json::to_string(&meta).unwrap();
+        assert!(!json.contains("client_lifecycle_managed"));
+    }
+
+    #[test]
+    fn create_gateway_metadata_sets_client_lifecycle_managed_true() {
+        let meta = create_gateway_metadata("test", None, 8080);
+        assert_eq!(meta.client_lifecycle_managed, Some(true));
     }
 
     #[test]
@@ -472,6 +594,7 @@ mod tests {
     fn local_gateway_metadata_with_tls_disabled() {
         let meta = create_gateway_metadata_with_host("test", None, 8080, None, true);
         assert_eq!(meta.gateway_endpoint, "http://127.0.0.1:8080");
+        assert_eq!(meta.auth_mode.as_deref(), Some("plaintext"));
     }
 
     #[test]
@@ -484,6 +607,55 @@ mod tests {
             true,
         );
         assert_eq!(meta.gateway_endpoint, "http://host.docker.internal:8080");
+        assert_eq!(meta.auth_mode.as_deref(), Some("plaintext"));
+    }
+
+    // ── GatewayMetadata::gateway_host() ──────────────────────────────
+
+    #[test]
+    fn gateway_host_returns_custom_host() {
+        let meta =
+            create_gateway_metadata_with_host("t", None, 8082, Some("host.docker.internal"), false);
+        assert_eq!(meta.gateway_host(), Some("host.docker.internal"));
+    }
+
+    #[test]
+    fn gateway_host_returns_none_for_loopback() {
+        let meta = create_gateway_metadata("t", None, 8080);
+        // Default endpoint is https://127.0.0.1:8080
+        assert_eq!(meta.gateway_host(), None);
+    }
+
+    #[test]
+    fn gateway_host_returns_none_for_localhost() {
+        let meta = GatewayMetadata {
+            name: "t".into(),
+            gateway_endpoint: "https://localhost:8080".into(),
+            gateway_port: 8080,
+            ..Default::default()
+        };
+        assert_eq!(meta.gateway_host(), None);
+    }
+
+    #[test]
+    fn gateway_host_returns_ip_for_remote() {
+        let meta = GatewayMetadata {
+            name: "t".into(),
+            gateway_endpoint: "https://10.0.0.5:8080".into(),
+            is_remote: true,
+            gateway_port: 8080,
+            remote_host: Some("user@10.0.0.5".into()),
+            resolved_host: Some("10.0.0.5".into()),
+            ..Default::default()
+        };
+        assert_eq!(meta.gateway_host(), Some("10.0.0.5"));
+    }
+
+    #[test]
+    fn gateway_host_handles_http_scheme() {
+        let meta =
+            create_gateway_metadata_with_host("t", None, 8080, Some("host.docker.internal"), true);
+        assert_eq!(meta.gateway_host(), Some("host.docker.internal"));
     }
 
     #[test]
@@ -493,6 +665,7 @@ mod tests {
         assert!(meta.is_remote);
         assert!(meta.gateway_endpoint.starts_with("http://"));
         assert!(!meta.gateway_endpoint.starts_with("https://"));
+        assert_eq!(meta.auth_mode.as_deref(), Some("plaintext"));
     }
 
     // ── last-sandbox persistence ──────────────────────────────────────

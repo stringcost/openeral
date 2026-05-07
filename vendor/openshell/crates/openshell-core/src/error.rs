@@ -1,15 +1,15 @@
 // SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
-//! Common error types for OpenShell.
+//! Common error types for `OpenShell`.
 
 use miette::Diagnostic;
 use thiserror::Error;
 
-/// Result type alias using OpenShell's error type.
+/// Result type alias using `OpenShell`'s error type.
 pub type Result<T> = std::result::Result<T, Error>;
 
-/// OpenShell error type.
+/// `OpenShell` error type.
 #[derive(Debug, Error, Diagnostic)]
 pub enum Error {
     /// Configuration error.
@@ -102,4 +102,21 @@ impl Error {
             message: message.into(),
         }
     }
+}
+
+/// Error type shared by all compute driver implementations.
+///
+/// Both the Podman and Kubernetes drivers map their backend-specific
+/// errors into these variants before crossing crate boundaries.
+#[derive(Debug, Error)]
+pub enum ComputeDriverError {
+    /// The requested sandbox already exists.
+    #[error("sandbox already exists")]
+    AlreadyExists,
+    /// A precondition for the operation was not met.
+    #[error("{0}")]
+    Precondition(String),
+    /// Generic error message.
+    #[error("{0}")]
+    Message(String),
 }

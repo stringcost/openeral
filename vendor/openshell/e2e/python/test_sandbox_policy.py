@@ -22,7 +22,7 @@ if TYPE_CHECKING:
 
 _BASE_FILESYSTEM = sandbox_pb2.FilesystemPolicy(
     include_workdir=True,
-    read_only=["/usr", "/lib", "/etc", "/app", "/var/log"],
+    read_only=["/usr", "/lib", "/etc", "/app", "/var/log", "/proc", "/dev/urandom"],
     read_write=["/sandbox", "/tmp"],
 )
 _BASE_LANDLOCK = sandbox_pb2.LandlockPolicy(compatibility="best_effort")
@@ -30,6 +30,10 @@ _BASE_PROCESS = sandbox_pb2.ProcessPolicy(run_as_user="sandbox", run_as_group="s
 # Standard proxy address inside the sandbox network namespace
 _PROXY_HOST = "10.200.0.1"
 _PROXY_PORT = 3128
+# sslip.io keeps the wildcard test on deterministic public DNS. Vendor-owned
+# telemetry subdomains can be NXDOMAIN or resolve to private ranges in CI.
+_PUBLIC_WILDCARD_SUFFIX = "1.1.1.1.sslip.io"
+_PUBLIC_WILDCARD_PATTERN = f"*.{_PUBLIC_WILDCARD_SUFFIX}"
 
 
 def _base_policy(
@@ -267,6 +271,88 @@ def _forward_proxy_raw():
             return conn.recv(4096).decode("latin1")
         finally:
             conn.close()
+
+    return fn
+
+
+def _proxy_connect_then_http_with_server():
+    """Return a closure that starts a local HTTP server and sends CONNECT+HTTP."""
+
+    def fn(proxy_host, proxy_port, target_host, target_port, method="GET", path="/"):
+        import json as _json
+        import socket
+        import threading
+        import time
+        from http.server import BaseHTTPRequestHandler, HTTPServer
+
+        class Handler(BaseHTTPRequestHandler):
+            def do_GET(self):
+                self.send_response(200)
+                body = b"connect-server-ok"
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+
+            def do_POST(self):
+                self.send_response(200)
+                body = b"connect-server-ok"
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+
+            def log_message(self, *args):
+                pass
+
+        srv = HTTPServer(("0.0.0.0", int(target_port)), Handler)
+        threading.Thread(target=srv.handle_request, daemon=True).start()
+        time.sleep(0.5)
+
+        conn = socket.create_connection((proxy_host, int(proxy_port)), timeout=10)
+        try:
+            conn.sendall(
+                f"CONNECT {target_host}:{target_port} HTTP/1.1\r\nHost: {target_host}\r\n\r\n".encode()
+            )
+            connect_resp = conn.recv(256).decode("latin1")
+            if "200" not in connect_resp:
+                return _json.dumps(
+                    {"connect_status": connect_resp.strip(), "http_status": 0}
+                )
+
+            request = f"{method} {path} HTTP/1.1\r\nHost: {target_host}\r\nConnection: close\r\n\r\n"
+            conn.sendall(request.encode())
+
+            data = b""
+            conn.settimeout(5)
+            try:
+                while True:
+                    chunk = conn.recv(4096)
+                    if not chunk:
+                        break
+                    data += chunk
+            except socket.timeout:
+                pass
+
+            response = data.decode("latin1", errors="replace")
+            status_line = response.split("\r\n")[0] if response else ""
+            status_code = (
+                int(status_line.split()[1]) if len(status_line.split()) >= 2 else 0
+            )
+
+            header_end = response.find("\r\n\r\n")
+            headers_raw = response[:header_end] if header_end > 0 else ""
+            body = response[header_end + 4 :] if header_end > 0 else ""
+
+            return _json.dumps(
+                {
+                    "connect_status": connect_resp.strip(),
+                    "http_status": status_code,
+                    "headers": headers_raw,
+                    "body": body,
+                }
+            )
+        finally:
+            conn.close()
+            srv.server_close()
 
     return fn
 
@@ -540,13 +626,13 @@ def test_l4_log_fields(
         assert log_result.exit_code == 0, log_result.stderr
         log = log_result.stdout
 
-        # Verify structured fields in allow line
-        assert "action=allow" in log or 'action="allow"' in log or "action=allow" in log
-        assert "dst_host=api.anthropic.com" in log or "dst_host" in log
-        assert "engine=opa" in log or 'engine="opa"' in log
+        # Verify OCSF shorthand fields in allow line
+        assert "ALLOWED" in log, "Expected ALLOWED in OCSF shorthand"
+        assert "api.anthropic.com" in log, "Expected destination host in log"
+        assert "engine:opa" in log, "Expected engine:opa in log context"
 
         # Verify deny line exists
-        assert "action=deny" in log or 'action="deny"' in log
+        assert "DENIED" in log, "Expected DENIED in OCSF shorthand"
 
 
 # =============================================================================
@@ -607,10 +693,16 @@ def test_ssrf_blocks_metadata_endpoint_despite_policy_allow(
         assert "403" in result.stdout
 
 
-def test_ssrf_log_shows_internal_address_block(
+def test_ssrf_log_shows_blocked_address(
     sandbox: Callable[..., Sandbox],
 ) -> None:
-    """SSRF-3: Proxy log includes 'internal address' reason when SSRF check fires."""
+    """SSRF-3: Proxy log includes block reason when SSRF check fires.
+
+    Loopback addresses are always-blocked.  Since implicit_allowed_ips_for_ip_host
+    now skips always-blocked hosts, 127.0.0.1 falls through to the default
+    resolve_and_reject_internal path which blocks it as an internal address.
+    The shorthand log should include 'ssrf' and a '[reason:' tag for denied events.
+    """
     policy = _base_policy(
         network_policies={
             "internal": sandbox_pb2.NetworkPolicyRule(
@@ -629,8 +721,13 @@ def test_ssrf_log_shows_internal_address_block(
         log_result = sb.exec_python(_read_openshell_log())
         assert log_result.exit_code == 0, log_result.stderr
         log = log_result.stdout
-        assert "internal address" in log.lower(), (
-            f"Expected 'internal address' in proxy log, got:\n{log}"
+        # OCSF shorthand uses "engine:ssrf" for SSRF blocks
+        assert "engine:ssrf" in log.lower() or "ssrf" in log.lower(), (
+            f"Expected SSRF block indicator in proxy log, got:\n{log}"
+        )
+        # Shorthand for denied events should include [reason:...] tag
+        assert "[reason:" in log.lower(), (
+            f"Expected [reason:] tag in denied event shorthand, got:\n{log}"
         )
 
 
@@ -716,16 +813,21 @@ def test_ssrf_allowed_ips_hostless_permits_private_ip(
         )
 
 
-def test_ssrf_private_ip_blocked_without_allowed_ips(
+def test_ssrf_private_ip_allowed_with_literal_ip_host(
     sandbox: Callable[..., Sandbox],
 ) -> None:
-    """SSRF-6: Private IP blocked when endpoint has no allowed_ips (default)."""
+    """SSRF-6: Private IP allowed when policy host is a literal IP address.
+
+    When the policy endpoint host is a literal IP, the user has explicitly
+    declared intent.  The proxy synthesizes an implicit allowed_ips entry,
+    so the CONNECT succeeds (200) even without explicit allowed_ips.
+    """
     policy = _base_policy(
         network_policies={
             "internal": sandbox_pb2.NetworkPolicyRule(
                 name="internal",
                 endpoints=[
-                    # No allowed_ips — private IP should be blocked
+                    # No allowed_ips — but host is a literal IP, so implicit
                     sandbox_pb2.NetworkEndpoint(host="10.200.0.1", port=19999),
                 ],
                 binaries=[sandbox_pb2.NetworkBinary(path="/**")],
@@ -736,15 +838,24 @@ def test_ssrf_private_ip_blocked_without_allowed_ips(
     with sandbox(spec=spec, delete_on_exit=True) as sb:
         result = sb.exec_python(_proxy_connect(), args=("10.200.0.1", 19999))
         assert result.exit_code == 0, result.stderr
-        assert "403" in result.stdout, (
-            "Expected private IP to be blocked without allowed_ips"
+        # Should not get 403 — the SSRF check should pass.
+        # The actual TCP connection may fail (nothing listening on 19999)
+        # so recv() might return empty, but 403 must not appear.
+        assert "403" not in result.stdout, (
+            "Expected SSRF check to pass for literal IP host, but got 403"
         )
 
 
 def test_ssrf_loopback_blocked_even_with_allowed_ips(
     sandbox: Callable[..., Sandbox],
 ) -> None:
-    """SSRF-7: Loopback always blocked even when allowed_ips covers 127.0.0.0/8."""
+    """SSRF-7: Loopback always blocked even when allowed_ips covers 127.0.0.0/8.
+
+    With always-blocked validation, parse_allowed_ips rejects 127.0.0.0/8 at
+    connection time (returns Err), so the proxy treats this as "invalid
+    allowed_ips in policy" and returns 403.  The end result is the same:
+    loopback is never reachable.
+    """
     policy = _base_policy(
         network_policies={
             "internal": sandbox_pb2.NetworkPolicyRule(
@@ -784,6 +895,8 @@ def test_ssrf_loopback_blocked_even_with_allowed_ips(
 # L7-T6: L7 deny response is valid JSON with expected fields
 # L7-T7: L7 request logging includes structured fields
 # L7-T8: Port 443 + protocol=rest without tls=terminate warns (L7 not evaluated)
+# L7-T9: Query matcher glob/any allows and denies as expected
+# L7-T10: Rule without query matcher allows any query params
 # =============================================================================
 
 
@@ -905,7 +1018,9 @@ def test_l7_tls_audit_mode_allows_but_logs(
         log_result = sb.exec_python(_read_openshell_log())
         assert log_result.exit_code == 0, log_result.stderr
         log = log_result.stdout
-        assert "l7_decision=audit" in log or 'l7_decision="audit"' in log
+        # OCSF shorthand: audit decisions show as ALLOWED (audit mode allows through)
+        assert "HTTP:" in log, "Expected OCSF HTTP activity event in log"
+        assert "ALLOWED" in log, "Expected ALLOWED for audit-mode decision"
 
 
 def test_l7_tls_explicit_path_rules(
@@ -1083,267 +1198,170 @@ def test_l7_tls_log_fields(
         assert log_result.exit_code == 0, log_result.stderr
         log = log_result.stdout
 
-        assert "L7_REQUEST" in log
-        assert "l7_protocol" in log
-        assert "l7_action" in log
-        assert "l7_target" in log
-        assert "l7_decision" in log
+        # OCSF shorthand: L7 requests show as HTTP:method events
+        assert "HTTP:" in log, "Expected OCSF HTTP activity event in log"
+        assert "ALLOWED" in log or "DENIED" in log, "Expected L7 decision in log"
+        assert "policy:" in log, "Expected policy context in log"
 
 
-# =============================================================================
-# Live policy update + log streaming tests
-#
-# LPU-1: Create sandbox, verify initial policy is v1
-# LPU-2: Set the same policy again -> unchanged (no new version)
-# LPU-3: Push a different policy -> new version loaded, verify connectivity
-# LPU-4: Push v2 again -> unchanged
-# LPU-5: Fetch logs (one-shot + streaming) and verify both sources appear
-# =============================================================================
-
-
-def test_live_policy_update_and_logs(
+def test_l7_query_matchers_enforced(
     sandbox: Callable[..., Sandbox],
-    sandbox_client: SandboxClient,
 ) -> None:
-    """End-to-end: live policy update lifecycle with log verification."""
-    from openshell._proto import openshell_pb2, sandbox_pb2
-
-    # --- Setup: two distinct policies ---
-    # Policy A: python can reach api.anthropic.com
-    policy_a = _base_policy(
+    """L7-T9: Query matcher glob/any allows and denies as expected."""
+    policy = _base_policy(
         network_policies={
-            "anthropic": sandbox_pb2.NetworkPolicyRule(
-                name="anthropic",
+            "query_api": sandbox_pb2.NetworkPolicyRule(
+                name="query_api",
                 endpoints=[
-                    sandbox_pb2.NetworkEndpoint(host="api.anthropic.com", port=443),
+                    sandbox_pb2.NetworkEndpoint(
+                        host=_SANDBOX_IP,
+                        port=_FORWARD_PROXY_PORT,
+                        protocol="rest",
+                        enforcement="enforce",
+                        allowed_ips=["10.200.0.0/24"],
+                        rules=[
+                            sandbox_pb2.L7Rule(
+                                allow=sandbox_pb2.L7Allow(
+                                    method="GET",
+                                    path="/download",
+                                    query={
+                                        "tag": sandbox_pb2.L7QueryMatcher(glob="foo-*"),
+                                    },
+                                ),
+                            ),
+                            sandbox_pb2.L7Rule(
+                                allow=sandbox_pb2.L7Allow(
+                                    method="GET",
+                                    path="/search",
+                                    query={
+                                        "tag": sandbox_pb2.L7QueryMatcher(
+                                            any=["foo-*", "bar-*"]
+                                        ),
+                                    },
+                                ),
+                            ),
+                        ],
+                    ),
                 ],
                 binaries=[sandbox_pb2.NetworkBinary(path="/**")],
             ),
         },
     )
-    # Policy B: python can reach api.anthropic.com AND example.com
-    policy_b = _base_policy(
-        network_policies={
-            "anthropic": sandbox_pb2.NetworkPolicyRule(
-                name="anthropic",
-                endpoints=[
-                    sandbox_pb2.NetworkEndpoint(host="api.anthropic.com", port=443),
-                ],
-                binaries=[sandbox_pb2.NetworkBinary(path="/**")],
-            ),
-            "example": sandbox_pb2.NetworkPolicyRule(
-                name="example",
-                endpoints=[
-                    sandbox_pb2.NetworkEndpoint(host="example.com", port=443),
-                ],
-                binaries=[sandbox_pb2.NetworkBinary(path="/**")],
-            ),
-        },
-    )
-
-    spec = datamodel_pb2.SandboxSpec(policy=policy_a)
-    stub = sandbox_client._stub
-
+    spec = datamodel_pb2.SandboxSpec(policy=policy)
     with sandbox(spec=spec, delete_on_exit=True) as sb:
-        sandbox_name = sb.sandbox.name
-
-        # --- LPU-1: Initial policy should be version 1 ---
-        status_resp = stub.GetSandboxPolicyStatus(
-            openshell_pb2.GetSandboxPolicyStatusRequest(name=sandbox_name, version=0)
-        )
-        assert status_resp.revision.version >= 1, "Initial policy should be at least v1"
-        initial_version = status_resp.revision.version
-        initial_hash = status_resp.revision.policy_hash
-
-        # --- LPU-2: Set the same policy -> no new version ---
-        update_resp = stub.UpdateSandboxPolicy(
-            openshell_pb2.UpdateSandboxPolicyRequest(
-                name=sandbox_name,
-                policy=policy_a,
-            )
-        )
-        assert update_resp.version == initial_version, (
-            f"Same policy should return existing version {initial_version}, "
-            f"got {update_resp.version}"
-        )
-        assert update_resp.policy_hash == initial_hash
-
-        # --- LPU-3: Push policy B -> new version ---
-        update_resp = stub.UpdateSandboxPolicy(
-            openshell_pb2.UpdateSandboxPolicyRequest(
-                name=sandbox_name,
-                policy=policy_b,
-            )
-        )
-        new_version = update_resp.version
-        assert new_version > initial_version, (
-            f"Different policy should create new version > {initial_version}, "
-            f"got {new_version}"
-        )
-        assert update_resp.policy_hash != initial_hash
-
-        # Wait for the sandbox to load the new policy (poll loop is 30s default).
-        import time
-
-        deadline = time.time() + 90
-        loaded = False
-        while time.time() < deadline:
-            status_resp = stub.GetSandboxPolicyStatus(
-                openshell_pb2.GetSandboxPolicyStatusRequest(
-                    name=sandbox_name, version=new_version
-                )
-            )
-            status = status_resp.revision.status
-            if status == openshell_pb2.POLICY_STATUS_LOADED:
-                loaded = True
-                break
-            if status == openshell_pb2.POLICY_STATUS_FAILED:
-                pytest.fail(
-                    f"Policy v{new_version} failed to load: "
-                    f"{status_resp.revision.load_error}"
-                )
-            time.sleep(2)
-        assert loaded, f"Policy v{new_version} was not loaded within 90s"
-
-        # Verify the new policy works: example.com should now be allowed
-        result = sb.exec_python(_proxy_connect(), args=("example.com", 443))
-        assert result.exit_code == 0, result.stderr
-        assert "200" in result.stdout, (
-            f"example.com should be allowed after policy update, got: {result.stdout}"
-        )
-
-        # --- LPU-4: Push policy B again -> unchanged ---
-        update_resp = stub.UpdateSandboxPolicy(
-            openshell_pb2.UpdateSandboxPolicyRequest(
-                name=sandbox_name,
-                policy=policy_b,
-            )
-        )
-        assert update_resp.version == new_version, (
-            f"Same policy B should return existing version {new_version}, "
-            f"got {update_resp.version}"
-        )
-
-        # --- LPU-5: Verify policy history ---
-        list_resp = stub.ListSandboxPolicies(
-            openshell_pb2.ListSandboxPoliciesRequest(name=sandbox_name, limit=10)
-        )
-        versions = [r.version for r in list_resp.revisions]
-        assert new_version in versions
-        assert initial_version in versions
-
-        # Only one version should be Loaded
-        loaded_count = sum(
-            1
-            for r in list_resp.revisions
-            if r.status == openshell_pb2.POLICY_STATUS_LOADED
-        )
-        assert loaded_count == 1, (
-            f"Expected exactly 1 loaded version, got {loaded_count}: "
-            f"{[(r.version, r.status) for r in list_resp.revisions]}"
-        )
-
-        # --- LPU-6: Fetch logs (one-shot) and verify both sources ---
-        # Resolve sandbox ID for log RPCs
-        get_resp = stub.GetSandbox(openshell_pb2.GetSandboxRequest(name=sandbox_name))
-        sandbox_id = get_resp.sandbox.id
-
-        logs_resp = stub.GetSandboxLogs(
-            openshell_pb2.GetSandboxLogsRequest(sandbox_id=sandbox_id, lines=500)
-        )
-        assert logs_resp.buffer_total > 0, "Expected some logs in the buffer"
-
-        sources = {log.source or "gateway" for log in logs_resp.logs}
-        assert "gateway" in sources, (
-            f"Expected gateway logs in response, got sources: {sources}"
-        )
-        # Sandbox logs may take a moment to arrive via the push stream.
-        # If they're present, verify the source tag.
-        if "sandbox" in sources:
-            sandbox_logs = [l for l in logs_resp.logs if l.source == "sandbox"]
-            assert len(sandbox_logs) > 0
-            # Verify structured fields are present on at least one sandbox log
-            has_fields = any(len(l.fields) > 0 for l in sandbox_logs)
-            # Not all sandbox logs have fields (e.g., "Starting sandbox" doesn't),
-            # so we just check at least one does if there are CONNECT logs
-            connect_logs = [l for l in sandbox_logs if "CONNECT" in l.message]
-            if connect_logs:
-                assert has_fields, "CONNECT logs should have structured fields"
-
-
-def test_live_policy_update_from_empty_network_policies(
-    sandbox: Callable[..., Sandbox],
-    sandbox_client: SandboxClient,
-) -> None:
-    """End-to-end: add the first network rule to a running sandbox."""
-    from openshell._proto import openshell_pb2, sandbox_pb2
-
-    initial_policy = _base_policy()
-    updated_policy = _base_policy(
-        network_policies={
-            "example": sandbox_pb2.NetworkPolicyRule(
-                name="example",
-                endpoints=[
-                    sandbox_pb2.NetworkEndpoint(host="example.com", port=443),
-                ],
-                binaries=[sandbox_pb2.NetworkBinary(path="/**")],
+        allowed = sb.exec_python(
+            _proxy_connect_then_http_with_server(),
+            args=(
+                _PROXY_HOST,
+                _PROXY_PORT,
+                _SANDBOX_IP,
+                _FORWARD_PROXY_PORT,
+                "GET",
+                "/download?tag=foo-a&tag=foo-b",
             ),
-        },
-    )
-
-    spec = datamodel_pb2.SandboxSpec(policy=initial_policy)
-    stub = sandbox_client._stub
-
-    with sandbox(spec=spec, delete_on_exit=True) as sb:
-        sandbox_name = sb.sandbox.name
-
-        denied = sb.exec_python(_proxy_connect(), args=("example.com", 443))
-        assert denied.exit_code == 0, denied.stderr
-        assert "403" in denied.stdout, denied.stdout
-
-        initial_status = stub.GetSandboxPolicyStatus(
-            openshell_pb2.GetSandboxPolicyStatusRequest(name=sandbox_name, version=0)
         )
-        initial_version = initial_status.revision.version
-
-        update_resp = stub.UpdateSandboxPolicy(
-            openshell_pb2.UpdateSandboxPolicyRequest(
-                name=sandbox_name,
-                policy=updated_policy,
-            )
-        )
-        new_version = update_resp.version
-        assert new_version > initial_version, (
-            f"Adding the first network rule should create a new version > {initial_version}, "
-            f"got {new_version}"
-        )
-
-        import time
-
-        deadline = time.time() + 90
-        loaded = False
-        while time.time() < deadline:
-            status_resp = stub.GetSandboxPolicyStatus(
-                openshell_pb2.GetSandboxPolicyStatusRequest(
-                    name=sandbox_name, version=new_version
-                )
-            )
-            status = status_resp.revision.status
-            if status == openshell_pb2.POLICY_STATUS_LOADED:
-                loaded = True
-                break
-            if status == openshell_pb2.POLICY_STATUS_FAILED:
-                pytest.fail(
-                    f"Policy v{new_version} failed to load: "
-                    f"{status_resp.revision.load_error}"
-                )
-            time.sleep(2)
-
-        assert loaded, f"Policy v{new_version} was not loaded within 90s"
-
-        allowed = sb.exec_python(_proxy_connect(), args=("example.com", 443))
         assert allowed.exit_code == 0, allowed.stderr
-        assert "200" in allowed.stdout, allowed.stdout
+        allowed_resp = json.loads(allowed.stdout)
+        assert "200" in allowed_resp["connect_status"]
+        assert allowed_resp["http_status"] == 200
+        assert "connect-server-ok" in allowed_resp["body"]
+
+        denied = sb.exec_python(
+            _proxy_connect_then_http_with_server(),
+            args=(
+                _PROXY_HOST,
+                _PROXY_PORT,
+                _SANDBOX_IP,
+                _FORWARD_PROXY_PORT,
+                "GET",
+                "/download?tag=foo-a&tag=evil",
+            ),
+        )
+        assert denied.exit_code == 0, denied.stderr
+        denied_resp = json.loads(denied.stdout)
+        assert denied_resp["http_status"] == 403
+        assert "policy_denied" in denied_resp["body"]
+
+        any_allowed = sb.exec_python(
+            _proxy_connect_then_http_with_server(),
+            args=(
+                _PROXY_HOST,
+                _PROXY_PORT,
+                _SANDBOX_IP,
+                _FORWARD_PROXY_PORT,
+                "GET",
+                "/search?tag=foo-a&tag=bar-b",
+            ),
+        )
+        assert any_allowed.exit_code == 0, any_allowed.stderr
+        any_resp = json.loads(any_allowed.stdout)
+        assert any_resp["http_status"] == 200
+        assert "connect-server-ok" in any_resp["body"]
+
+        missing_required = sb.exec_python(
+            _proxy_connect_then_http_with_server(),
+            args=(
+                _PROXY_HOST,
+                _PROXY_PORT,
+                _SANDBOX_IP,
+                _FORWARD_PROXY_PORT,
+                "GET",
+                "/download?slug=skill-1",
+            ),
+        )
+        assert missing_required.exit_code == 0, missing_required.stderr
+        missing_resp = json.loads(missing_required.stdout)
+        assert missing_resp["http_status"] == 403
+        assert "policy_denied" in missing_resp["body"]
+
+
+def test_l7_rule_without_query_matcher_allows_any_query_params(
+    sandbox: Callable[..., Sandbox],
+) -> None:
+    """L7-T10: Rule without query matcher allows any query params."""
+    policy = _base_policy(
+        network_policies={
+            "query_optional": sandbox_pb2.NetworkPolicyRule(
+                name="query_optional",
+                endpoints=[
+                    sandbox_pb2.NetworkEndpoint(
+                        host=_SANDBOX_IP,
+                        port=_FORWARD_PROXY_PORT,
+                        protocol="rest",
+                        enforcement="enforce",
+                        allowed_ips=["10.200.0.0/24"],
+                        rules=[
+                            sandbox_pb2.L7Rule(
+                                allow=sandbox_pb2.L7Allow(
+                                    method="GET",
+                                    path="/download",
+                                ),
+                            ),
+                        ],
+                    ),
+                ],
+                binaries=[sandbox_pb2.NetworkBinary(path="/**")],
+            ),
+        },
+    )
+    spec = datamodel_pb2.SandboxSpec(policy=policy)
+    with sandbox(spec=spec, delete_on_exit=True) as sb:
+        result = sb.exec_python(
+            _proxy_connect_then_http_with_server(),
+            args=(
+                _PROXY_HOST,
+                _PROXY_PORT,
+                _SANDBOX_IP,
+                _FORWARD_PROXY_PORT,
+                "GET",
+                "/download?tag=anything&slug=any-value",
+            ),
+        )
+        assert result.exit_code == 0, result.stderr
+        resp = json.loads(result.stdout)
+        assert "200" in resp["connect_status"]
+        assert resp["http_status"] == 200
+        assert "connect-server-ok" in resp["body"]
 
 
 # =============================================================================
@@ -1393,20 +1411,21 @@ def test_forward_proxy_allows_private_ip_with_allowed_ips(
         )
 
 
-def test_forward_proxy_denied_without_allowed_ips(
+def test_forward_proxy_allows_private_ip_host_without_allowed_ips(
     sandbox: Callable[..., Sandbox],
 ) -> None:
-    """FWD-2: Forward proxy to private IP without allowed_ips -> 403.
+    """FWD-2: Forward proxy to literal IP host without allowed_ips -> 200.
 
-    Even though the endpoint matches, forward proxy requires explicit
-    allowed_ips on the endpoint.
+    When the policy host field is a literal IP address, the user has explicitly
+    declared intent to allow that destination.  The SSRF guard synthesizes an
+    implicit allowed_ips entry, so explicit allowed_ips is not required.
     """
     policy = _base_policy(
         network_policies={
             "internal_http": sandbox_pb2.NetworkPolicyRule(
                 name="internal_http",
                 endpoints=[
-                    # No allowed_ips — forward proxy should be denied
+                    # No allowed_ips — but host is a literal IP, so implicit
                     sandbox_pb2.NetworkEndpoint(
                         host=_SANDBOX_IP,
                         port=_FORWARD_PROXY_PORT,
@@ -1419,16 +1438,15 @@ def test_forward_proxy_denied_without_allowed_ips(
     spec = datamodel_pb2.SandboxSpec(policy=policy)
     with sandbox(spec=spec, delete_on_exit=True) as sb:
         result = sb.exec_python(
-            _forward_proxy_raw(),
-            args=(
-                _PROXY_HOST,
-                _PROXY_PORT,
-                f"http://{_SANDBOX_IP}:{_FORWARD_PROXY_PORT}/test",
-            ),
+            _forward_proxy_with_server(),
+            args=(_PROXY_HOST, _PROXY_PORT, _SANDBOX_IP, _FORWARD_PROXY_PORT),
         )
         assert result.exit_code == 0, result.stderr
-        assert "403" in result.stdout, (
-            f"Expected 403 without allowed_ips, got: {result.stdout}"
+        assert "200" in result.stdout, (
+            f"Expected 200 for literal IP host, got: {result.stdout}"
+        )
+        assert "forward-proxy-ok" in result.stdout, (
+            f"Expected response body relayed, got: {result.stdout}"
         )
 
 
@@ -1581,13 +1599,10 @@ def test_forward_proxy_log_fields(
         assert result.exit_code == 0, result.stderr
         log = result.stdout
 
-        assert "FORWARD" in log, "Expected FORWARD log lines"
-        # tracing key-value pairs quote string values: action="allow"
-        assert 'action="allow"' in log, "Expected allowed FORWARD in logs"
-        assert f"dst_host={_SANDBOX_IP}" in log, "Expected dst_host in FORWARD log"
-        assert f"dst_port={_FORWARD_PROXY_PORT}" in log, (
-            "Expected dst_port in FORWARD log"
-        )
+        # OCSF shorthand: FORWARD requests show as HTTP:method events
+        assert "HTTP:" in log, "Expected OCSF HTTP activity event for FORWARD request"
+        assert "ALLOWED" in log, "Expected ALLOWED for forward proxy allow"
+        assert f"{_SANDBOX_IP}" in log, "Expected destination IP in FORWARD log"
 
 
 # =============================================================================
@@ -1824,22 +1839,25 @@ def test_single_port_backwards_compat(
 # Host wildcard tests
 # =============================================================================
 #
-# HW-1: Wildcard *.anthropic.com matches subdomains
-# HW-2: Wildcard *.anthropic.com does NOT match anthropic.com (bare domain)
-# HW-3: Wildcard *.anthropic.com does NOT match deep.sub.anthropic.com
+# HW-1: Wildcard host pattern matches subdomains
+# HW-2: Wildcard host pattern does NOT match the bare domain
+# HW-3: Wildcard host pattern does NOT match deep subdomains
 # =============================================================================
 
 
 def test_host_wildcard_matches_subdomain(
     sandbox: Callable[..., Sandbox],
 ) -> None:
-    """HW-1: *.anthropic.com matches api.anthropic.com."""
+    """HW-1: host wildcard matches single-label subdomains."""
     policy = _base_policy(
         network_policies={
             "wildcard": sandbox_pb2.NetworkPolicyRule(
                 name="wildcard",
                 endpoints=[
-                    sandbox_pb2.NetworkEndpoint(host="*.anthropic.com", port=443),
+                    sandbox_pb2.NetworkEndpoint(
+                        host=_PUBLIC_WILDCARD_PATTERN,
+                        port=443,
+                    ),
                 ],
                 binaries=[sandbox_pb2.NetworkBinary(path="/**")],
             ),
@@ -1847,38 +1865,44 @@ def test_host_wildcard_matches_subdomain(
     )
     spec = datamodel_pb2.SandboxSpec(policy=policy)
     with sandbox(spec=spec, delete_on_exit=True) as sb:
-        # api.anthropic.com -> matches *.anthropic.com
-        result = sb.exec_python(_proxy_connect(), args=("api.anthropic.com", 443))
+        first_subdomain = f"alpha.{_PUBLIC_WILDCARD_SUFFIX}"
+        result = sb.exec_python(_proxy_connect(), args=(first_subdomain, 443))
         assert result.exit_code == 0, result.stderr
         assert "200" in result.stdout, (
-            f"*.anthropic.com should match api.anthropic.com: {result.stdout}"
+            f"{_PUBLIC_WILDCARD_PATTERN} should match {first_subdomain}: "
+            f"{result.stdout}"
         )
 
-        # statsig.anthropic.com -> also matches *.anthropic.com
-        result = sb.exec_python(_proxy_connect(), args=("statsig.anthropic.com", 443))
+        second_subdomain = f"beta.{_PUBLIC_WILDCARD_SUFFIX}"
+        result = sb.exec_python(_proxy_connect(), args=(second_subdomain, 443))
         assert result.exit_code == 0, result.stderr
         assert "200" in result.stdout, (
-            f"*.anthropic.com should match statsig.anthropic.com: {result.stdout}"
+            f"{_PUBLIC_WILDCARD_PATTERN} should match {second_subdomain}: "
+            f"{result.stdout}"
         )
 
-        # example.com -> does NOT match *.anthropic.com
+        # example.com -> does NOT match the wildcard pattern
         result = sb.exec_python(_proxy_connect(), args=("example.com", 443))
         assert result.exit_code == 0, result.stderr
         assert "403" in result.stdout, (
-            f"*.anthropic.com should NOT match example.com: {result.stdout}"
+            f"{_PUBLIC_WILDCARD_PATTERN} should NOT match example.com: "
+            f"{result.stdout}"
         )
 
 
 def test_host_wildcard_rejects_bare_domain(
     sandbox: Callable[..., Sandbox],
 ) -> None:
-    """HW-2: *.anthropic.com does NOT match anthropic.com (requires a subdomain)."""
+    """HW-2: host wildcard does NOT match the bare domain."""
     policy = _base_policy(
         network_policies={
             "wildcard": sandbox_pb2.NetworkPolicyRule(
                 name="wildcard",
                 endpoints=[
-                    sandbox_pb2.NetworkEndpoint(host="*.anthropic.com", port=443),
+                    sandbox_pb2.NetworkEndpoint(
+                        host=_PUBLIC_WILDCARD_PATTERN,
+                        port=443,
+                    ),
                 ],
                 binaries=[sandbox_pb2.NetworkBinary(path="/**")],
             ),
@@ -1886,17 +1910,18 @@ def test_host_wildcard_rejects_bare_domain(
     )
     spec = datamodel_pb2.SandboxSpec(policy=policy)
     with sandbox(spec=spec, delete_on_exit=True) as sb:
-        result = sb.exec_python(_proxy_connect(), args=("anthropic.com", 443))
+        result = sb.exec_python(_proxy_connect(), args=(_PUBLIC_WILDCARD_SUFFIX, 443))
         assert result.exit_code == 0, result.stderr
         assert "403" in result.stdout, (
-            f"*.anthropic.com should NOT match bare anthropic.com: {result.stdout}"
+            f"{_PUBLIC_WILDCARD_PATTERN} should NOT match bare "
+            f"{_PUBLIC_WILDCARD_SUFFIX}: {result.stdout}"
         )
 
 
 def test_host_wildcard_rejects_deep_subdomain(
     sandbox: Callable[..., Sandbox],
 ) -> None:
-    """HW-3: *.anthropic.com does NOT match deep.sub.anthropic.com.
+    """HW-3: host wildcard does NOT match a deep subdomain.
 
     Single * matches one DNS label only (does not cross . boundaries).
     """
@@ -1905,7 +1930,10 @@ def test_host_wildcard_rejects_deep_subdomain(
             "wildcard": sandbox_pb2.NetworkPolicyRule(
                 name="wildcard",
                 endpoints=[
-                    sandbox_pb2.NetworkEndpoint(host="*.anthropic.com", port=443),
+                    sandbox_pb2.NetworkEndpoint(
+                        host=_PUBLIC_WILDCARD_PATTERN,
+                        port=443,
+                    ),
                 ],
                 binaries=[sandbox_pb2.NetworkBinary(path="/**")],
             ),
@@ -1913,8 +1941,111 @@ def test_host_wildcard_rejects_deep_subdomain(
     )
     spec = datamodel_pb2.SandboxSpec(policy=policy)
     with sandbox(spec=spec, delete_on_exit=True) as sb:
-        result = sb.exec_python(_proxy_connect(), args=("deep.sub.anthropic.com", 443))
+        deep_subdomain = f"deep.sub.{_PUBLIC_WILDCARD_SUFFIX}"
+        result = sb.exec_python(_proxy_connect(), args=(deep_subdomain, 443))
         assert result.exit_code == 0, result.stderr
         assert "403" in result.stdout, (
-            f"*.anthropic.com should NOT match deep.sub.anthropic.com: {result.stdout}"
+            f"{_PUBLIC_WILDCARD_PATTERN} should NOT match {deep_subdomain}: "
+            f"{result.stdout}"
+        )
+
+
+# =============================================================================
+# Overlapping policies (duplicate host:port) — regression tests
+# =============================================================================
+
+
+def test_overlapping_policies_do_not_crash_opa(
+    sandbox: Callable[..., Sandbox],
+) -> None:
+    """OVL-1: Two policies covering the same host:port must not crash OPA.
+
+    After a draft rule approval, the merged policy can contain two entries
+    for the same (host, port).  The OPA engine must handle this without
+    a 'duplicated definition of local variable' error.  This test creates
+    the overlap directly to simulate the post-approval state.
+    """
+    policy = _base_policy(
+        network_policies={
+            "user_rule": sandbox_pb2.NetworkPolicyRule(
+                name="user_rule",
+                endpoints=[
+                    sandbox_pb2.NetworkEndpoint(
+                        host=_SANDBOX_IP,
+                        port=_FORWARD_PROXY_PORT,
+                    ),
+                ],
+                binaries=[sandbox_pb2.NetworkBinary(path="/**")],
+            ),
+            "approved_rule": sandbox_pb2.NetworkPolicyRule(
+                name="approved_rule",
+                endpoints=[
+                    sandbox_pb2.NetworkEndpoint(
+                        host=_SANDBOX_IP,
+                        port=_FORWARD_PROXY_PORT,
+                        allowed_ips=["10.200.0.0/24"],
+                    ),
+                ],
+                binaries=[sandbox_pb2.NetworkBinary(path="/**")],
+            ),
+        },
+    )
+    spec = datamodel_pb2.SandboxSpec(policy=policy)
+    with sandbox(spec=spec, delete_on_exit=True) as sb:
+        result = sb.exec_python(
+            _forward_proxy_with_server(),
+            args=(_PROXY_HOST, _PROXY_PORT, _SANDBOX_IP, _FORWARD_PROXY_PORT),
+        )
+        assert result.exit_code == 0, result.stderr
+        assert "200" in result.stdout, (
+            f"Overlapping policies should not crash; expected 200, got: {result.stdout}"
+        )
+
+
+def test_overlapping_policies_l7_connect_does_not_crash(
+    sandbox: Callable[..., Sandbox],
+) -> None:
+    """OVL-2: CONNECT to overlapping L7 policies must not crash OPA.
+
+    Two policies with L7 rules (protocol: rest) covering the same host:port
+    must evaluate without a regorus variable collision error.
+    """
+    policy = _base_policy(
+        network_policies={
+            "user_api": sandbox_pb2.NetworkPolicyRule(
+                name="user_api",
+                endpoints=[
+                    sandbox_pb2.NetworkEndpoint(
+                        host="api.anthropic.com",
+                        port=443,
+                        protocol="rest",
+                        enforcement="enforce",
+                        access="read-only",
+                    ),
+                ],
+                binaries=[sandbox_pb2.NetworkBinary(path="/**")],
+            ),
+            "auto_approved_api": sandbox_pb2.NetworkPolicyRule(
+                name="auto_approved_api",
+                endpoints=[
+                    sandbox_pb2.NetworkEndpoint(
+                        host="api.anthropic.com",
+                        port=443,
+                        protocol="rest",
+                        enforcement="enforce",
+                        access="read-only",
+                    ),
+                ],
+                binaries=[sandbox_pb2.NetworkBinary(path="/**")],
+            ),
+        },
+    )
+    spec = datamodel_pb2.SandboxSpec(policy=policy)
+    with sandbox(spec=spec, delete_on_exit=True) as sb:
+        # CONNECT should succeed at the tunnel level (200 Connection Established)
+        # even with two overlapping L7 policies.
+        result = sb.exec_python(_proxy_connect(), args=("api.anthropic.com", 443))
+        assert result.exit_code == 0, result.stderr
+        assert "200" in result.stdout, (
+            f"Overlapping L7 policies should not crash; expected 200, got: {result.stdout}"
         )

@@ -20,7 +20,7 @@ use std::os::unix::io::RawFd;
 use std::path::PathBuf;
 use std::process::Stdio;
 use tokio::process::{Child, Command};
-use tracing::{debug, warn};
+use tracing::debug;
 
 const SSH_HANDSHAKE_SECRET_ENV: &str = "OPENSHELL_SSH_HANDSHAKE_SECRET";
 
@@ -32,6 +32,51 @@ fn inject_provider_env(cmd: &mut Command, provider_env: &HashMap<String, String>
 
 fn scrub_sensitive_env(cmd: &mut Command) {
     cmd.env_remove(SSH_HANDSHAKE_SECRET_ENV);
+}
+
+#[cfg(unix)]
+#[allow(unsafe_code, clippy::borrow_as_ptr)]
+pub fn harden_child_process() -> Result<()> {
+    let core_limit = libc::rlimit {
+        rlim_cur: 0,
+        rlim_max: 0,
+    };
+    let rc = unsafe { libc::setrlimit(libc::RLIMIT_CORE, &raw const core_limit) };
+    if rc != 0 {
+        return Err(miette::miette!(
+            "Failed to disable core dumps: {}",
+            std::io::Error::last_os_error()
+        ));
+    }
+
+    // Limit process creation to prevent fork bombs. 512 processes per UID is
+    // sufficient for typical agent workloads (shell, compilers, language servers)
+    // while preventing runaway forking. Set as a hard limit so the sandbox user
+    // cannot raise it after privilege drop.
+    let nproc_limit = libc::rlimit {
+        rlim_cur: 512,
+        rlim_max: 512,
+    };
+    let rc = unsafe { libc::setrlimit(libc::RLIMIT_NPROC, &raw const nproc_limit) };
+    if rc != 0 {
+        return Err(miette::miette!(
+            "Failed to set RLIMIT_NPROC: {}",
+            std::io::Error::last_os_error()
+        ));
+    }
+
+    #[cfg(target_os = "linux")]
+    {
+        let rc = unsafe { libc::prctl(libc::PR_SET_DUMPABLE, 0, 0, 0, 0) };
+        if rc != 0 {
+            return Err(miette::miette!(
+                "Failed to set PR_SET_DUMPABLE=0: {}",
+                std::io::Error::last_os_error()
+            ));
+        }
+    }
+
+    Ok(())
 }
 
 /// Handle to a running process.
@@ -154,6 +199,19 @@ impl ProcessHandle {
             }
         }
 
+        // Probe Landlock availability and emit OCSF logs from the parent
+        // process where the tracing subscriber is functional. The child's
+        // pre_exec context cannot reliably emit structured logs.
+        #[cfg(target_os = "linux")]
+        sandbox::linux::log_sandbox_readiness(policy, workdir);
+
+        // Phase 1 (as root): Prepare Landlock ruleset by opening PathFds.
+        // This MUST happen before drop_privileges() so that root-only paths
+        // (e.g. mode 700 directories) can be opened. See issue #803.
+        #[cfg(target_os = "linux")]
+        let prepared_sandbox = sandbox::linux::prepare(policy, workdir)
+            .map_err(|err| miette::miette!("Failed to prepare sandbox: {err}"))?;
+
         // Set up process group for signal handling (non-interactive mode only).
         // In interactive mode, we inherit the parent's process group to maintain
         // proper terminal control for shells and interactive programs.
@@ -161,7 +219,10 @@ impl ProcessHandle {
         // setpgid and setns are async-signal-safe and safe to call in this context.
         {
             let policy = policy.clone();
-            let workdir = workdir.map(str::to_string);
+            // Wrap in Option so we can .take() it out of the FnMut closure.
+            // pre_exec is only called once (after fork, before exec).
+            #[cfg(target_os = "linux")]
+            let mut prepared_sandbox = Some(prepared_sandbox);
             #[allow(unsafe_code)]
             unsafe {
                 cmd.pre_exec(move || {
@@ -178,14 +239,22 @@ impl ProcessHandle {
                         }
                     }
 
-                    // Drop privileges before applying sandbox restrictions.
-                    // initgroups/setgid/setuid need access to /etc/group and /etc/passwd
-                    // which may be blocked by Landlock.
+                    // Drop privileges. initgroups/setgid/setuid need access to
+                    // /etc/group and /etc/passwd which would be blocked if
+                    // Landlock were already enforced.
                     drop_privileges(&policy)
                         .map_err(|err| std::io::Error::other(err.to_string()))?;
 
-                    sandbox::apply(&policy, workdir.as_deref())
-                        .map_err(|err| std::io::Error::other(err.to_string()))?;
+                    harden_child_process().map_err(|err| std::io::Error::other(err.to_string()))?;
+
+                    // Phase 2 (as unprivileged user): Enforce the prepared
+                    // Landlock ruleset via restrict_self() + apply seccomp.
+                    // restrict_self() does not require root.
+                    #[cfg(target_os = "linux")]
+                    if let Some(prepared) = prepared_sandbox.take() {
+                        sandbox::linux::enforce(prepared)
+                            .map_err(|err| std::io::Error::other(err.to_string()))?;
+                    }
 
                     Ok(())
                 });
@@ -270,6 +339,8 @@ impl ProcessHandle {
                     drop_privileges(&policy)
                         .map_err(|err| std::io::Error::other(err.to_string()))?;
 
+                    harden_child_process().map_err(|err| std::io::Error::other(err.to_string()))?;
+
                     sandbox::apply(&policy, workdir.as_deref())
                         .map_err(|err| std::io::Error::other(err.to_string()))?;
 
@@ -325,7 +396,14 @@ impl ProcessHandle {
     pub fn kill(&mut self) -> Result<()> {
         // First try SIGTERM
         if let Err(e) = self.signal(Signal::SIGTERM) {
-            warn!(error = %e, "Failed to send SIGTERM");
+            openshell_ocsf::ocsf_emit!(
+                openshell_ocsf::ProcessActivityBuilder::new(crate::ocsf_ctx())
+                    .activity(openshell_ocsf::ActivityId::Close)
+                    .severity(openshell_ocsf::SeverityId::Medium)
+                    .status(openshell_ocsf::StatusId::Failure)
+                    .message(format!("Failed to send SIGTERM: {e}"))
+                    .build()
+            );
         }
 
         // Give the process a moment to terminate gracefully
@@ -349,7 +427,10 @@ impl Drop for ProcessHandle {
     }
 }
 
+// `effective_gid`/`effective_uid` are intentionally parallel names (same role
+// for different identifiers) and the noise from renaming would obscure intent.
 #[cfg(unix)]
+#[allow(clippy::similar_names)]
 pub fn drop_privileges(policy: &SandboxPolicy) -> Result<()> {
     let user_name = match policy.process.run_as_user.as_deref() {
         Some(name) if !name.is_empty() => Some(name),
@@ -514,6 +595,12 @@ mod tests {
     use crate::policy::{
         FilesystemPolicy, LandlockPolicy, NetworkPolicy, ProcessPolicy, SandboxPolicy,
     };
+    #[cfg(unix)]
+    use nix::sys::wait::{WaitStatus, waitpid};
+    #[cfg(unix)]
+    use nix::unistd::{ForkResult, fork};
+    #[cfg(unix)]
+    use std::mem::size_of;
     use std::process::Stdio as StdStdio;
 
     /// Helper to create a minimal `SandboxPolicy` with the given process policy.
@@ -525,6 +612,17 @@ mod tests {
             landlock: LandlockPolicy::default(),
             process,
         }
+    }
+
+    /// Unknown names may yield `Ok(None)` (`… not found …`) or `Err` when NSS fails first
+    /// (e.g. `ENOENT: No such file or directory`).
+    fn assert_unknown_identity_lookup_failed(msg: &str) {
+        assert!(
+            msg.contains("not found")
+                || msg.contains("ENOENT")
+                || msg.contains("No such file or directory"),
+            "expected unknown user/group lookup failure (…not found… or ENOENT): {msg}"
+        );
     }
 
     #[test]
@@ -559,10 +657,31 @@ mod tests {
     }
 
     #[test]
+    fn drop_privileges_succeeds_for_current_group() {
+        // Set only run_as_group (no run_as_user) so that initgroups() is not
+        // called.  initgroups(3) requires CAP_SETGID/root even when the target
+        // is the current user, so it cannot be exercised without elevated
+        // privileges.  This test covers the setgid() + GID post-condition
+        // verification path without needing root.
+        let current_group = Group::from_gid(nix::unistd::getegid())
+            .expect("getgrgid")
+            .expect("current group entry");
+
+        let policy = policy_with_process(ProcessPolicy {
+            run_as_user: None,
+            run_as_group: Some(current_group.name),
+        });
+
+        assert!(drop_privileges(&policy).is_ok());
+    }
+
+    #[test]
+    #[ignore = "initgroups(3) requires CAP_SETGID; run as root: sudo cargo test -- --ignored"]
     fn drop_privileges_succeeds_for_current_user() {
-        // Resolve the current user's name so we can ask drop_privileges to
-        // "switch" to the user we're already running as.  This exercises the
-        // full verification path (getegid/geteuid checks) without needing root.
+        // Exercises the full privilege-drop path including initgroups(),
+        // setgid(), setuid(), and the root-reacquisition check.  Requires
+        // CAP_SETGID (root) because initgroups(3) calls setgroups(2)
+        // internally.  Fixes: https://github.com/NVIDIA/OpenShell/issues/622
         let current_user = User::from_uid(nix::unistd::geteuid())
             .expect("getpwuid")
             .expect("current user entry");
@@ -588,10 +707,7 @@ mod tests {
         let result = drop_privileges(&policy);
         assert!(result.is_err());
         let msg = format!("{}", result.unwrap_err());
-        assert!(
-            msg.contains("not found"),
-            "expected 'not found' in error: {msg}"
-        );
+        assert_unknown_identity_lookup_failed(&msg);
     }
 
     #[test]
@@ -604,10 +720,88 @@ mod tests {
         let result = drop_privileges(&policy);
         assert!(result.is_err());
         let msg = format!("{}", result.unwrap_err());
-        assert!(
-            msg.contains("not found"),
-            "expected 'not found' in error: {msg}"
+        assert_unknown_identity_lookup_failed(&msg);
+    }
+
+    #[cfg(unix)]
+    #[allow(unsafe_code)]
+    fn probe_hardened_child(probe: unsafe fn() -> i64) -> i64 {
+        const HARDEN_FAILED: i64 = -2;
+
+        let mut fds = [0; 2];
+        let pipe_rc = unsafe { libc::pipe(fds.as_mut_ptr()) };
+        assert_eq!(
+            pipe_rc,
+            0,
+            "pipe failed: {}",
+            std::io::Error::last_os_error()
         );
+
+        match unsafe { fork() }.expect("fork should succeed") {
+            ForkResult::Child => {
+                unsafe { libc::close(fds[0]) };
+                let value = match harden_child_process() {
+                    Ok(()) => unsafe { probe() },
+                    Err(_) => HARDEN_FAILED,
+                };
+                let bytes = value.to_ne_bytes();
+                let written = unsafe { libc::write(fds[1], bytes.as_ptr().cast(), bytes.len()) };
+                unsafe {
+                    libc::close(fds[1]);
+                    libc::_exit(i32::from(written != bytes.len().cast_signed()));
+                }
+            }
+            ForkResult::Parent { child } => {
+                unsafe { libc::close(fds[1]) };
+                let mut bytes = [0u8; size_of::<i64>()];
+                let read = unsafe { libc::read(fds[0], bytes.as_mut_ptr().cast(), bytes.len()) };
+                unsafe { libc::close(fds[0]) };
+                assert_eq!(
+                    read.cast_unsigned(),
+                    bytes.len(),
+                    "expected {} probe bytes, got {}",
+                    bytes.len(),
+                    read
+                );
+
+                match waitpid(child, None).expect("waitpid should succeed") {
+                    WaitStatus::Exited(_, 0) => {}
+                    status => panic!("probe child exited unexpectedly: {status:?}"),
+                }
+
+                i64::from_ne_bytes(bytes)
+            }
+        }
+    }
+
+    #[cfg(unix)]
+    #[allow(unsafe_code)]
+    unsafe fn core_dump_limit_is_zero_probe() -> i64 {
+        let mut limit = std::mem::MaybeUninit::<libc::rlimit>::uninit();
+        let rc = unsafe { libc::getrlimit(libc::RLIMIT_CORE, limit.as_mut_ptr()) };
+        if rc != 0 {
+            return -1;
+        }
+        let limit = unsafe { limit.assume_init() };
+        i64::from(limit.rlim_cur == 0 && limit.rlim_max == 0)
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn harden_child_process_disables_core_dumps() {
+        assert_eq!(probe_hardened_child(core_dump_limit_is_zero_probe), 1);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[allow(unsafe_code)]
+    unsafe fn dumpable_flag_probe() -> i64 {
+        unsafe { i64::from(libc::prctl(libc::PR_GET_DUMPABLE, 0, 0, 0, 0)) }
+    }
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn harden_child_process_marks_process_nondumpable() {
+        assert_eq!(probe_hardened_child(dumpable_flag_probe), 0);
     }
 
     #[tokio::test]

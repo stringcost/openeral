@@ -1,0 +1,56 @@
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+[package]
+name = "openshell-driver-vm"
+description = "MicroVM compute driver for OpenShell"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[lib]
+name = "openshell_driver_vm"
+path = "src/lib.rs"
+
+[[bin]]
+name = "openshell-driver-vm"
+path = "src/main.rs"
+
+[dependencies]
+openshell-core = { path = "../openshell-core" }
+openshell-vfio = { path = "../openshell-vfio" }
+
+bollard = { version = "0.20", features = ["ssh"] }
+tokio = { workspace = true }
+tonic = { workspace = true, features = ["transport"] }
+prost-types = { workspace = true }
+futures = { workspace = true }
+tokio-stream = { workspace = true, features = ["net"] }
+nix = { workspace = true }
+clap = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+miette = { workspace = true }
+url = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+oci-client = "0.16"
+libc = "0.2"
+libloading = "0.8"
+tar = "0.4"
+flate2 = "1"
+sha2 = "0.10"
+zstd = "0.13"
+
+# smol-rs/polling drives the BSD/macOS parent-death detection in
+# procguard via kqueue's EVFILT_PROC / NOTE_EXIT filter. We could use
+# it on Linux too (via epoll + pidfd) but sticking with
+# nix::sys::prctl::set_pdeathsig there keeps the Linux path a single
+# syscall with no helper thread.
+[target.'cfg(any(target_os = "macos", target_os = "ios", target_os = "freebsd", target_os = "netbsd", target_os = "openbsd", target_os = "dragonfly"))'.dependencies]
+polling = "3.11"
+
+[lints]
+workspace = true

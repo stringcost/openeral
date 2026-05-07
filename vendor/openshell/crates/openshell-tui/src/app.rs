@@ -6,6 +6,8 @@ use std::time::{Duration, Instant};
 
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use openshell_core::proto::open_shell_client::OpenShellClient;
+use openshell_core::proto::setting_value;
+use openshell_core::settings::{self, SettingValueKind};
 use tonic::transport::Channel;
 
 // ---------------------------------------------------------------------------
@@ -81,6 +83,128 @@ impl LogSourceFilter {
             Self::Gateway => "gateway",
             Self::Sandbox => "sandbox",
         }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Middle pane tab (Providers vs Global Settings)
+// ---------------------------------------------------------------------------
+
+/// Which tab is active in the middle pane of the dashboard.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MiddlePaneTab {
+    Providers,
+    GlobalSettings,
+}
+
+impl MiddlePaneTab {
+    pub fn next(self) -> Self {
+        match self {
+            Self::Providers => Self::GlobalSettings,
+            Self::GlobalSettings => Self::Providers,
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Global settings model
+// ---------------------------------------------------------------------------
+
+/// A single global setting entry for display in the TUI.
+#[derive(Debug, Clone)]
+pub struct GlobalSettingEntry {
+    pub key: String,
+    pub kind: SettingValueKind,
+    pub value: Option<setting_value::Value>,
+}
+
+impl GlobalSettingEntry {
+    pub fn display_value(&self) -> String {
+        display_setting_value(&self.value)
+    }
+}
+
+/// Editing state for a global or sandbox setting.
+#[derive(Debug, Clone)]
+pub struct SettingEditState {
+    /// Index into the settings list being edited.
+    pub index: usize,
+    /// Text buffer for string/int types.
+    pub input: String,
+    /// Validation error to display.
+    pub error: Option<String>,
+}
+
+// ---------------------------------------------------------------------------
+// Sandbox policy pane tab (Policy vs Settings)
+// ---------------------------------------------------------------------------
+
+/// Which tab is active in the bottom pane of the sandbox screen (when
+/// `Focus::SandboxPolicy`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SandboxPolicyTab {
+    Policy,
+    Settings,
+}
+
+impl SandboxPolicyTab {
+    pub fn next(self) -> Self {
+        match self {
+            Self::Policy => Self::Settings,
+            Self::Settings => Self::Policy,
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Sandbox setting entry (effective, with scope)
+// ---------------------------------------------------------------------------
+
+/// A single effective setting for a sandbox, with scope indicator.
+#[derive(Debug, Clone)]
+pub struct SandboxSettingEntry {
+    pub key: String,
+    pub kind: SettingValueKind,
+    pub value: Option<setting_value::Value>,
+    pub scope: SettingScope,
+}
+
+/// The scope a sandbox setting was resolved from.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SettingScope {
+    Unset,
+    Sandbox,
+    Global,
+}
+
+impl SettingScope {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Unset => "unset",
+            Self::Sandbox => "sandbox",
+            Self::Global => "global",
+        }
+    }
+}
+
+impl SandboxSettingEntry {
+    pub fn display_value(&self) -> String {
+        display_setting_value(&self.value)
+    }
+
+    pub fn is_globally_managed(&self) -> bool {
+        self.scope == SettingScope::Global
+    }
+}
+
+/// Format a proto `SettingValue` for display.
+pub fn display_setting_value(value: &Option<setting_value::Value>) -> String {
+    match value {
+        None => "<unset>".to_string(),
+        Some(setting_value::Value::StringValue(v)) => v.clone(),
+        Some(setting_value::Value::BoolValue(v)) => v.to_string(),
+        Some(setting_value::Value::IntValue(v)) => v.to_string(),
+        Some(setting_value::Value::BytesValue(_)) => "<bytes>".to_string(),
     }
 }
 
@@ -235,7 +359,7 @@ pub struct CreateProviderForm {
     pub is_generic: bool,
     /// Status message (errors, validation).
     pub status: Option<String>,
-    /// Warning shown at top of EnterKey modal (e.g. autodetect failure).
+    /// Warning shown at top of `EnterKey` modal (e.g. autodetect failure).
     pub warning: Option<String>,
     /// Animation start time.
     pub anim_start: Option<Instant>,
@@ -304,6 +428,23 @@ pub struct App {
     pub provider_selected: usize,
     pub provider_count: usize,
 
+    // Middle pane tab (providers vs global settings)
+    pub middle_pane_tab: MiddlePaneTab,
+
+    // Global policy indicator (dashboard)
+    pub global_policy_active: bool,
+    pub global_policy_version: u32,
+
+    // Global settings
+    pub global_settings: Vec<GlobalSettingEntry>,
+    pub global_settings_selected: usize,
+    pub global_settings_revision: u64,
+    pub setting_edit: Option<SettingEditState>,
+    pub confirm_setting_set: Option<usize>,
+    pub confirm_setting_delete: Option<usize>,
+    pub pending_setting_set: bool,
+    pub pending_setting_delete: bool,
+
     // Provider CRUD
     pub create_provider_form: Option<CreateProviderForm>,
     pub provider_detail: Option<ProviderDetailView>,
@@ -322,6 +463,8 @@ pub struct App {
     pub sandbox_created: Vec<String>,
     pub sandbox_images: Vec<String>,
     pub sandbox_notes: Vec<String>,
+    /// Formatted labels for each sandbox (e.g., "env=prod,team=platform" or empty string).
+    pub sandbox_labels: Vec<String>,
     pub sandbox_policy_versions: Vec<u32>,
     pub sandbox_selected: usize,
     pub sandbox_count: usize,
@@ -332,6 +475,18 @@ pub struct App {
     pub pending_sandbox_delete: bool,
     pub pending_sandbox_detail: bool,
     pub pending_shell_connect: bool,
+
+    // Sandbox policy pane tab + sandbox settings
+    pub sandbox_policy_tab: SandboxPolicyTab,
+    pub sandbox_policy_is_global: bool,
+    pub sandbox_global_policy_version: u32,
+    pub sandbox_settings: Vec<SandboxSettingEntry>,
+    pub sandbox_settings_selected: usize,
+    pub sandbox_setting_edit: Option<SettingEditState>,
+    pub sandbox_confirm_setting_set: Option<usize>,
+    pub sandbox_confirm_setting_delete: Option<usize>,
+    pub pending_sandbox_setting_set: bool,
+    pub pending_sandbox_setting_delete: bool,
 
     // Sandbox policy viewer
     pub sandbox_policy: Option<openshell_core::proto::SandboxPolicy>,
@@ -391,7 +546,39 @@ pub struct App {
     pub approve_all_confirm_chunks: Vec<openshell_core::proto::PolicyChunk>,
 }
 
+// ---------------------------------------------------------------------------
+// Label formatting utilities
+// ---------------------------------------------------------------------------
+
+/// Sanitize a string for safe terminal display by filtering control characters.
+///
+/// Removes all control characters except newlines to prevent ANSI escape
+/// sequences or other terminal manipulation.
+fn sanitize_for_display(s: &str) -> String {
+    s.chars()
+        .filter(|c| !c.is_control() || *c == '\n')
+        .collect()
+}
+
+/// Format object labels as a comma-separated key=value string.
+///
+/// Labels are sorted by key for deterministic output. Returns an empty string
+/// if the map is empty. Values are sanitized to prevent terminal escape sequences.
+pub fn format_labels(labels: &HashMap<String, String>) -> String {
+    if labels.is_empty() {
+        return String::new();
+    }
+    let mut sorted: Vec<_> = labels.iter().collect();
+    sorted.sort_by_key(|(k, _)| *k);
+    sorted
+        .iter()
+        .map(|(k, v)| format!("{}={}", sanitize_for_display(k), sanitize_for_display(v)))
+        .collect::<Vec<_>>()
+        .join(",")
+}
+
 impl App {
+    #[allow(clippy::large_types_passed_by_value)] // Theme is Copy; one-shot ctor
     pub fn new(
         client: OpenShellClient<Channel>,
         gateway_name: String,
@@ -413,6 +600,17 @@ impl App {
             gateways: Vec::new(),
             gateway_selected: 0,
             pending_gateway_switch: None,
+            middle_pane_tab: MiddlePaneTab::Providers,
+            global_policy_active: false,
+            global_policy_version: 0,
+            global_settings: Vec::new(),
+            global_settings_selected: 0,
+            global_settings_revision: 0,
+            setting_edit: None,
+            confirm_setting_set: None,
+            confirm_setting_delete: None,
+            pending_setting_set: false,
+            pending_setting_delete: false,
             provider_names: Vec::new(),
             provider_types: Vec::new(),
             provider_cred_keys: Vec::new(),
@@ -433,6 +631,7 @@ impl App {
             sandbox_created: Vec::new(),
             sandbox_images: Vec::new(),
             sandbox_notes: Vec::new(),
+            sandbox_labels: Vec::new(),
             sandbox_policy_versions: Vec::new(),
             sandbox_selected: 0,
             sandbox_count: 0,
@@ -441,6 +640,16 @@ impl App {
             pending_sandbox_delete: false,
             pending_sandbox_detail: false,
             pending_shell_connect: false,
+            sandbox_policy_tab: SandboxPolicyTab::Policy,
+            sandbox_policy_is_global: false,
+            sandbox_global_policy_version: 0,
+            sandbox_settings: Vec::new(),
+            sandbox_settings_selected: 0,
+            sandbox_setting_edit: None,
+            sandbox_confirm_setting_set: None,
+            sandbox_confirm_setting_delete: None,
+            pending_sandbox_setting_set: false,
+            pending_sandbox_setting_delete: false,
             sandbox_policy: None,
             sandbox_providers_list: Vec::new(),
             policy_lines: Vec::new(),
@@ -477,6 +686,66 @@ impl App {
     // ------------------------------------------------------------------
     // Filtered log helpers
     // ------------------------------------------------------------------
+
+    /// Apply fetched global settings from the `GetGatewayConfig` response.
+    pub fn apply_global_settings(
+        &mut self,
+        settings: HashMap<String, openshell_core::proto::SettingValue>,
+        revision: u64,
+    ) {
+        self.global_settings_revision = revision;
+        self.global_settings = settings::REGISTERED_SETTINGS
+            .iter()
+            .map(|reg| {
+                let value = settings.get(reg.key).and_then(|sv| sv.value.clone());
+                GlobalSettingEntry {
+                    key: reg.key.to_string(),
+                    kind: reg.kind,
+                    value,
+                }
+            })
+            .collect();
+        if self.global_settings_selected >= self.global_settings.len()
+            && !self.global_settings.is_empty()
+        {
+            self.global_settings_selected = self.global_settings.len() - 1;
+        }
+    }
+
+    /// Apply fetched sandbox settings from the `GetSandboxConfig` response.
+    pub fn apply_sandbox_settings(
+        &mut self,
+        settings: HashMap<String, openshell_core::proto::EffectiveSetting>,
+    ) {
+        self.sandbox_settings = settings::REGISTERED_SETTINGS
+            .iter()
+            .map(|reg| {
+                let (value, scope) =
+                    settings
+                        .get(reg.key)
+                        .map_or((None, SettingScope::Unset), |es| {
+                            let v = es.value.as_ref().and_then(|sv| sv.value.clone());
+                            let s = match es.scope {
+                                1 => SettingScope::Sandbox,
+                                2 => SettingScope::Global,
+                                _ => SettingScope::Unset,
+                            };
+                            (v, s)
+                        });
+                SandboxSettingEntry {
+                    key: reg.key.to_string(),
+                    kind: reg.kind,
+                    value,
+                    scope,
+                }
+            })
+            .collect();
+        if self.sandbox_settings_selected >= self.sandbox_settings.len()
+            && !self.sandbox_settings.is_empty()
+        {
+            self.sandbox_settings_selected = self.sandbox_settings.len() - 1;
+        }
+    }
 
     /// Return log lines matching the current source filter.
     pub fn filtered_log_lines(&self) -> Vec<&LogLine> {
@@ -515,6 +784,32 @@ impl App {
         }
 
         // Modals intercept all keys when open.
+        // Confirmation modals take priority over the edit overlay since the
+        // edit state remains set while the confirm dialog is shown.
+        if self.confirm_setting_set.is_some() {
+            self.handle_setting_confirm_set_key(key);
+            return;
+        }
+        if self.confirm_setting_delete.is_some() {
+            self.handle_setting_confirm_delete_key(key);
+            return;
+        }
+        if self.sandbox_confirm_setting_set.is_some() {
+            self.handle_sandbox_setting_confirm_set_key(key);
+            return;
+        }
+        if self.sandbox_confirm_setting_delete.is_some() {
+            self.handle_sandbox_setting_confirm_delete_key(key);
+            return;
+        }
+        if self.sandbox_setting_edit.is_some() {
+            self.handle_sandbox_setting_edit_key(key);
+            return;
+        }
+        if self.setting_edit.is_some() {
+            self.handle_setting_edit_key(key);
+            return;
+        }
         if self.create_form.is_some() {
             self.handle_create_form_key(key);
             return;
@@ -541,7 +836,13 @@ impl App {
     fn handle_normal_key(&mut self, key: KeyEvent) {
         match self.focus {
             Focus::Gateways => self.handle_gateways_key(key),
-            Focus::Providers => self.handle_providers_key(key),
+            Focus::Providers => {
+                if self.middle_pane_tab == MiddlePaneTab::GlobalSettings {
+                    self.handle_global_settings_key(key);
+                } else {
+                    self.handle_providers_key(key);
+                }
+            }
             Focus::Sandboxes => self.handle_sandboxes_key(key),
             Focus::SandboxPolicy => self.handle_policy_key(key),
             Focus::SandboxLogs => self.handle_logs_key(key),
@@ -558,11 +859,8 @@ impl App {
                 self.input_mode = InputMode::Command;
                 self.command_input.clear();
             }
-            KeyCode::Char('j') | KeyCode::Down => {
-                if !self.gateways.is_empty() {
-                    self.gateway_selected =
-                        (self.gateway_selected + 1).min(self.gateways.len() - 1);
-                }
+            KeyCode::Char('j') | KeyCode::Down if !self.gateways.is_empty() => {
+                self.gateway_selected = (self.gateway_selected + 1).min(self.gateways.len() - 1);
             }
             KeyCode::Char('k') | KeyCode::Up => {
                 self.gateway_selected = self.gateway_selected.saturating_sub(1);
@@ -602,11 +900,8 @@ impl App {
                 self.input_mode = InputMode::Command;
                 self.command_input.clear();
             }
-            KeyCode::Char('j') | KeyCode::Down => {
-                if self.provider_count > 0 {
-                    self.provider_selected =
-                        (self.provider_selected + 1).min(self.provider_count - 1);
-                }
+            KeyCode::Char('j') | KeyCode::Down if self.provider_count > 0 => {
+                self.provider_selected = (self.provider_selected + 1).min(self.provider_count - 1);
             }
             KeyCode::Char('k') | KeyCode::Up => {
                 self.provider_selected = self.provider_selected.saturating_sub(1);
@@ -614,22 +909,152 @@ impl App {
             KeyCode::Char('c') => {
                 self.open_create_provider_form();
             }
-            KeyCode::Enter => {
-                // Fetch and show provider detail.
-                if self.provider_count > 0 {
-                    self.pending_provider_get = true;
-                }
+            // Fetch and show provider detail.
+            KeyCode::Enter if self.provider_count > 0 => {
+                self.pending_provider_get = true;
             }
-            KeyCode::Char('u') => {
-                // Open update form for the selected provider.
-                if self.provider_count > 0 {
-                    self.open_update_provider_form();
+            // Open update form for the selected provider.
+            KeyCode::Char('u') if self.provider_count > 0 => {
+                self.open_update_provider_form();
+            }
+            KeyCode::Char('d') if self.provider_count > 0 => {
+                self.confirm_provider_delete = true;
+            }
+            KeyCode::Char('h' | 'l') | KeyCode::Left | KeyCode::Right => {
+                self.middle_pane_tab = self.middle_pane_tab.next();
+            }
+            _ => {}
+        }
+    }
+
+    fn handle_global_settings_key(&mut self, key: KeyEvent) {
+        match key.code {
+            KeyCode::Char('q') => self.running = false,
+            KeyCode::Tab => self.focus = Focus::Sandboxes,
+            KeyCode::BackTab => self.focus = Focus::Gateways,
+            KeyCode::Char(':') => {
+                self.input_mode = InputMode::Command;
+                self.command_input.clear();
+            }
+            KeyCode::Char('j') | KeyCode::Down if !self.global_settings.is_empty() => {
+                self.global_settings_selected =
+                    (self.global_settings_selected + 1).min(self.global_settings.len() - 1);
+            }
+            KeyCode::Char('k') | KeyCode::Up => {
+                self.global_settings_selected = self.global_settings_selected.saturating_sub(1);
+            }
+            KeyCode::Char('h' | 'l') | KeyCode::Left | KeyCode::Right => {
+                self.middle_pane_tab = self.middle_pane_tab.next();
+            }
+            KeyCode::Enter => {
+                // Open edit for the selected setting.
+                if let Some(entry) = self.global_settings.get(self.global_settings_selected) {
+                    if entry.kind == SettingValueKind::Bool {
+                        // Toggle bool inline and go straight to confirmation.
+                        let new_val = match &entry.value {
+                            Some(setting_value::Value::BoolValue(v)) => !v,
+                            _ => true,
+                        };
+                        self.setting_edit = Some(SettingEditState {
+                            index: self.global_settings_selected,
+                            input: new_val.to_string(),
+                            error: None,
+                        });
+                        self.confirm_setting_set = Some(self.global_settings_selected);
+                    } else {
+                        // Open text editor.
+                        let current = entry.display_value();
+                        let input = if current == "<unset>" {
+                            String::new()
+                        } else {
+                            current
+                        };
+                        self.setting_edit = Some(SettingEditState {
+                            index: self.global_settings_selected,
+                            input,
+                            error: None,
+                        });
+                    }
                 }
             }
             KeyCode::Char('d') => {
-                if self.provider_count > 0 {
-                    self.confirm_provider_delete = true;
+                // Delete the selected global setting (only if it has a value).
+                if let Some(entry) = self.global_settings.get(self.global_settings_selected)
+                    && entry.value.is_some()
+                {
+                    self.confirm_setting_delete = Some(self.global_settings_selected);
                 }
+            }
+            _ => {}
+        }
+    }
+
+    fn handle_setting_edit_key(&mut self, key: KeyEvent) {
+        let Some(ref mut edit) = self.setting_edit else {
+            return;
+        };
+        match key.code {
+            KeyCode::Esc => {
+                self.setting_edit = None;
+            }
+            KeyCode::Enter => {
+                // Validate then open confirmation.
+                let idx = edit.index;
+                if let Some(entry) = self.global_settings.get(idx) {
+                    let raw = edit.input.trim();
+                    match entry.kind {
+                        SettingValueKind::Int => {
+                            if raw.parse::<i64>().is_err() {
+                                edit.error = Some("expected integer".to_string());
+                                return;
+                            }
+                        }
+                        SettingValueKind::Bool => {
+                            if settings::parse_bool_like(raw).is_none() {
+                                edit.error = Some("expected true/false/yes/no/1/0".to_string());
+                                return;
+                            }
+                        }
+                        SettingValueKind::String => {}
+                    }
+                }
+                edit.error = None;
+                self.confirm_setting_set = Some(idx);
+            }
+            KeyCode::Backspace => {
+                edit.input.pop();
+                edit.error = None;
+            }
+            KeyCode::Char(c) => {
+                edit.input.push(c);
+                edit.error = None;
+            }
+            _ => {}
+        }
+    }
+
+    fn handle_setting_confirm_set_key(&mut self, key: KeyEvent) {
+        match key.code {
+            KeyCode::Char('y') | KeyCode::Enter => {
+                self.pending_setting_set = true;
+                self.confirm_setting_set = None;
+            }
+            KeyCode::Esc | KeyCode::Char('n') => {
+                self.confirm_setting_set = None;
+                self.setting_edit = None;
+            }
+            _ => {}
+        }
+    }
+
+    fn handle_setting_confirm_delete_key(&mut self, key: KeyEvent) {
+        match key.code {
+            KeyCode::Char('y') | KeyCode::Enter => {
+                self.pending_setting_delete = true;
+                self.confirm_setting_delete = None;
+            }
+            KeyCode::Esc | KeyCode::Char('n') => {
+                self.confirm_setting_delete = None;
             }
             _ => {}
         }
@@ -644,10 +1069,8 @@ impl App {
                 self.input_mode = InputMode::Command;
                 self.command_input.clear();
             }
-            KeyCode::Char('j') | KeyCode::Down => {
-                if self.sandbox_count > 0 {
-                    self.sandbox_selected = (self.sandbox_selected + 1).min(self.sandbox_count - 1);
-                }
+            KeyCode::Char('j') | KeyCode::Down if self.sandbox_count > 0 => {
+                self.sandbox_selected = (self.sandbox_selected + 1).min(self.sandbox_count - 1);
             }
             KeyCode::Char('k') | KeyCode::Up => {
                 self.sandbox_selected = self.sandbox_selected.saturating_sub(1);
@@ -655,13 +1078,11 @@ impl App {
             KeyCode::Char('c') => {
                 self.open_create_form();
             }
-            KeyCode::Enter => {
-                if self.sandbox_count > 0 {
-                    self.screen = Screen::Sandbox;
-                    self.focus = Focus::SandboxPolicy;
-                    self.confirm_delete = false;
-                    self.pending_sandbox_detail = true;
-                }
+            KeyCode::Enter if self.sandbox_count > 0 => {
+                self.screen = Screen::Sandbox;
+                self.focus = Focus::SandboxPolicy;
+                self.confirm_delete = false;
+                self.pending_sandbox_detail = true;
             }
             KeyCode::Esc => {
                 self.focus = Focus::Providers;
@@ -685,10 +1106,17 @@ impl App {
             return;
         }
 
+        // Dispatch to sandbox settings handler when on the Settings tab.
+        if self.sandbox_policy_tab == SandboxPolicyTab::Settings {
+            self.handle_sandbox_settings_key(key);
+            return;
+        }
+
         match key.code {
             KeyCode::Esc => {
                 self.cancel_log_stream();
                 self.draft_detail_open = false;
+                self.sandbox_policy_tab = SandboxPolicyTab::Policy;
                 self.screen = Screen::Dashboard;
                 self.focus = Focus::Sandboxes;
             }
@@ -705,10 +1133,8 @@ impl App {
             KeyCode::Char('r') => {
                 self.focus = Focus::SandboxDraft;
             }
-            KeyCode::Char('s') => {
-                if self.sandbox_count > 0 {
-                    self.pending_shell_connect = true;
-                }
+            KeyCode::Char('s') if self.sandbox_count > 0 => {
+                self.pending_shell_connect = true;
             }
             KeyCode::Char('d') => {
                 self.confirm_delete = true;
@@ -727,6 +1153,153 @@ impl App {
                 self.policy_scroll = 0;
             }
             KeyCode::Char('q') => self.running = false,
+            KeyCode::Char('h') | KeyCode::Left | KeyCode::Right => {
+                self.sandbox_policy_tab = self.sandbox_policy_tab.next();
+            }
+            _ => {}
+        }
+    }
+
+    fn handle_sandbox_settings_key(&mut self, key: KeyEvent) {
+        match key.code {
+            KeyCode::Char('q') => self.running = false,
+            KeyCode::Esc => {
+                self.cancel_log_stream();
+                self.sandbox_policy_tab = SandboxPolicyTab::Policy;
+                self.screen = Screen::Dashboard;
+                self.focus = Focus::Sandboxes;
+            }
+            KeyCode::Char('h') | KeyCode::Left | KeyCode::Right => {
+                self.sandbox_policy_tab = self.sandbox_policy_tab.next();
+            }
+            KeyCode::Char('l') => {
+                // In policy tab, 'l' opens logs. In settings tab, switch tab.
+                self.sandbox_policy_tab = self.sandbox_policy_tab.next();
+            }
+            KeyCode::Char('j') | KeyCode::Down if !self.sandbox_settings.is_empty() => {
+                self.sandbox_settings_selected =
+                    (self.sandbox_settings_selected + 1).min(self.sandbox_settings.len() - 1);
+            }
+            KeyCode::Char('k') | KeyCode::Up => {
+                self.sandbox_settings_selected = self.sandbox_settings_selected.saturating_sub(1);
+            }
+            KeyCode::Enter => {
+                if let Some(entry) = self.sandbox_settings.get(self.sandbox_settings_selected) {
+                    if entry.is_globally_managed() {
+                        self.status_text = format!(
+                            "'{}' is managed globally -- delete the global setting first",
+                            entry.key
+                        );
+                        return;
+                    }
+                    if entry.kind == SettingValueKind::Bool {
+                        let new_val = match &entry.value {
+                            Some(setting_value::Value::BoolValue(v)) => !v,
+                            _ => true,
+                        };
+                        self.sandbox_setting_edit = Some(SettingEditState {
+                            index: self.sandbox_settings_selected,
+                            input: new_val.to_string(),
+                            error: None,
+                        });
+                        self.sandbox_confirm_setting_set = Some(self.sandbox_settings_selected);
+                    } else {
+                        let current = entry.display_value();
+                        let input = if current == "<unset>" {
+                            String::new()
+                        } else {
+                            current
+                        };
+                        self.sandbox_setting_edit = Some(SettingEditState {
+                            index: self.sandbox_settings_selected,
+                            input,
+                            error: None,
+                        });
+                    }
+                }
+            }
+            KeyCode::Char('d') => {
+                if let Some(entry) = self.sandbox_settings.get(self.sandbox_settings_selected) {
+                    if entry.is_globally_managed() {
+                        self.status_text = format!(
+                            "'{}' is managed globally -- delete the global setting first",
+                            entry.key
+                        );
+                    } else if entry.value.is_some() {
+                        self.sandbox_confirm_setting_delete = Some(self.sandbox_settings_selected);
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+
+    fn handle_sandbox_setting_edit_key(&mut self, key: KeyEvent) {
+        let Some(ref mut edit) = self.sandbox_setting_edit else {
+            return;
+        };
+        match key.code {
+            KeyCode::Esc => {
+                self.sandbox_setting_edit = None;
+            }
+            KeyCode::Enter => {
+                let idx = edit.index;
+                if let Some(entry) = self.sandbox_settings.get(idx) {
+                    let raw = edit.input.trim();
+                    match entry.kind {
+                        SettingValueKind::Int => {
+                            if raw.parse::<i64>().is_err() {
+                                edit.error = Some("expected integer".to_string());
+                                return;
+                            }
+                        }
+                        SettingValueKind::Bool => {
+                            if settings::parse_bool_like(raw).is_none() {
+                                edit.error = Some("expected true/false/yes/no/1/0".to_string());
+                                return;
+                            }
+                        }
+                        SettingValueKind::String => {}
+                    }
+                }
+                edit.error = None;
+                self.sandbox_confirm_setting_set = Some(edit.index);
+            }
+            KeyCode::Backspace => {
+                edit.input.pop();
+                edit.error = None;
+            }
+            KeyCode::Char(c) => {
+                edit.input.push(c);
+                edit.error = None;
+            }
+            _ => {}
+        }
+    }
+
+    fn handle_sandbox_setting_confirm_set_key(&mut self, key: KeyEvent) {
+        match key.code {
+            KeyCode::Char('y') | KeyCode::Enter => {
+                self.pending_sandbox_setting_set = true;
+                self.sandbox_confirm_setting_set = None;
+            }
+            KeyCode::Esc | KeyCode::Char('n') => {
+                self.sandbox_confirm_setting_set = None;
+                self.sandbox_setting_edit = None;
+            }
+            _ => {}
+        }
+    }
+
+    fn handle_sandbox_setting_confirm_delete_key(&mut self, key: KeyEvent) {
+        match key.code {
+            KeyCode::Char('y') | KeyCode::Enter => {
+                self.pending_sandbox_setting_delete = true;
+                self.sandbox_confirm_setting_delete = None;
+            }
+            KeyCode::Esc | KeyCode::Char('n') => {
+                self.sandbox_confirm_setting_delete = None;
+            }
             _ => {}
         }
     }
@@ -758,22 +1331,32 @@ impl App {
                 }
                 // Allow approve/reject toggle from within the popup.
                 KeyCode::Char('a') => {
-                    let abs = self.draft_scroll + self.draft_selected;
-                    if abs < self.draft_chunks.len() {
-                        let st = self.draft_chunks[abs].status.as_str();
-                        if st == "pending" || st == "rejected" {
-                            self.pending_draft_approve = true;
-                            self.draft_detail_open = false;
+                    if self.sandbox_policy_is_global {
+                        self.status_text =
+                            "Cannot approve rules while a global policy is active".to_string();
+                    } else {
+                        let abs = self.draft_scroll + self.draft_selected;
+                        if abs < self.draft_chunks.len() {
+                            let st = self.draft_chunks[abs].status.as_str();
+                            if st == "pending" || st == "rejected" {
+                                self.pending_draft_approve = true;
+                                self.draft_detail_open = false;
+                            }
                         }
                     }
                 }
                 KeyCode::Char('x') => {
-                    let abs = self.draft_scroll + self.draft_selected;
-                    if abs < self.draft_chunks.len() {
-                        let st = self.draft_chunks[abs].status.as_str();
-                        if st == "pending" || st == "approved" {
-                            self.pending_draft_reject = true;
-                            self.draft_detail_open = false;
+                    if self.sandbox_policy_is_global {
+                        self.status_text =
+                            "Cannot modify rules while a global policy is active".to_string();
+                    } else {
+                        let abs = self.draft_scroll + self.draft_selected;
+                        if abs < self.draft_chunks.len() {
+                            let st = self.draft_chunks[abs].status.as_str();
+                            if st == "pending" || st == "approved" {
+                                self.pending_draft_reject = true;
+                                self.draft_detail_open = false;
+                            }
                         }
                     }
                 }
@@ -800,10 +1383,8 @@ impl App {
                 self.focus = Focus::SandboxLogs;
                 self.pending_log_fetch = true;
             }
-            KeyCode::Enter => {
-                if !self.draft_chunks.is_empty() {
-                    self.draft_detail_open = true;
-                }
+            KeyCode::Enter if !self.draft_chunks.is_empty() => {
+                self.draft_detail_open = true;
             }
             KeyCode::Char('j') | KeyCode::Down => {
                 if total == 0 {
@@ -831,17 +1412,18 @@ impl App {
                 self.draft_scroll = 0;
                 self.draft_selected = 0;
             }
-            KeyCode::Char('G') => {
-                if total > 0 {
-                    let max_scroll = total.saturating_sub(vh.min(total));
-                    self.draft_scroll = max_scroll;
-                    let visible = total.saturating_sub(self.draft_scroll).min(vh);
-                    self.draft_selected = visible.saturating_sub(1);
-                }
+            KeyCode::Char('G') if total > 0 => {
+                let max_scroll = total.saturating_sub(vh.min(total));
+                self.draft_scroll = max_scroll;
+                let visible = total.saturating_sub(self.draft_scroll).min(vh);
+                self.draft_selected = visible.saturating_sub(1);
             }
             // Approve selected chunk (pending → approved, rejected → approved).
             KeyCode::Char('a') => {
-                if !self.draft_chunks.is_empty() {
+                if self.sandbox_policy_is_global {
+                    self.status_text =
+                        "Cannot approve rules while a global policy is active".to_string();
+                } else if !self.draft_chunks.is_empty() {
                     let abs = self.draft_scroll + self.draft_selected;
                     if abs < total {
                         let st = self.draft_chunks[abs].status.as_str();
@@ -853,7 +1435,10 @@ impl App {
             }
             // Reject selected chunk (pending → rejected, approved → rejected).
             KeyCode::Char('x') => {
-                if !self.draft_chunks.is_empty() {
+                if self.sandbox_policy_is_global {
+                    self.status_text =
+                        "Cannot modify rules while a global policy is active".to_string();
+                } else if !self.draft_chunks.is_empty() {
                     let abs = self.draft_scroll + self.draft_selected;
                     if abs < total {
                         let st = self.draft_chunks[abs].status.as_str();
@@ -865,15 +1450,20 @@ impl App {
             }
             // Approve all pending chunks — show confirmation modal.
             KeyCode::Char('A') => {
-                let pending: Vec<_> = self
-                    .draft_chunks
-                    .iter()
-                    .filter(|c| c.status == "pending")
-                    .cloned()
-                    .collect();
-                if !pending.is_empty() {
-                    self.approve_all_confirm_chunks = pending;
-                    self.approve_all_confirm_open = true;
+                if self.sandbox_policy_is_global {
+                    self.status_text =
+                        "Cannot approve rules while a global policy is active".to_string();
+                } else {
+                    let pending: Vec<_> = self
+                        .draft_chunks
+                        .iter()
+                        .filter(|c| c.status == "pending")
+                        .cloned()
+                        .collect();
+                    if !pending.is_empty() {
+                        self.approve_all_confirm_chunks = pending;
+                        self.approve_all_confirm_open = true;
+                    }
                 }
             }
             KeyCode::Char('q') => self.running = false,
@@ -971,12 +1561,10 @@ impl App {
                     self.log_autoscroll = false;
                 }
             }
-            KeyCode::Enter => {
-                if filtered_len > 0 && self.log_selection_anchor.is_none() {
-                    let abs = self.sandbox_log_scroll + self.log_cursor;
-                    if abs < filtered_len {
-                        self.log_detail_index = Some(abs);
-                    }
+            KeyCode::Enter if filtered_len > 0 && self.log_selection_anchor.is_none() => {
+                let abs = self.sandbox_log_scroll + self.log_cursor;
+                if abs < filtered_len {
+                    self.log_detail_index = Some(abs);
                 }
             }
             KeyCode::Char('j') | KeyCode::Down => {
@@ -1040,7 +1628,8 @@ impl App {
             self.sandbox_log_scroll = self.sandbox_log_scroll.saturating_sub(delta.unsigned_abs());
             self.log_autoscroll = false;
         } else {
-            self.sandbox_log_scroll = (self.sandbox_log_scroll + delta as usize).min(max_scroll);
+            self.sandbox_log_scroll =
+                (self.sandbox_log_scroll + delta.cast_unsigned()).min(max_scroll);
         }
         let visible = filtered_len
             .saturating_sub(self.sandbox_log_scroll)
@@ -1108,11 +1697,9 @@ impl App {
                     CreateFormField::Image => Self::handle_text_input(&mut form.image, key),
                     CreateFormField::Command => Self::handle_text_input(&mut form.command, key),
                     CreateFormField::Providers => match key.code {
-                        KeyCode::Char('j') | KeyCode::Down => {
-                            if !form.providers.is_empty() {
-                                form.provider_cursor =
-                                    (form.provider_cursor + 1).min(form.providers.len() - 1);
-                            }
+                        KeyCode::Char('j') | KeyCode::Down if !form.providers.is_empty() => {
+                            form.provider_cursor =
+                                (form.provider_cursor + 1).min(form.providers.len() - 1);
                         }
                         KeyCode::Char('k') | KeyCode::Up => {
                             form.provider_cursor = form.provider_cursor.saturating_sub(1);
@@ -1211,10 +1798,8 @@ impl App {
                 KeyCode::Esc => {
                     self.create_provider_form = None;
                 }
-                KeyCode::Char('j') | KeyCode::Down => {
-                    if !form.types.is_empty() {
-                        form.type_cursor = (form.type_cursor + 1).min(form.types.len() - 1);
-                    }
+                KeyCode::Char('j') | KeyCode::Down if !form.types.is_empty() => {
+                    form.type_cursor = (form.type_cursor + 1).min(form.types.len() - 1);
                 }
                 KeyCode::Char('k') | KeyCode::Up => {
                     form.type_cursor = form.type_cursor.saturating_sub(1);
@@ -1255,7 +1840,7 @@ impl App {
                     form.status = None;
                     form.warning = None;
                 }
-                KeyCode::Char('j') | KeyCode::Down | KeyCode::Char('k') | KeyCode::Up => {
+                KeyCode::Char('j' | 'k') | KeyCode::Down | KeyCode::Up => {
                     form.method_cursor = 1 - form.method_cursor;
                 }
                 KeyCode::Enter => {
@@ -1461,7 +2046,7 @@ impl App {
             registry
                 .credential_env_vars(&ptype)
                 .first()
-                .map_or(String::new(), |s| s.to_string())
+                .map_or(String::new(), ToString::to_string)
         } else {
             cred_key
         };
@@ -1601,6 +2186,7 @@ impl App {
         self.sandbox_created.clear();
         self.sandbox_images.clear();
         self.sandbox_notes.clear();
+        self.sandbox_labels.clear();
         self.sandbox_policy_versions.clear();
         self.sandbox_selected = 0;
         self.sandbox_count = 0;

@@ -15,7 +15,8 @@ All paths are relative to `crates/openshell-sandbox/src/`.
 | `opa.rs` | OPA/Rego policy engine using `regorus` crate -- network evaluation, sandbox config queries, L7 endpoint queries |
 | `process.rs` | `ProcessHandle` for spawning child processes, privilege dropping, signal handling |
 | `proxy.rs` | HTTP CONNECT proxy with OPA evaluation, process-identity binding, inference interception, and L7 dispatch |
-| `ssh.rs` | Embedded SSH server (`russh` crate) with PTY support and handshake verification |
+| `ssh.rs` | Embedded SSH server (`russh` crate) listening on a Unix socket, with PTY support |
+| `supervisor_session.rs` | Persistent outbound `ConnectSupervisor` gRPC session to the gateway; bridges `RelayStream` calls to the local SSH daemon's Unix socket |
 | `identity.rs` | `BinaryIdentityCache` -- SHA256 trust-on-first-use binary integrity |
 | `procfs.rs` | `/proc` filesystem reading for TCP peer identity resolution and ancestor chain walking |
 | `grpc_client.rs` | gRPC client for fetching policy, provider environment, inference route bundles, policy polling/status reporting, proposal submission, and log push (`CachedOpenShellClient`) |
@@ -24,15 +25,18 @@ All paths are relative to `crates/openshell-sandbox/src/`.
 | `sandbox/mod.rs` | Platform abstraction -- dispatches to Linux or no-op |
 | `sandbox/linux/mod.rs` | Linux composition: Landlock then seccomp |
 | `sandbox/linux/landlock.rs` | Filesystem isolation via Landlock LSM (ABI V1) |
-| `sandbox/linux/seccomp.rs` | Syscall filtering via BPF on `SYS_socket` |
+| `sandbox/linux/seccomp.rs` | Syscall filtering via BPF: socket domain blocks, dangerous syscall blocks, conditional flag blocks |
 | `bypass_monitor.rs` | Background `/dev/kmsg` reader for iptables bypass detection events |
 | `sandbox/linux/netns.rs` | Network namespace creation, veth pair setup, bypass detection iptables rules, cleanup on drop |
-| `l7/mod.rs` | L7 types (`L7Protocol`, `TlsMode`, `EnforcementMode`, `L7EndpointConfig`), config parsing, validation, access preset expansion |
+| `l7/mod.rs` | L7 types (`L7Protocol`, `TlsMode`, `EnforcementMode`, `L7EndpointConfig`), config parsing, validation, access preset expansion, deprecated `tls` value handling |
+| `l7/graphql.rs` | GraphQL-over-HTTP request classifier, body buffering, operation/root-field extraction, and persisted-query metadata handling |
 | `l7/inference.rs` | Inference API pattern detection (`detect_inference_pattern()`), HTTP request/response parsing and formatting for intercepted inference connections |
-| `l7/tls.rs` | Ephemeral CA generation (`SandboxCa`), per-hostname leaf cert cache (`CertCache`), TLS termination/connection helpers |
-| `l7/relay.rs` | Protocol-aware bidirectional relay with per-request OPA evaluation |
+| `l7/tls.rs` | Ephemeral CA generation (`SandboxCa`), per-hostname leaf cert cache (`CertCache`), TLS termination/connection helpers, `looks_like_tls()` auto-detection |
+| `l7/relay.rs` | Protocol-aware bidirectional relay with per-request OPA evaluation, credential-injection-only passthrough relay |
 | `l7/rest.rs` | HTTP/1.1 request/response parsing, body framing (Content-Length, chunked), deny response generation |
+| `l7/path.rs` | Request-target canonicalization: percent-decoding, dot-segment resolution, `;params` stripping, encoded-slash policy (opt-in per endpoint via `allow_encoded_slash: true` for upstreams like GitLab that embed `%2F` in paths). Single source of truth for the path both OPA evaluates and the upstream receives. |
 | `l7/provider.rs` | `L7Provider` trait and `L7Request`/`BodyLength` types |
+| `secrets.rs` | `SecretResolver` credential placeholder system — placeholder generation, multi-location rewriting (headers, query params, path segments, Basic auth), fail-closed scanning, secret validation, percent-encoding |
 
 ## Startup and Orchestration
 
@@ -63,9 +67,12 @@ flowchart TD
     L --> L2[Spawn bypass monitor]
     L2 --> N{SSH enabled?}
     M --> N
-    N -- Yes --> O[Spawn SSH server task]
-    N -- No --> P[Spawn child process]
-    O --> P
+    N -- Yes --> O[Spawn SSH server task on Unix socket]
+    N -- No --> P0{gRPC mode + socket?}
+    O --> P0
+    P0 -- Yes --> P1[Spawn supervisor session task]
+    P0 -- No --> P[Spawn child process]
+    P1 --> P
     P --> Q[Store entrypoint PID]
     Q --> R{gRPC mode?}
     R -- Yes --> T[Spawn policy poll task]
@@ -87,13 +94,13 @@ flowchart TD
 
 3. **Binary identity cache**: If OPA engine is active, create `Arc<BinaryIdentityCache::new()>` for SHA256 TOFU enforcement.
 
-4. **Filesystem preparation** (`prepare_filesystem()`): For each path in `filesystem.read_write`, create the directory if it does not exist and `chown` to the configured `run_as_user`/`run_as_group`. Runs as the supervisor (root) before forking.
+4. **Filesystem preparation** (`prepare_filesystem()`): For each path in `filesystem.read_write`, reject symlinks, create the directory if it does not exist, and `chown` only newly-created paths to the configured `run_as_user`/`run_as_group`. Pre-existing paths keep the image-defined ownership. Runs as the supervisor (root) before forking.
 
 5. **TLS state for L7 inspection** (proxy mode only):
    - Generate ephemeral CA via `SandboxCa::generate()` using `rcgen`
    - Write CA cert PEM and combined bundle (system CAs + sandbox CA) to `/etc/openshell-tls/`
    - Add the TLS directory to `policy.filesystem.read_only` so Landlock allows the child to read it
-   - Build upstream `ClientConfig` with Mozilla root CAs via `webpki_roots`
+   - Build upstream `ClientConfig` with Mozilla root CAs (`webpki_roots`) plus system CA certificates from the container's trust store (e.g. corporate CAs added via `update-ca-certificates`)
    - Create `Arc<ProxyTlsState>` wrapping a `CertCache` and the upstream config
 
 6. **Network namespace** (Linux, proxy mode only):
@@ -108,18 +115,20 @@ flowchart TD
    - Build `InferenceContext` via `build_inference_context()` which resolves routes from one of two sources (see [Inference routing context](#inference-routing-context) below)
    - `ProxyHandle::start_with_bind_addr()` binds a `TcpListener` and spawns an accept loop, passing the inference context to each connection handler
 
-8. **SSH server** (optional): If `--ssh-listen-addr` is provided, spawn an async task running `ssh::run_ssh_server()` with the policy, workdir, netns FD, proxy URL, CA paths, and provider env.
+8. **SSH server** (optional): If `--ssh-socket-path` is provided, spawn an async task running `ssh::run_ssh_server()` with the policy, workdir, netns FD, proxy URL, CA paths, and provider env. The value is a filesystem path to the Unix socket the embedded sshd binds. The supervisor waits on a readiness `oneshot` channel before proceeding so that exec requests arriving immediately after pod-ready cannot race against socket bind.
 
-9. **Child process spawning** (`ProcessHandle::spawn()`):
-   - Build `tokio::process::Command` with inherited stdio and `kill_on_drop(true)`
-   - Set environment variables: `OPENSHELL_SANDBOX=1`, provider credentials, proxy URLs, TLS trust store paths
-   - Pre-exec closure (async-signal-safe): `setpgid` (if non-interactive) -> `setns` (enter netns) -> `drop_privileges` -> `sandbox::apply` (Landlock + seccomp)
+9. **Supervisor session** (gRPC mode + SSH socket only): If `--sandbox-id`, `--openshell-endpoint`, and an SSH socket path are all set, spawn `supervisor_session::spawn()`. This task opens a persistent outbound bidirectional gRPC stream to the gateway and bridges inbound relay requests to the local SSH daemon. See [Supervisor Session](#supervisor-session) for the full protocol.
 
-10. **Store entrypoint PID**: `entrypoint_pid.store(pid, Ordering::Release)` so the proxy can resolve TCP peer identity via `/proc`.
+10. **Child process spawning** (`ProcessHandle::spawn()`):
+    - Build `tokio::process::Command` with inherited stdio and `kill_on_drop(true)`
+    - Set environment variables: `OPENSHELL_SANDBOX=1`, provider credentials, proxy URLs, TLS trust store paths
+    - Pre-exec closure (async-signal-safe): `setpgid` (if non-interactive) -> `setns` (enter netns) -> `drop_privileges` -> `sandbox::apply` (Landlock + seccomp)
 
-11. **Spawn policy poll task** (gRPC mode only): If `sandbox_id`, `openshell_endpoint`, and an OPA engine are all present, spawn `run_policy_poll_loop()` as a background tokio task. This task polls the gateway for policy updates and hot-reloads the OPA engine when a new version is detected. See [Policy Reload Lifecycle](#policy-reload-lifecycle) for details.
+11. **Store entrypoint PID**: `entrypoint_pid.store(pid, Ordering::Release)` so the proxy can resolve TCP peer identity via `/proc`.
 
-12. **Wait with timeout**: If `--timeout > 0`, wrap `handle.wait()` in `tokio::time::timeout()`. On timeout, kill the process and return exit code 124.
+12. **Spawn policy poll task** (gRPC mode only): If `sandbox_id`, `openshell_endpoint`, and an OPA engine are all present, spawn `run_policy_poll_loop()` as a background tokio task. This task polls the gateway for policy updates and hot-reloads the OPA engine when a new version is detected. See [Policy Reload Lifecycle](#policy-reload-lifecycle) for details.
+
+13. **Wait with timeout**: If `--timeout > 0`, wrap `handle.wait()` in `tokio::time::timeout()`. On timeout, kill the process and return exit code 124.
 
 ## Policy Model
 
@@ -236,6 +245,7 @@ Two evaluation methods exist: `evaluate_network()` for the legacy bool-based pat
 #### `evaluate_network(input: &NetworkInput) -> Result<PolicyDecision>`
 
 Input JSON shape:
+
 ```json
 {
   "exec": {
@@ -251,6 +261,7 @@ Input JSON shape:
 ```
 
 Evaluates three Rego rules:
+
 1. `data.openshell.sandbox.allow_network` -> bool
 2. `data.openshell.sandbox.deny_reason` -> string
 3. `data.openshell.sandbox.matched_network_policy` -> string (or `Undefined`)
@@ -265,6 +276,7 @@ Uses the same input JSON shape as `evaluate_network()`. Evaluates the `data.open
 - `"deny"` -- network connections not allowed by policy
 
 The Rego logic:
+
 1. If `network_policy_for_request` exists (endpoint + binary match), return `"allow"`
 2. Default: `"deny"`
 
@@ -281,18 +293,22 @@ The proxy calls `evaluate_network_action()` (not `evaluate_network()`) as its ma
 
 ### L7 endpoint config query
 
-After L4 allows a connection, `query_endpoint_config(input)` evaluates `data.openshell.sandbox.matched_endpoint_config` to get the full endpoint object. If the endpoint has a `protocol` field, `l7::parse_l7_config()` extracts the L7 config for protocol-aware inspection.
+After L4 allows a connection, `query_endpoint_config_with_generation(input)` evaluates `data.openshell.sandbox.matched_endpoint_config` to get the full endpoint object and the policy generation used for the query. If the endpoint has a `protocol` field, `l7::parse_l7_config()` extracts the L7 config for protocol-aware inspection.
 
 ### Engine cloning for L7
 
-`clone_engine_for_tunnel()` clones the inner `regorus::Engine`. With the `arc` feature, this shares compiled policy via `Arc` and only duplicates interpreter state (microseconds). The cloned engine is wrapped in its own `std::sync::Mutex` and used by the L7 relay without contention on the main engine.
+`clone_engine_for_tunnel(expected_generation)` clones the inner `regorus::Engine` only if the current policy generation still matches the endpoint config generation captured above. With the `arc` feature, this shares compiled policy via `Arc` and only duplicates interpreter state (microseconds). The cloned engine is wrapped in a generation-bound `TunnelPolicyEngine` and used by the L7 relay without contention on the main engine.
+
+The L7 relay checks the captured generation before parsing, evaluating, and forwarding each request. If a policy reload has advanced the shared generation, the relay closes the tunnel before forwarding more bytes. This applies live policy changes to the next L7 request on a keep-alive tunnel and avoids pairing stale endpoint config with a newer policy engine. HTTP passthrough tunnels without endpoint `protocol` are also generation-bound so credential-injection-only keep-alive tunnels close after a reload before forwarding another request.
+
+Raw streams are connection-scoped and outside the L7 live-reload guarantee. This includes `tls: skip`, binary/non-HTTP CONNECT tunnels, SQL audit fallback passthrough, HTTP upgrades such as WebSocket after `101 Switching Protocols`, and already-forwarded long-lived response bodies such as SSE. Policy reloads affect the next connection or the next parsed HTTP request; they do not interrupt raw byte streams that have already moved outside the request parser.
 
 ### Hot reload
 
 Two reload methods exist:
 
 - **`reload(policy, data_yaml)`**: Builds a new engine from raw Rego + YAML strings and atomically replaces the inner engine. Used in tests and by the file-mode path.
-- **`reload_from_proto(proto)`**: Builds a new engine through the same validated pipeline as `from_proto()` -- proto-to-JSON conversion, L7 validation, access preset expansion -- then atomically swaps the inner `regorus::Engine`. On success, all subsequent `evaluate_network_action()` and `query_endpoint_config()` calls use the new policy. On failure (e.g., L7 validation errors), the previous engine is untouched (last-known-good behavior). This is the method used by the policy poll loop for live reloads in gRPC mode.
+- **`reload_from_proto(proto)`**: Builds a new engine through the same validated pipeline as `from_proto()` -- proto-to-JSON conversion, L7 validation, access preset expansion -- then atomically swaps the inner `regorus::Engine`. On success, all subsequent `evaluate_network_action()` and `query_endpoint_config()` calls use the new policy, and the engine generation increments so active L7 tunnels close before forwarding another request under stale state. On failure (e.g., L7 validation errors), the previous engine and generation are untouched (last-known-good behavior). This is the method used by the policy poll loop for live reloads in gRPC mode.
 
 Both methods hold the `Mutex` only for the final swap (`*engine = new_engine`), so evaluation is blocked for only the duration of a pointer-sized assignment.
 
@@ -315,31 +331,38 @@ The gateway's `UpdateSandboxPolicy` RPC enforces this boundary: it rejects any u
 
 ### Poll loop
 
+The poll loop tracks `config_revision` (a fingerprint of policy + settings + source) as the primary change-detection signal. It separately tracks `policy_hash` to determine whether an OPA reload is needed -- settings-only changes do not trigger OPA reloads.
+
 ```mermaid
 sequenceDiagram
-    participant PL as Policy Poll Loop
+    participant PL as Settings Poll Loop
     participant GW as Gateway (gRPC)
     participant OPA as OPA Engine (Arc)
 
-    PL->>GW: GetSandboxPolicy(sandbox_id)
-    GW-->>PL: policy + version + hash
-    PL->>PL: Store initial version
+    PL->>GW: GetSandboxSettings(sandbox_id)
+    GW-->>PL: policy + settings + config_revision
+    PL->>PL: Store initial config_revision, policy_hash, settings
 
     loop Every OPENSHELL_POLICY_POLL_INTERVAL_SECS (default 10)
-        PL->>GW: GetSandboxPolicy(sandbox_id)
-        GW-->>PL: policy + version + hash
-        alt version > current_version
-            PL->>OPA: reload_from_proto(policy)
-            alt Reload succeeds
-                OPA-->>PL: Ok
-                PL->>PL: Update current_version
-                PL->>GW: ReportPolicyStatus(version, LOADED)
-            else Reload fails (validation error)
-                OPA-->>PL: Err (old engine untouched)
-                PL->>GW: ReportPolicyStatus(version, FAILED, error_msg)
+        PL->>GW: GetSandboxSettings(sandbox_id)
+        GW-->>PL: policy + settings + config_revision
+        alt config_revision unchanged
+            PL->>PL: Skip
+        else config_revision changed
+            PL->>PL: log_setting_changes(old_settings, new_settings)
+            alt policy_hash changed
+                PL->>OPA: reload_from_proto(policy)
+                alt Reload succeeds
+                    OPA-->>PL: Ok
+                    PL->>PL: Update tracked state
+                    PL->>GW: ReportPolicyStatus(version, LOADED)
+                else Reload fails (validation error)
+                    OPA-->>PL: Err (old engine untouched)
+                    PL->>GW: ReportPolicyStatus(version, FAILED, error_msg)
+                end
+            else settings-only change
+                PL->>PL: Update tracked state (no OPA reload)
             end
-        else version <= current_version
-            PL->>PL: Skip (no update)
         end
     end
 ```
@@ -347,11 +370,14 @@ sequenceDiagram
 The `run_policy_poll_loop()` function in `crates/openshell-sandbox/src/lib.rs` implements this loop:
 
 1. **Connect once**: Create a `CachedOpenShellClient` that holds a persistent mTLS channel to the gateway. This avoids TLS renegotiation on every poll.
-2. **Fetch initial version**: Call `poll_policy(sandbox_id)` to establish the baseline `current_version`. On failure, log a warning and retry on the next interval.
-3. **Poll loop**: Sleep for the configured interval, then call `poll_policy()` again.
-4. **Version comparison**: If `result.version <= current_version`, skip. The version is a monotonically increasing `u32` per sandbox.
-5. **Reload attempt**: Call `opa_engine.reload_from_proto(&result.policy)`. This runs the full `from_proto()` pipeline on the new policy, then atomically swaps the inner engine.
-6. **Status reporting**: On success, report `PolicyStatus::Loaded` to the gateway via `ReportPolicyStatus` RPC. On failure, report `PolicyStatus::Failed` with the error message. Status report failures are logged but do not affect the poll loop.
+2. **Fetch initial state**: Call `poll_settings(sandbox_id)` to establish baseline `current_config_revision`, `current_policy_hash`, and `current_settings` map. On failure, log a warning and retry on the next interval.
+3. **Poll loop**: Sleep for the configured interval, then call `poll_settings()` again.
+4. **Config comparison**: If `result.config_revision == current_config_revision`, skip.
+5. **Per-setting diff logging**: Call `log_setting_changes()` to diff old and new settings maps. Each individual change is logged with old and new values.
+6. **Conditional OPA reload**: Only call `opa_engine.reload_from_proto(policy)` when `policy_hash` changes. Settings-only changes (e.g., `log_level` updated) update the tracked state without touching the OPA engine.
+7. **Status reporting**: On success/failure, report status only for sandbox-scoped policy revisions (`policy_source = SANDBOX`, `version > 0`). Global policy overrides still trigger OPA reload, but they do not write per-sandbox policy status history.
+8. **Global policy logging**: When `global_policy_version > 0`, the sandbox logs `"Policy reloaded successfully (global)"` with the `global_version` field. This distinguishes global reloads from sandbox-scoped reloads in the log stream.
+9. **Update tracked state**: After processing, update `current_config_revision`, `current_policy_hash`, and `current_settings` regardless of whether OPA was reloaded.
 
 ### `CachedOpenShellClient`
 
@@ -364,28 +390,41 @@ pub struct CachedOpenShellClient {
     client: OpenShellClient<Channel>,
 }
 
-pub struct PolicyPollResult {
-    pub policy: ProtoSandboxPolicy,
+pub struct SettingsPollResult {
+    pub policy: Option<ProtoSandboxPolicy>,
     pub version: u32,
     pub policy_hash: String,
+    pub config_revision: u64,
+    pub policy_source: PolicySource,
+    pub settings: HashMap<String, EffectiveSetting>,
+    pub global_policy_version: u32,
 }
 ```
 
 Methods:
+
 - **`connect(endpoint)`**: Establish an mTLS channel and return a new client.
-- **`poll_policy(sandbox_id)`**: Call `GetSandboxPolicy` RPC and return a `PolicyPollResult` containing the policy, version, and hash.
+- **`poll_settings(sandbox_id)`**: Call `GetSandboxSettings` RPC and return a `SettingsPollResult` containing policy payload (optional), policy metadata, effective config revision, policy source, global policy version, and the effective settings map (for diff logging).
 - **`report_policy_status(sandbox_id, version, loaded, error_msg)`**: Call `ReportPolicyStatus` RPC with the appropriate `PolicyStatus` enum value (`Loaded` or `Failed`).
 - **`raw_client()`**: Return a clone of the underlying `OpenShellClient<Channel>` for direct RPC calls (used by the log push task).
 
 ### Server-side policy versioning
 
-The gateway assigns a monotonically increasing version number to each policy revision per sandbox. The `GetSandboxPolicyResponse` includes `version` and `policy_hash` fields. The `ReportPolicyStatus` RPC records which version the sandbox successfully loaded (or failed to load), enabling operators to query `GetSandboxPolicyStatus` for the current active version and load history.
+The gateway assigns a monotonically increasing version number to each sandbox policy revision. `GetSandboxSettingsResponse` carries the full effective configuration: policy payload, effective settings map (with per-key scope indicators), a `config_revision` fingerprint that changes when any effective input changes (policy, settings, or source), and a `policy_source` field indicating whether the policy came from the sandbox's own history or from a global override.
 
 Proto messages involved:
-- `GetSandboxPolicyResponse` (`proto/sandbox.proto`): `policy`, `version`, `policy_hash`
+
+- `GetSandboxSettingsResponse` (`proto/sandbox.proto`): `policy`, `version`, `policy_hash`, `settings` (map of `EffectiveSetting`), `config_revision`, `policy_source`, `global_policy_version`
+- `EffectiveSetting` (`proto/sandbox.proto`): `SettingValue value`, `SettingScope scope`
+- `SettingScope` enum: `UNSPECIFIED`, `SANDBOX`, `GLOBAL`
+- `PolicySource` enum: `UNSPECIFIED`, `SANDBOX`, `GLOBAL`
 - `ReportPolicyStatusRequest` (`proto/openshell.proto`): `sandbox_id`, `version`, `status` (enum), `load_error`
 - `PolicyStatus` enum: `PENDING`, `LOADED`, `FAILED`, `SUPERSEDED`
 - `SandboxPolicyRevision` (`proto/openshell.proto`): Full revision metadata including `created_at_ms`, `loaded_at_ms`
+
+The `global_policy_version` field is zero when no global policy is active or when `policy_source` is `SANDBOX`. When `policy_source` is `GLOBAL`, it carries the version number of the active global revision. The sandbox logs this value on reload (`"Policy reloaded successfully (global)" global_version=N`) and the TUI displays it in the dashboard and sandbox metadata pane.
+
+See [Gateway Settings Channel](gateway-settings.md) for full details on the settings resolution model, storage, and CLI/TUI commands.
 
 ### Failure modes
 
@@ -410,34 +449,82 @@ Landlock restricts the child process's filesystem access to an explicit allowlis
 1. Build path lists from `filesystem.read_only` and `filesystem.read_write`
 2. If `include_workdir` is true, add the working directory to `read_write`
 3. If both lists are empty, skip Landlock entirely (no-op)
-4. Create a Landlock ruleset targeting ABI V1:
+4. Create a Landlock ruleset targeting ABI V2:
    - Read-only paths receive `AccessFs::from_read(abi)` rights
    - Read-write paths receive `AccessFs::from_all(abi)` rights
-5. Call `ruleset.restrict_self()` -- this applies to the calling process and all descendants
+5. For each path, attempt `PathFd::new()`. If it fails:
+   - `BestEffort`: Log a warning with the error classification (not found, permission denied, symlink loop, etc.) and skip the path. Continue building the ruleset from remaining valid paths.
+   - `HardRequirement`: Return a fatal error, aborting the sandbox.
+6. If all paths failed (zero rules applied), return an error rather than calling `restrict_self()` on an empty ruleset (which would block all filesystem access)
+7. Call `ruleset.restrict_self()` -- this applies to the calling process and all descendants
 
-Error behavior depends on `LandlockCompatibility`:
+Kernel-level error behavior (e.g., Landlock ABI unavailable) depends on `LandlockCompatibility`:
+
 - `BestEffort`: Log a warning and continue without filesystem isolation
 - `HardRequirement`: Return a fatal error, aborting the sandbox
+
+**Baseline path filtering**: System-injected baseline paths (e.g., `/app`) are pre-filtered by `enrich_proto_baseline_paths()` / `enrich_sandbox_baseline_paths()` using `Path::exists()` before they reach Landlock. If a baseline `read_write` path is already present in `read_only`, enrichment skips the promotion so explicit policy intent is preserved. User-specified paths are not pre-filtered -- they are evaluated at Landlock apply time so misconfigurations surface as warnings or errors.
+
+**GPU baseline paths**: The supervisor currently infers GPU baseline paths from
+device nodes and NVIDIA runtime paths visible inside the sandbox container. The
+Docker compute driver can request CDI GPU injection, but this implementation
+does not pass CDI metadata into the supervisor. Future device-specific CDI
+selection may need follow-up work so the supervisor can enrich Landlock using
+the requested CDI device's actual device nodes and mounted library paths. That
+design must work for remote Docker daemons, where Docker-reported CDI spec
+directories are paths on the daemon host and may not be readable by the gateway
+process or the sandbox supervisor.
 
 ### Seccomp syscall filtering
 
 **File:** `crates/openshell-sandbox/src/sandbox/linux/seccomp.rs`
 
-Seccomp blocks socket creation for specific address families. The filter targets a single syscall (`SYS_socket`) and inspects argument 0 (the domain).
-
-**Always blocked** (regardless of network mode):
-- `AF_NETLINK`, `AF_PACKET`, `AF_BLUETOOTH`, `AF_VSOCK`
-
-**Additionally blocked in `Block` mode** (no proxy):
-- `AF_INET`, `AF_INET6`
+Seccomp provides three layers of syscall restriction: socket domain blocks, unconditional syscall blocks, and conditional syscall blocks. The filter uses a default-allow policy (`SeccompAction::Allow`) with targeted rules that return `Errno(EPERM)`.
 
 **Skipped entirely** in `Allow` mode.
 
 Setup:
+
 1. `prctl(PR_SET_NO_NEW_PRIVS, 1)` -- required before seccomp
 2. `seccompiler::apply_filter()` with default action `Allow` and per-rule action `Errno(EPERM)`
 
+#### Socket domain blocks
+
+| Domain | Always blocked | Additionally blocked in Block mode |
+|--------|:-:|:-:|
+| `AF_PACKET` | Yes | |
+| `AF_BLUETOOTH` | Yes | |
+| `AF_VSOCK` | Yes | |
+| `AF_INET` | | Yes |
+| `AF_INET6` | | Yes |
+| `AF_NETLINK` | | Yes |
+
 In `Proxy` mode, `AF_INET`/`AF_INET6` are allowed because the sandboxed process needs to connect to the proxy over the veth pair. The network namespace ensures it can only reach the proxy's IP (`10.200.0.1`).
+
+#### Unconditional syscall blocks
+
+These syscalls are blocked entirely (EPERM for any invocation):
+
+| Syscall | Reason |
+|---------|--------|
+| `memfd_create` | Fileless binary execution bypasses Landlock filesystem restrictions |
+| `ptrace` | Cross-process memory inspection and code injection |
+| `bpf` | Kernel BPF program loading |
+| `process_vm_readv` | Cross-process memory read |
+| `io_uring_setup` | Async I/O subsystem with extensive CVE history |
+| `mount` | Filesystem mount could subvert Landlock or overlay writable paths |
+
+#### Conditional syscall blocks
+
+These syscalls are only blocked when specific flag patterns are present:
+
+| Syscall | Condition | Reason |
+|---------|-----------|--------|
+| `execveat` | `AT_EMPTY_PATH` flag set (arg4) | Fileless execution from an anonymous fd |
+| `unshare` | `CLONE_NEWUSER` flag set (arg0) | User namespace creation enables privilege escalation |
+| `seccomp` | operation == `SECCOMP_SET_MODE_FILTER` (arg0) | Prevents sandboxed code from replacing the active filter |
+
+Conditional blocks use `MaskedEq` for flag checks (bit-test) and `Eq` for exact-value matches. This allows normal use of these syscalls while blocking the dangerous flag combinations.
 
 ### Network namespace isolation
 
@@ -447,7 +534,7 @@ The network namespace creates an isolated network stack where the sandboxed proc
 
 #### Topology
 
-```
+```text
 HOST NAMESPACE                          SANDBOX NAMESPACE
 -----------------                       -----------------
 veth-h-{uuid}                           veth-s-{uuid}
@@ -475,6 +562,7 @@ Each step has rollback on failure -- if any `ip` command fails, previously creat
 #### Cleanup on drop
 
 `NetworkNamespace` implements `Drop`:
+
 1. Close the namespace FD
 2. Delete the host-side veth (`ip link delete veth-h-{id}`) -- this automatically removes the peer
 3. Delete the namespace (`ip netns delete sandbox-{id}`)
@@ -512,7 +600,7 @@ The proxy port defaults to `3128` unless the policy specifies a different `http_
 1. Opens `/dev/kmsg` in read mode and seeks to end (skips historical messages)
 2. Reads lines via `BufReader`, filtering for the namespace-specific prefix `openshell:bypass:{namespace_name}:`
 3. Parses iptables LOG format via `parse_kmsg_line()`, extracting `DST`, `DPT`, `SPT`, `PROTO`, and `UID` fields
-4. Resolves process identity for TCP events via `procfs::resolve_tcp_peer_identity()` (best-effort — requires a valid entrypoint PID and non-zero source port)
+4. Resolves process identity for TCP events via multi-owner socket inode lookup (best-effort — requires a valid entrypoint PID and non-zero source port). If multiple processes hold the same socket with different executable identities, the event is marked ambiguous instead of attributing it to one PID.
 5. Emits a structured `tracing::warn!()` event with the tag `BYPASS_DETECT`
 6. Sends a `DenialEvent` to the denial aggregator channel (if available)
 
@@ -653,11 +741,26 @@ sequenceDiagram
             else All IPs public
                 P->>U: TCP connect (resolved addrs)
                 P-->>S: HTTP/1.1 200 Connection Established
-                alt L7 config present
-                    P->>P: TLS termination / protocol detection
-                    P->>P: Per-request L7 evaluation
-                else L4-only
+                alt tls: skip
                     P->>P: copy_bidirectional (raw tunnel)
+                else Auto-detect
+                    P->>P: Peek first bytes
+                    alt TLS detected
+                        P->>P: TLS terminate (MITM)
+                        alt L7 config present
+                            P->>P: relay_with_inspection (per-request L7 evaluation)
+                        else No L7 config
+                            P->>P: relay_passthrough_with_credentials (credential injection)
+                        end
+                    else HTTP detected
+                        alt L7 config present
+                            P->>P: relay_with_inspection
+                        else No L7 config
+                            P->>P: relay_passthrough_with_credentials
+                        end
+                    else Neither TLS nor HTTP
+                        P->>P: copy_bidirectional (raw tunnel)
+                    end
                 end
             end
         end
@@ -728,7 +831,9 @@ Every CONNECT request to a non-`inference.local` target produces an `info!()` lo
 
 ### SSRF protection (internal IP rejection)
 
-After OPA allows a connection, the proxy resolves DNS and rejects any host that resolves to an internal IP address (loopback, RFC 1918 private, link-local, or IPv4-mapped IPv6 equivalents). This defense-in-depth measure prevents SSRF attacks where an allowed hostname is pointed at internal infrastructure. The check is implemented by `resolve_and_reject_internal()` which calls `tokio::net::lookup_host()` and validates every resolved address via `is_internal_ip()`. If any resolved IP is internal, the connection receives a `403 Forbidden` response and a warning is logged. See [SSRF Protection](security-policy.md#ssrf-protection-internal-ip-rejection) for the full list of blocked ranges.
+After OPA allows a connection, the proxy resolves the host using the sandbox's `/etc/hosts` first on Linux (via `/proc/<pid>/root/etc/hosts`, which picks up Kubernetes `hostAliases`), then falls back to DNS. It rejects any host that resolves to an internal IP address (loopback, RFC 1918 private, link-local, or IPv4-mapped IPv6 equivalents). This defense-in-depth measure prevents SSRF attacks where an allowed hostname is pointed at internal infrastructure. The check is implemented by `resolve_and_reject_internal()`, which validates every resolved address via `is_internal_ip()`. If any resolved IP is internal, the connection receives a `403 Forbidden` response and a warning is logged. `hostAliases` only affect name resolution — private destinations still need `allowed_ips`. See [SSRF Protection](security-policy.md#ssrf-protection-internal-ip-rejection) for the full list of blocked ranges.
+
+IP classification helpers (`is_always_blocked_ip`, `is_always_blocked_net`, `is_internal_ip`) are shared from `openshell_core::net`. The `parse_allowed_ips` function rejects entries overlapping always-blocked ranges (loopback, link-local, unspecified) at load time with a hard error, and `implicit_allowed_ips_for_ip_host` skips synthesis for always-blocked literal IP hosts. The mechanistic mapper filters proposals for always-blocked destinations to prevent infinite TUI notification loops.
 
 ### Inference interception
 
@@ -764,9 +869,9 @@ The interception steps:
 
    Pattern matching strips query strings. Exact path comparison is used for most patterns; the `/v1/models/*` pattern matches `/v1/models` itself or any path under `/v1/models/` (e.g., `/v1/models/gpt-4.1`).
 
-4. **Header sanitization**: For matched inference requests, the proxy strips credential headers (`Authorization`, `x-api-key`) and framing/hop-by-hop headers (`host`, `content-length`, `transfer-encoding`, `connection`, etc.). The router rebuilds correct framing for the forwarded body.
+4. **Header sanitization**: For matched inference requests, the proxy passes the parsed headers to the router. The router applies a route-aware allowlist before forwarding: common inference headers (`content-type`, `accept`, `accept-encoding`, `user-agent`), provider-specific passthrough headers (for example `openai-organization`, `x-model-id`, `anthropic-version`, `anthropic-beta`), and any route default header names. It always strips client-supplied credential headers (`Authorization`, `x-api-key`) and framing/hop-by-hop headers (`host`, `content-length`, `transfer-encoding`, `connection`, etc.). The router rebuilds correct framing for the forwarded body.
 
-5. **Local routing**: Matched requests are executed by calling `Router::proxy_with_candidates_streaming()`, passing the detected protocol, HTTP method, path, sanitized headers, body, and the cached `ResolvedRoute` list from `InferenceContext`. The router selects the first route whose `protocols` list contains the source protocol (see [Inference Routing -- Response streaming](inference-routing.md#response-streaming) for details). When forwarding to the backend, the router rewrites the request: the route's `api_key` replaces the `Authorization` header, the `Host` header is set to the backend endpoint, and the `"model"` field in the JSON request body is replaced with the route's configured `model` value. If the request body is not valid JSON or does not contain a `"model"` key, the body is forwarded unchanged.
+5. **Local routing**: Matched requests are executed by calling `Router::proxy_with_candidates_streaming()`, passing the detected protocol, HTTP method, path, original parsed headers, body, and the cached `ResolvedRoute` list from `InferenceContext`. The router selects the first route whose `protocols` list contains the source protocol (see [Inference Routing -- Response streaming](inference-routing.md#response-streaming) for details). When forwarding to the backend, the router rewrites the request: the route's `api_key` replaces the client auth header, the `Host` header is set to the backend endpoint, only allowlisted request headers survive, and the `"model"` field in the JSON request body is replaced with the route's configured `model` value. If the request body is not valid JSON or does not contain a `"model"` key, the body is forwarded unchanged.
 
 6. **Response handling (streaming)**:
    - On success: response headers are sent back to the client immediately as an HTTP/1.1 response with `Transfer-Encoding: chunked`, using `format_http_response_header()`. Framing/hop-by-hop headers are stripped from the upstream response. Body chunks are then forwarded incrementally as they arrive from the backend via `StreamingProxyResponse::next_chunk()`, each wrapped in HTTP chunked encoding by `format_chunk()`. The stream is terminated with a `0\r\n\r\n` chunk terminator. This ensures time-to-first-byte reflects the backend's first token latency rather than the full generation time.
@@ -782,11 +887,13 @@ When `Router::proxy_with_candidates()` returns an error, `router_error_to_http()
 
 | `RouterError` variant | HTTP status | Response body |
 |----------------------|-------------|---------------|
-| `RouteNotFound(hint)` | `400` | `no route configured for route '{hint}'` |
-| `NoCompatibleRoute(protocol)` | `400` | `no compatible route for source protocol '{protocol}'` |
-| `Unauthorized(msg)` | `401` | `{msg}` |
-| `UpstreamUnavailable(msg)` | `503` | `{msg}` |
-| `UpstreamProtocol(msg)` / `Internal(msg)` | `502` | `{msg}` |
+| `RouteNotFound(_)` | `400` | `no inference route configured` |
+| `NoCompatibleRoute(_)` | `400` | `no compatible inference route available` |
+| `Unauthorized(_)` | `401` | `unauthorized` |
+| `UpstreamUnavailable(_)` | `503` | `inference service unavailable` |
+| `UpstreamProtocol(_)` / `Internal(_)` | `502` | `inference service error` |
+
+Response messages are generic — internal details (upstream URLs, hostnames, TLS errors, route hints) are never exposed to the sandboxed process. Full error context is logged server-side at `warn` level.
 
 ### Inference routing context
 
@@ -806,28 +913,29 @@ pub struct InferenceContext {
 
 #### Design decision: standalone capability
 
-The sandbox is designed to operate both as part of a cluster and as a standalone component without any cluster infrastructure. This is intentional -- it enables local development workflows (e.g., a developer running a sandbox against a local LLM server without deploying the full stack), CI/CD environments where sandboxes run as isolated test harnesses, and air-gapped deployments where the gateway is not available. Everything the sandbox needs -- policy, inference routes -- can be provided without any dependency on the control plane.
+The sandbox is designed to operate both under a gateway-managed compute platform and as a standalone component without gateway infrastructure. This is intentional -- it enables local development workflows (e.g., a developer running a sandbox against a local LLM server without deploying the full stack), CI/CD environments where sandboxes run as isolated test harnesses, and air-gapped deployments where the gateway is not available. Everything the sandbox needs -- policy, inference routes -- can be provided without any dependency on the control plane.
 
 #### Route sources (priority order)
 
-1. **Route file (standalone mode)**: `--inference-routes` / `OPENSHELL_INFERENCE_ROUTES` points to a YAML file parsed by `RouterConfig::load_from_file()`. Routes are resolved via `config.resolve_routes()`. File loading or parsing errors are fatal (fail-fast), but an empty route list gracefully disables inference routing (returns `None`). The route file always takes precedence -- if both a route file and cluster credentials are present, the route file wins and the cluster bundle is not fetched.
+1. **Route file (standalone mode)**: `--inference-routes` / `OPENSHELL_INFERENCE_ROUTES` points to a YAML file parsed by `RouterConfig::load_from_file()`. Routes are resolved via `config.resolve_routes()`. File loading or parsing errors are fatal (fail-fast), but an empty route list gracefully disables inference routing (returns `None`). The route file always takes precedence -- if both a route file and gateway credentials are present, the route file wins and the gateway bundle is not fetched.
 
-2. **Cluster bundle (cluster mode)**: When `openshell_endpoint` is available (and no route file is configured), routes are fetched from the gateway via `grpc_client::fetch_inference_bundle()`, which calls the `GetInferenceBundle` gRPC RPC on the `Inference` service. The RPC takes no arguments (the bundle is cluster-scoped, not per-sandbox). The gateway returns a `GetInferenceBundleResponse` containing resolved `ResolvedRoute` entries for the managed cluster route. These proto messages are converted to router `ResolvedRoute` structs by `bundle_to_resolved_routes()`, which maps provider types to auth headers and default headers via `openshell_core::inference::auth_for_provider_type()`.
+2. **Gateway bundle (gateway mode)**: When `openshell_endpoint` is available (and no route file is configured), routes are fetched from the gateway via `grpc_client::fetch_inference_bundle()`, which calls the `GetInferenceBundle` gRPC RPC on the `Inference` service. The RPC takes no arguments (the bundle is gateway-scoped, not per-sandbox). The gateway returns a `GetInferenceBundleResponse` containing resolved `ResolvedRoute` entries for the managed gateway route. These proto messages are converted to router `ResolvedRoute` structs by `bundle_to_resolved_routes()`, which maps provider types to auth headers and default headers via `openshell_core::inference::auth_for_provider_type()`.
 
-3. **No source**: If neither route file nor cluster credentials are configured, `build_inference_context()` returns `None` and inference routing is disabled.
+3. **No source**: If neither route file nor gateway credentials are configured, `build_inference_context()` returns `None` and inference routing is disabled.
 
-#### Cluster mode graceful degradation
+#### Gateway mode graceful degradation
 
-In cluster mode, `fetch_inference_bundle()` failures are handled based on the error type:
+In gateway mode, `fetch_inference_bundle()` failures are handled based on the error type:
+
 - gRPC `PermissionDenied` or `NotFound` (detected via error message string matching): sandbox has no inference policy -- inference routing is silently disabled.
 - Other errors: logged as a warning, inference routing is disabled.
 - Empty initial route bundle: inference routing stays enabled with an empty cache and background refresh continues.
 
-Route sources handle empty route lists differently: file mode disables inference routing when the file resolves to zero routes, while cluster mode keeps inference routing active with an empty cache so refresh can pick up routes created later. File *loading errors* (missing file, parse failure) are fatal, while cluster *fetch errors* are non-fatal.
+Route sources handle empty route lists differently: file mode disables inference routing when the file resolves to zero routes, while gateway mode keeps inference routing active with an empty cache so refresh can pick up routes created later. File *loading errors* (missing file, parse failure) are fatal, while gateway *fetch errors* are non-fatal.
 
 #### Background route cache refresh
 
-In cluster mode (when no route file is configured), `spawn_route_refresh()` starts a background tokio task that refreshes the route cache every 30 seconds (`ROUTE_REFRESH_INTERVAL_SECS`). The task calls `fetch_inference_bundle()` on each tick and replaces the `RwLock<Vec<ResolvedRoute>>` contents. On fetch failure, the task logs a warning and keeps the stale routes. The `MissedTickBehavior::Skip` policy prevents refresh storms after temporary gateway outages.
+In gateway mode (when no route file is configured), `spawn_route_refresh()` starts a background tokio task that refreshes the route cache every 30 seconds (`ROUTE_REFRESH_INTERVAL_SECS`). The task calls `fetch_inference_bundle()` on each tick and replaces the `RwLock<Vec<ResolvedRoute>>` contents. On fetch failure, the task logs a warning and keeps the stale routes. The `MissedTickBehavior::Skip` policy prevents refresh storms after temporary gateway outages.
 
 ```mermaid
 flowchart TD
@@ -847,7 +955,7 @@ flowchart TD
     M -- Yes --> L
     M -- No --> N[Warn + None]
     H -- No --> L
-    F --> O[spawn_route_refresh if cluster mode]
+    F --> O[spawn_route_refresh if gateway mode]
     G --> O
 ```
 
@@ -855,26 +963,51 @@ flowchart TD
 
 `ResolvedRoute` has a custom `Debug` implementation in `crates/openshell-router/src/config.rs` that redacts the `api_key` field, printing `[REDACTED]` instead of the actual value. This prevents key leakage in log output and debug traces.
 
-### Post-decision: L7 dispatch or raw tunnel (`Allow` path)
+### Post-decision: auto-TLS detection, L7 dispatch, or raw tunnel (`Allow` path)
 
-After a CONNECT is allowed, the SSRF check passes, and the upstream TCP connection is established:
+After a CONNECT is allowed, the SSRF check passes, and the upstream TCP connection is established, the proxy determines how to handle the tunnel traffic. TLS detection is automatic — the proxy peeks the first bytes of the client stream to decide.
 
-1. **Query L7 config**: `query_l7_config()` asks the OPA engine for `matched_endpoint_config`. If the endpoint has a `protocol` field, parse it into `L7EndpointConfig`.
+1. **Query L7 route**: `query_l7_route_snapshot()` asks the OPA engine for `matched_endpoint_config` and the current policy generation. If the endpoint has a `protocol` field, parse it into a generation-bound `L7ConfigSnapshot`. If the endpoint has no `protocol`, retain the generation for HTTP passthrough keep-alive tunnels.
 
-2. **L7 inspection** (if config present):
-   - Clone the OPA engine for per-tunnel evaluation (`clone_engine_for_tunnel()`)
-   - Build `L7EvalContext` with host, port, policy name, binary path, ancestors, cmdline paths
-   - Branch on TLS mode:
-     - `TlsMode::Terminate`: MITM via `tls_terminate_client()` + `tls_connect_upstream()`, then `relay_with_inspection()`
-     - `TlsMode::Passthrough`: Peek first bytes on raw TCP; if `looks_like_http()` matches, run `relay_with_inspection()`; reject on protocol mismatch
+2. **Check for `tls: skip`**: If the endpoint has `tls: skip`, bypass all auto-detection and relay raw bytes via `copy_bidirectional()`. This is the escape hatch for client-cert mTLS or non-standard protocols.
 
-3. **L4-only** (no L7 config): `tokio::io::copy_bidirectional()` for a raw tunnel
+3. **Peek and auto-detect**: Read up to 8 bytes from the client stream via `TcpStream::peek()`. Classify the traffic using `looks_like_tls()` (checks for TLS ClientHello record: byte 0 = `0x16`, bytes 1-2 = TLS version `0x03xx`) and `looks_like_http()` (checks for HTTP method prefix).
+
+4. **TLS detected** (`is_tls = true`):
+   - Terminate TLS unconditionally via `tls_terminate_client()` + `tls_connect_upstream()`. This happens for all HTTPS endpoints, not just those with L7 config.
+   - If L7 config is present: clone the OPA engine for the captured generation (`clone_engine_for_tunnel(generation)`), run `relay_with_inspection()` for per-request policy evaluation. If the generation changed between config lookup and clone, close the tunnel before inspection.
+   - If no L7 config: run `relay_passthrough_with_credentials()` — parses HTTP minimally to inject credentials (via `SecretResolver`) and log requests, but does not evaluate L7 OPA rules. The passthrough relay is bound to the policy generation captured at connection setup and closes before forwarding another request after a reload. This enables credential injection on all HTTPS endpoints without requiring `protocol` in the policy.
+   - If TLS state is not configured: fall back to raw `copy_bidirectional()` with a warning.
+
+5. **Plaintext HTTP detected** (`is_http = true`, `is_tls = false`):
+   - If L7 config present: clone the OPA engine for the captured generation, run `relay_with_inspection()` directly on the plaintext streams.
+   - If no L7 config: run `relay_passthrough_with_credentials()` for credential injection and observability, with the same per-request generation guard.
+
+6. **Neither TLS nor HTTP**: Raw `copy_bidirectional()` tunnel (binary protocols, SSH-over-CONNECT, etc.). These raw streams are connection-scoped and continue until either side closes; live policy reload does not interrupt them.
+
+```mermaid
+flowchart TD
+    A["CONNECT allowed + upstream connected"] --> B["Query L7 config"]
+    B --> C{"tls: skip?"}
+    C -- Yes --> D["Raw copy_bidirectional"]
+    C -- No --> E["Peek first bytes"]
+    E --> F{"looks_like_tls?"}
+    F -- Yes --> G["TLS terminate client + upstream"]
+    G --> H{"L7 config?"}
+    H -- Yes --> I["relay_with_inspection"]
+    H -- No --> J["relay_passthrough_with_credentials<br/>(credential injection, no L7 rules)"]
+    F -- No --> K{"looks_like_http?"}
+    K -- Yes --> L{"L7 config?"}
+    L -- Yes --> M["relay_with_inspection"]
+    L -- No --> N["relay_passthrough_with_credentials"]
+    K -- No --> O["Raw copy_bidirectional<br/>(binary protocol)"]
+```
 
 ## L7 Protocol-Aware Inspection
 
 **Files:** `crates/openshell-sandbox/src/l7/`
 
-The L7 subsystem inspects application-layer traffic within CONNECT tunnels. Instead of raw `copy_bidirectional`, each request is parsed, evaluated against OPA rules, and either forwarded or blocked.
+The L7 subsystem inspects application-layer traffic within CONNECT tunnels. Instead of raw `copy_bidirectional`, each request is parsed, evaluated against OPA rules, and either forwarded or blocked. The relay uses a generation-bound policy snapshot; after a successful policy reload, an existing L7 keep-alive tunnel closes before forwarding another request. Once an HTTP request has upgraded into a raw stream, or when a response body is a long-lived stream, that stream is connection-scoped and is not interrupted by L7 live reload.
 
 ### Architecture
 
@@ -896,12 +1029,12 @@ flowchart LR
 
 | Type | Definition | Purpose |
 |------|-----------|---------|
-| `L7Protocol` | `Rest`, `Sql` | Supported application protocols |
-| `TlsMode` | `Passthrough`, `Terminate` | TLS handling strategy |
+| `L7Protocol` | `Rest`, `Graphql`, `Sql` | Supported application protocols |
+| `TlsMode` | `Auto` (default), `Skip` | TLS handling strategy — `Auto` peeks first bytes and terminates if TLS is detected; `Skip` bypasses detection entirely |
 | `EnforcementMode` | `Audit`, `Enforce` | What to do on L7 deny (log-only vs block) |
-| `L7EndpointConfig` | `{ protocol, tls, enforcement }` | Per-endpoint L7 configuration |
+| `L7EndpointConfig` | `{ protocol, path, tls, enforcement, allow_encoded_slash, graphql_max_body_bytes }` | Per-endpoint L7 configuration, including optional path scoping for shared host:port APIs |
 | `L7Decision` | `{ allowed, reason, matched_rule }` | Result of L7 evaluation |
-| `L7RequestInfo` | `{ action, target }` | HTTP method + path for policy evaluation |
+| `L7RequestInfo` | `{ action, target, query_params, graphql }` | HTTP method, path, decoded query multimap, and optional GraphQL classification for policy evaluation |
 
 ### Access presets
 
@@ -909,9 +1042,9 @@ Policy data supports shorthand `access` presets that expand into explicit `rules
 
 | Preset | Expands to |
 |--------|-----------|
-| `read-only` | `GET **`, `HEAD **`, `OPTIONS **` |
-| `read-write` | `GET **`, `HEAD **`, `OPTIONS **`, `POST **`, `PUT **`, `PATCH **` |
-| `full` | `* **` (all methods, all paths) |
+| `read-only` | REST: `GET **`, `HEAD **`, `OPTIONS **`; GraphQL: `query` |
+| `read-write` | REST: `GET **`, `HEAD **`, `OPTIONS **`, `POST **`, `PUT **`, `PATCH **`; GraphQL: `query`, `mutation` |
+| `full` | REST: `* **`; GraphQL: `operation_type: "*"` |
 
 Expansion happens in `expand_access_presets()` before the Rego engine loads the data. The `rules` and `access` fields are mutually exclusive (validated at startup).
 
@@ -920,40 +1053,179 @@ Expansion happens in `expand_access_presets()` before the Rego engine loads the 
 `validate_l7_policies()` runs at engine load time and returns `(errors, warnings)`:
 
 **Errors** (block startup):
+
 - `rules` and `access` both specified on same endpoint
 - `protocol` specified without `rules` or `access`
-- `tls: terminate` without a `protocol`
+- unknown `protocol`
 - `protocol: sql` with `enforcement: enforce` (SQL parsing not available in v1)
 - Empty `rules` array (would deny all traffic)
+- invalid GraphQL operation types, persisted-query mode, body limit, or rule shape
 
 **Warnings** (logged):
-- `protocol: rest` on port 443 without `tls: terminate` (L7 rules ineffective on encrypted traffic)
-- Unknown HTTP method in rules
 
-### TLS termination
+- `tls: terminate` or `tls: passthrough` on any endpoint (deprecated — TLS termination is now automatic; use `tls: skip` to disable)
+- `tls: skip` with L7 rules on port 443 (L7 inspection cannot work on encrypted traffic)
+- Unknown HTTP method in rules
+- GraphQL-specific fields on non-GraphQL endpoints
+
+### TLS termination (auto-detect)
 
 **File:** `crates/openshell-sandbox/src/l7/tls.rs`
 
-TLS termination enables the proxy to inspect HTTPS traffic by performing MITM decryption.
+TLS termination is automatic. The proxy peeks the first bytes of every CONNECT tunnel and terminates TLS whenever a ClientHello is detected. This enables credential injection and L7 inspection on all HTTPS endpoints without requiring explicit `tls: terminate` in the policy. The `tls` field defaults to `Auto`; use `tls: skip` to opt out entirely (e.g., for client-cert mTLS to upstream).
 
 **Ephemeral CA lifecycle:**
+
 1. At sandbox startup, `SandboxCa::generate()` creates a self-signed CA (CN: "OpenShell Sandbox CA") using `rcgen`
 2. The CA cert PEM and a combined bundle (system CAs + sandbox CA) are written to `/etc/openshell-tls/`
 3. The sandbox CA cert path is set as `NODE_EXTRA_CA_CERTS` (additive for Node.js)
 4. The combined bundle is set as `SSL_CERT_FILE`, `REQUESTS_CA_BUNDLE`, `CURL_CA_BUNDLE` (replaces defaults for OpenSSL, Python requests, curl)
 
+**TLS auto-detection** (`looks_like_tls()`):
+
+- Peeks up to 8 bytes from the client stream
+- Checks for TLS ClientHello pattern: byte 0 = `0x16` (ContentType::Handshake), byte 1 = `0x03` (TLS major version), byte 2 ≤ `0x04` (minor version, covering SSL 3.0 through TLS 1.3)
+- Returns `false` for plaintext HTTP, SSH, or other binary protocols
+
 **Per-hostname leaf cert generation:**
+
 - `CertCache` maps hostnames to `CertifiedLeaf` structs (cert chain + private key)
 - First request for a hostname generates a leaf cert signed by the sandbox CA via `rcgen`
 - Cache has a hard limit of 256 entries; on overflow, the entire cache is cleared (sufficient for sandbox scale)
 - Each leaf cert chain contains two certs: the leaf and the CA
 
-**Connection flow:**
+**Connection flow (when TLS is detected):**
+
 1. `tls_terminate_client()`: Accept TLS from the sandboxed client using a `ServerConfig` with the hostname-specific leaf cert. ALPN: `http/1.1`.
-2. `tls_connect_upstream()`: Connect TLS to the real upstream using a `ClientConfig` with Mozilla root CAs (`webpki_roots`). ALPN: `http/1.1`.
-3. Proxy now holds plaintext on both sides and runs `relay_with_inspection()`.
+2. `tls_connect_upstream()`: Connect TLS to the real upstream using a `ClientConfig` with Mozilla root CAs (`webpki_roots`) and system CA certificates. ALPN: `http/1.1`.
+3. Proxy now holds plaintext on both sides. If L7 config is present, runs `relay_with_inspection()`. Otherwise, runs `relay_passthrough_with_credentials()` for credential injection without L7 evaluation.
 
 System CA bundles are searched at well-known paths: `/etc/ssl/certs/ca-certificates.crt` (Debian/Ubuntu), `/etc/pki/tls/certs/ca-bundle.crt` (RHEL), `/etc/ssl/ca-bundle.pem` (openSUSE), `/etc/ssl/cert.pem` (Alpine/macOS).
+
+### Credential injection
+
+**Files:** `crates/openshell-sandbox/src/secrets.rs`, `crates/openshell-sandbox/src/l7/relay.rs`, `crates/openshell-sandbox/src/l7/rest.rs`, `crates/openshell-sandbox/src/proxy.rs`
+
+The sandbox proxy resolves `openshell:resolve:env:*` credential placeholders in outbound HTTP requests. The `SecretResolver` holds a supervisor-only map from placeholder strings to real secret values, constructed at startup from the provider environment. Child processes only see placeholder values in their environment; the proxy rewrites them to real secrets immediately before forwarding upstream.
+
+#### `SecretResolver`
+
+```rust
+pub(crate) struct SecretResolver {
+    by_placeholder: HashMap<String, String>,
+}
+```
+
+`SecretResolver::from_provider_env()` splits the provider environment into two maps: a child-visible map with placeholder values (`openshell:resolve:env:ANTHROPIC_API_KEY`) and a supervisor-only resolver map (`{"openshell:resolve:env:ANTHROPIC_API_KEY": "sk-real-key"}`). The placeholder grammar is `openshell:resolve:env:[A-Za-z_][A-Za-z0-9_]*`.
+
+#### Credential placement locations
+
+The resolver rewrites placeholders in four locations within HTTP requests:
+
+| Location | Example | Encoding | Implementation |
+|----------|---------|----------|----------------|
+| Header value (exact) | `x-api-key: openshell:resolve:env:KEY` | None (raw replacement) | `rewrite_header_value()` |
+| Header value (prefixed) | `Authorization: Bearer openshell:resolve:env:KEY` | None (prefix preserved) | `rewrite_header_value()` |
+| Basic auth token | `Authorization: Basic <base64(user:openshell:resolve:env:PASS)>` | Base64 decode → resolve → re-encode | `rewrite_basic_auth_token()` |
+| URL query parameter | `?key=openshell:resolve:env:KEY` | Percent-decode → resolve → percent-encode (RFC 3986 unreserved) | `rewrite_uri_query_params()` |
+| URL path segment | `/bot<placeholder>/sendMessage` | Percent-decode → resolve → validate → percent-encode (RFC 3986 pchar) | `rewrite_uri_path()` → `rewrite_path_segment()` |
+
+**Header values**: Direct match replaces the entire value. Prefixed match (e.g., `Bearer <placeholder>`) splits on whitespace, resolves the placeholder portion, and reassembles. Basic auth match detects `Authorization: Basic <base64>`, decodes the Base64 content, resolves any placeholders in the decoded `user:password` string, and re-encodes.
+
+**Query parameters**: Each `key=value` pair is checked. Values are percent-decoded before resolution and percent-encoded after (RFC 3986 Section 2.3 unreserved characters preserved: `ALPHA / DIGIT / "-" / "." / "_" / "~"`).
+
+**Path segments**: Handles substring matching for APIs that embed tokens within path segments (e.g., Telegram's `/bot{TOKEN}/sendMessage`). Each segment is percent-decoded, scanned for placeholder boundaries using the env var key grammar (`[A-Za-z_][A-Za-z0-9_]*`), resolved, validated for path safety, and percent-encoded per RFC 3986 Section 3.3 pchar rules (`unreserved / sub-delims / ":" / "@"`).
+
+#### Path credential validation (CWE-22)
+
+Resolved credential values destined for URL path segments are validated by `validate_credential_for_path()` before insertion. The following values are rejected:
+
+| Pattern | Rejection reason |
+|---------|-----------------|
+| `../`, `..\\`, `..` | Path traversal sequence |
+| `/`, `\` | Path separator |
+| `\0`, `\r`, `\n` | Control character |
+| `?`, `#` | URI delimiter |
+
+Rejection causes the request to fail closed (HTTP 500).
+
+#### Secret value validation (CWE-113)
+
+All resolved credential values are validated at the `resolve_placeholder()` level for prohibited control characters: CR (`\r`), LF (`\n`), and null byte (`\0`). This prevents HTTP header injection via malicious credential values. The validation applies to all placement locations automatically — header values, query parameters, and path segments all pass through `resolve_placeholder()`.
+
+#### Fail-closed behavior
+
+All placeholder rewriting fails closed. If any `openshell:resolve:env:*` placeholder is detected in the request but cannot be resolved, the proxy rejects the request with HTTP 500 instead of forwarding the raw placeholder to the upstream. The fail-closed mechanism operates at two levels:
+
+1. **Per-location**: Each rewrite function (`rewrite_uri_query_params`, `rewrite_path_segment`, `rewrite_header_line`) returns an `UnresolvedPlaceholderError` when a placeholder is detected but the resolver has no mapping for it.
+
+2. **Final scan**: After all rewriting completes, `rewrite_http_header_block()` scans the output for any remaining `openshell:resolve:env:` tokens. It also checks the percent-decoded form of the request line to catch encoded placeholder bypass attempts (e.g., `openshell%3Aresolve%3Aenv%3AUNKNOWN`).
+
+```rust
+pub(crate) struct UnresolvedPlaceholderError {
+    pub location: &'static str, // "header", "query_param", "path"
+}
+```
+
+#### Rewrite-before-OPA with redaction
+
+When L7 inspection is active, credential placeholders in the request target (path + query) are resolved BEFORE OPA L7 policy evaluation. This is implemented in `relay_with_inspection()` and `relay_passthrough_with_credentials()` in `l7/relay.rs`:
+
+1. `rewrite_target_for_eval()` resolves the request target, producing two strings:
+   - **Resolved**: real secrets inserted — used only for the upstream connection
+   - **Redacted**: `[CREDENTIAL]` markers in place of secrets — used for OPA input and logs
+
+2. OPA `evaluate_l7_request()` receives the redacted path in `request.path`, so policy rules never see real credential values.
+
+3. All log statements (`L7_REQUEST`, `HTTP_REQUEST`) use the redacted target. Real credential values never appear in logs.
+
+4. The resolved path (with real secrets) goes only to the upstream via `relay_http_request_with_resolver()`.
+
+```rust
+pub(crate) struct RewriteTargetResult {
+    pub resolved: String,  // for upstream forwarding only
+    pub redacted: String,  // for OPA + logs
+}
+```
+
+If credential resolution fails on the request target, the relay returns HTTP 500 and closes the connection.
+
+#### Credential-injection-only relay
+
+**File:** `crates/openshell-sandbox/src/l7/relay.rs` (`relay_passthrough_with_credentials()`)
+
+When TLS is auto-terminated but no L7 policy (`protocol` + `access`/`rules`) is configured on the endpoint, the proxy enters a passthrough mode that still provides credential injection and observability. This relay:
+
+1. Reads each HTTP request from the client via `RestProvider::parse_request()`
+2. Resolves and redacts the request target via `rewrite_target_for_eval()` (for log safety)
+3. Logs the request method, redacted path, host, and port at `info!()` level (tagged `HTTP_REQUEST`)
+4. Forwards the request to upstream via `relay_http_request_with_resolver()`, which rewrites all credential placeholders in headers, query parameters, path segments, and Basic auth tokens
+5. Relays the upstream response back to the client
+6. Loops for HTTP keep-alive; exits on client close or non-reusable response
+
+This enables credential injection on all HTTPS endpoints automatically, without requiring the policy author to add `protocol: rest` and `access: full` just to get credentials injected.
+
+#### Known limitation: host-binding
+
+The resolver resolves all placeholders regardless of destination host. If an agent has OPA-allowed access to an attacker-controlled host, it could construct a URL containing a placeholder and exfiltrate the resolved credential value to that host. OPA host restrictions are the defense — only endpoints explicitly allowed by policy receive traffic. Per-credential host binding (restricting which credentials resolve for which destination hosts) is not implemented.
+
+#### Data flow
+
+```mermaid
+sequenceDiagram
+    participant A as Agent Process
+    participant P as Proxy (SecretResolver)
+    participant O as OPA Engine
+    participant U as Upstream API
+
+    A->>P: GET /bot<placeholder>/send?key=<placeholder> HTTP/1.1<br/>Authorization: Bearer <placeholder>
+    P->>P: rewrite_target_for_eval(target)<br/>→ resolved: /bot{secret}/send?key={secret}<br/>→ redacted: /bot[CREDENTIAL]/send?key=[CREDENTIAL]
+    P->>O: evaluate_l7_request(redacted path)
+    O-->>P: allow
+    P->>P: rewrite_http_header_block(headers)<br/>→ resolve header placeholders<br/>→ resolve query param placeholders<br/>→ resolve path segment placeholders<br/>→ fail-closed scan
+    P->>U: GET /bot{secret}/send?key={secret} HTTP/1.1<br/>Authorization: Bearer {secret}
+    Note over P: Logs use redacted path only
+```
 
 ### REST protocol provider
 
@@ -961,7 +1233,7 @@ System CA bundles are searched at well-known paths: `/etc/ssl/certs/ca-certifica
 
 Implements `L7Provider` for HTTP/1.1:
 
-- **`parse_request()`**: Reads up to 16 KiB of headers, parses the request line (method, path), determines body framing from `Content-Length` or `Transfer-Encoding: chunked` headers. Returns `L7Request` with raw header bytes (may include overflow body bytes).
+- **`parse_request()`**: Reads up to 16 KiB of headers, parses the request line (method, path), decodes query parameters into a multimap, determines body framing from `Content-Length` or `Transfer-Encoding: chunked` headers. Returns `L7Request` with raw header bytes (may include overflow body bytes).
 
 - **`relay()`**: Forwards request headers and body to upstream (handling Content-Length, chunked, and no-body cases), then reads and relays the full response back to the client.
 
@@ -969,16 +1241,27 @@ Implements `L7Provider` for HTTP/1.1:
 
 - **`looks_like_http()`**: Protocol detection via first-byte peek -- checks for standard HTTP method prefixes (GET, HEAD, POST, PUT, DELETE, PATCH, OPTIONS, CONNECT, TRACE).
 
+### GraphQL protocol classifier
+
+**File:** `crates/openshell-sandbox/src/l7/graphql.rs`
+
+GraphQL inspection reuses the HTTP parser, then buffers the request body up to `graphql_max_body_bytes` for classification. It supports `GET` and `POST` GraphQL-over-HTTP envelopes, JSON batches, named operations, root fragment expansion, Apollo persisted-query hashes, and saved-query IDs (`id`, `documentId`, `queryId`). The classifier emits `GraphqlRequestInfo` with operation type, optional operation name, root fields, and persisted-query identifiers.
+
+Hash-only or saved-query-only requests cannot be parsed into operation fields. They are denied unless the endpoint sets `persisted_queries: allow_registered` and provides a trusted `graphql_persisted_queries` entry for the hash or ID. Batch requests are fail-closed: any malformed, denied, or unregistered operation denies the whole HTTP request.
+
 ### Per-request L7 evaluation
 
 `relay_with_inspection()` in `crates/openshell-sandbox/src/l7/relay.rs` is the main relay loop:
 
-1. Parse one HTTP request from client via the provider
-2. Build L7 input JSON with `request.method`, `request.path`, plus the CONNECT-level context (host, port, binary, ancestors, cmdline)
-3. Evaluate `data.openshell.sandbox.allow_request` and `data.openshell.sandbox.request_deny_reason`
-4. Log the L7 decision (tagged `L7_REQUEST`)
-5. If allowed (or audit mode): relay request to upstream and response back to client, then loop
-6. If denied in enforce mode: send 403 and close the connection
+1. Parse one HTTP request from client via the provider. Parser and path-canonicalization failures close the connection and emit a denied OCSF network event with the rejection reason in `status_detail`.
+2. Resolve credential placeholders in the request target via `rewrite_target_for_eval()`. OPA receives the redacted path (`[CREDENTIAL]` markers); the resolved path goes only to upstream. If resolution fails, return HTTP 500 and close the connection.
+3. Build L7 input JSON with `request.method`, the **redacted** `request.path`, `request.query_params`, optional `request.graphql`, plus the CONNECT-level context (host, port, binary, ancestors, cmdline)
+4. Evaluate `data.openshell.sandbox.allow_request` and `data.openshell.sandbox.request_deny_reason`
+5. Log the L7 decision (tagged `L7_REQUEST`) using the redacted target — real credential values never appear in logs
+6. If allowed (or audit mode): relay request to upstream via `relay_http_request_with_resolver()` (which rewrites all remaining credential placeholders in headers, query parameters, path segments, and Basic auth tokens) and relay the response back to client, then loop
+7. If denied in enforce mode: send 403 (using redacted target in the response body) and close the connection
+
+Before parsing, before evaluation, and before forwarding each request, the relay checks whether its captured policy generation still matches the shared engine generation. If not, it emits a denied OCSF network event and closes the tunnel without forwarding the request.
 
 ## Process Identity
 
@@ -993,11 +1276,13 @@ each cached entry stores:
 - File fingerprint (`len`, `mtime`, `ctime`, and on Unix `dev` + `inode`)
 
 `verify_or_cache(path)`:
+
 - **First call for a path**: Compute SHA256 via `procfs::file_sha256()`, store as the "golden" hash plus fingerprint, return the hash.
 - **Subsequent calls, unchanged fingerprint**: Return cached hash without re-hashing the file.
 - **Subsequent calls, changed fingerprint**: Recompute SHA256 and compare with cached value. Return `Ok(hash)` on match; return `Err` on mismatch (binary tampered/replaced mid-sandbox).
 
 The TOFU model means:
+
 - No hashes are specified in policy data -- the first observed binary is trusted
 - Once trusted, the binary cannot change for the sandbox's lifetime
 - Both the immediate binary and all ancestor binaries are TOFU-verified
@@ -1008,21 +1293,25 @@ The TOFU model means:
 
 The proxy resolves which binary is making each network request by inspecting `/proc`.
 
-**`resolve_tcp_peer_identity(entrypoint_pid, peer_port) -> (PathBuf, u32)`**
+**`resolve_tcp_peer_socket_owners(entrypoint_pid, peer_port) -> TcpPeerSocketOwners`**
 
 ```mermaid
 flowchart TD
     A["Parse /proc/{entrypoint}/net/tcp + tcp6"] --> B[Find ESTABLISHED socket with matching local port]
     B --> C[Extract socket inode]
-    C --> D["BFS collect descendants of entrypoint via /proc/{pid}/task/{tid}/children"]
-    D --> E["Scan /proc/{pid}/fd/* for socket:[inode] symlink"]
-    E --> F{Found?}
-    F -- Yes --> G["Read /proc/{pid}/exe -> binary path"]
-    F -- No --> H["Fallback: scan all /proc PIDs"]
-    H --> G
+    C --> D["BFS collect descendants of entrypoint via /proc/{pid}/task/{tid}/children, deduping PIDs"]
+    D --> E["Scan every descendant /proc/{pid}/fd/* for socket:[inode] symlink"]
+    E --> F["Fallback: scan all /proc PIDs not already checked"]
+    F --> G["Return all socket owner PIDs with source/depth metadata"]
+    G --> H["Read /proc/{pid}/exe, TOFU-check each owner and ancestor"]
+    H --> I{All owners same policy identity?}
+    I -- Yes --> J["Evaluate OPA once with the shared identity"]
+    I -- No --> K["Deny as ambiguous shared socket ownership"]
 ```
 
 Both IPv4 (`/proc/{pid}/net/tcp`) and IPv6 (`/proc/{pid}/net/tcp6`) tables are checked because some clients (notably gRPC C-core) use `AF_INET6` sockets with IPv4-mapped addresses.
+
+Multiple processes can hold the same socket inode after `fork()` or fd inheritance across `execve()`. The proxy treats that as ambiguous unless all socket owners resolve to the same policy identity: binary path, TOFU hash, ancestor chain, and cmdline-derived absolute paths. Ambiguous ownership is denied before OPA evaluation so a trusted co-owner cannot accidentally authorize traffic for a different process.
 
 **`collect_ancestor_binaries(pid, stop_pid) -> Vec<PathBuf>`**: Walk the PPid chain via `/proc/{pid}/status`, collecting `binary_path()` for each ancestor. Stops at PID 1, `stop_pid` (entrypoint), or after 64 levels (safety limit). Does not include `pid` itself.
 
@@ -1039,20 +1328,25 @@ Both IPv4 (`/proc/{pid}/net/tcp`) and IPv6 (`/proc/{pid}/net/tcp6`) tables are c
 Wraps `tokio::process::Child` + PID. Platform-specific `spawn()` methods delegate to `spawn_impl()`.
 
 **Environment setup** (both Linux and non-Linux):
+
 - `OPENSHELL_SANDBOX=1` (always set)
 - Provider credentials (from `GetSandboxProviderEnvironment` RPC)
 - Proxy URLs: `HTTP_PROXY`, `HTTPS_PROXY`, `ALL_PROXY` (uppercase for curl/wget), `NO_PROXY=127.0.0.1,localhost,::1` for localhost bypass, `http_proxy`, `https_proxy`, `grpc_proxy` (lowercase for gRPC C-core), `no_proxy=127.0.0.1,localhost,::1`, `NODE_USE_ENV_PROXY=1` (required for Node.js built-in `fetch`/`http` clients to honor proxy env vars)
 - TLS trust store: `NODE_EXTRA_CA_CERTS` (standalone CA cert), `SSL_CERT_FILE`, `REQUESTS_CA_BUNDLE`, `CURL_CA_BUNDLE` (combined bundle)
 
 **Pre-exec closure** (runs in child after fork, before exec -- async-signal-safe):
+
 1. `setpgid(0, 0)` if non-interactive (create new process group)
 2. `setns(fd, CLONE_NEWNET)` to enter network namespace (Linux only)
 3. `drop_privileges(policy)`: `initgroups()` -> `setgid()` -> `setuid()`
-4. `sandbox::apply(policy, workdir)`: Landlock then seccomp
+4. Disable core dumps with `setrlimit(RLIMIT_CORE, 0)` on Unix
+5. Set `prctl(PR_SET_DUMPABLE, 0)` on Linux
+6. `sandbox::apply(policy, workdir)`: Landlock then seccomp
 
 ### `drop_privileges()`
 
 Resolves user/group names from policy, then:
+
 1. `initgroups()` to set supplementary groups (Linux only, not macOS)
 2. `setgid()` to target group
 3. Verify `getegid()` matches the target GID
@@ -1063,6 +1357,8 @@ Resolves user/group names from policy, then:
 The ordering is significant: `initgroups`/`setgid` must happen before `setuid` because switching user may drop the privileges needed for group manipulation. Similarly, privilege dropping must happen before Landlock because Landlock may block access to `/etc/passwd` and `/etc/group`.
 
 Steps 3, 5, and 6 are defense-in-depth post-condition checks (CWE-250 / CERT POS37-C). All three syscalls (`geteuid`, `getegid`, `setuid`) are async-signal-safe, so they are safe to call in the `pre_exec` context. The checks add negligible overhead while guarding against hypothetical kernel-level defects that could cause `setuid`/`setgid` to return success without actually changing the effective IDs.
+
+After the privilege drop, the child process also disables core dumps before Landlock and seccomp are applied. On all Unix targets it sets `RLIMIT_CORE=0`; on Linux it additionally sets `PR_SET_DUMPABLE=0`. This prevents crash artifacts from containing provider credentials, request payloads, or other sensitive in-memory data.
 
 ### `ProcessStatus`
 
@@ -1076,30 +1372,24 @@ Exit code is `code` if the process exited normally, or `128 + signal` if killed 
 
 **File:** `crates/openshell-sandbox/src/ssh.rs`
 
-The embedded SSH server provides remote shell access to the sandbox. It uses the `russh` crate and allocates PTYs for interactive sessions.
+The embedded SSH server provides remote shell access to the sandbox. It uses the `russh` crate and allocates PTYs for interactive sessions. The daemon listens on a **Unix domain socket** rather than a TCP port -- the gateway never dials the sandbox pod directly. All SSH traffic arrives through the [supervisor session](#supervisor-session)'s `RelayStream` RPC, which the supervisor bridges into the socket.
 
 ### Startup
 
-`run_ssh_server()`:
-1. Generate an ephemeral Ed25519 host key via `russh::keys::PrivateKey::random()`
-2. Bind a `TcpListener` to the configured address
-3. Accept connections in a loop, spawning per-connection handlers
+`ssh_server_init()` (called from `run_ssh_server()`):
 
-### Handshake verification
+1. Generate an ephemeral Ed25519 host key via `russh::keys::PrivateKey::random()`.
+2. Ensure the socket's parent directory exists and is owned by root with mode `0700`. The sandbox entrypoint runs as an unprivileged user, so it cannot enter this directory.
+3. Remove any stale socket file from a prior run, then `UnixListener::bind(listen_path)`.
+4. Set the socket file's mode to `0600` so only the supervisor (root) can connect to it.
+5. Signal readiness back to `lib.rs` via a `oneshot` channel.
+6. Accept connections in a loop and spawn `handle_connection()` per connection.
 
-Before the SSH protocol begins, the server reads a preface line:
+The socket path is taken from `--ssh-socket-path` / `OPENSHELL_SSH_SOCKET_PATH`. The Kubernetes compute driver sets this to `/run/openshell/ssh.sock` by default (see `crates/openshell-driver-kubernetes/src/main.rs`); the VM driver pins it to the same path inside the guest.
 
-```
-NSSH1 {token} {timestamp} {nonce} {hmac_hex}\n
-```
+### Access control
 
-`verify_preface()`:
-1. Verify magic is `NSSH1` and exactly 5 fields
-2. Verify `|now - timestamp|` is within `--ssh-handshake-skew-secs` (default 300s)
-3. Compute `HMAC-SHA256(secret, "{token}|{timestamp}|{nonce}")` and compare with `{hmac_hex}`
-4. Send `OK\n` on success, `ERR\n` on failure
-
-This pre-SSH handshake authenticates the gateway-to-sandbox tunnel. After it succeeds, the SSH session uses permissive authentication (`auth_none` and `auth_publickey` both return `Accept`) since the transport is already verified.
+The filesystem permissions on the parent directory (`0700`) and the socket itself (`0600`) are the sole authentication boundary. Only the supervisor, which runs as root inside the container, can open the socket. The sandboxed entrypoint process -- dropped to the unprivileged `sandbox` user and further constrained by Landlock -- cannot reach `/run/openshell/` at all. Consequently, the SSH session handler's `auth_none` and `auth_publickey` callbacks both return `Auth::Accept` unconditionally; any byte stream that reaches the daemon has already passed the trust check via the socket's permission bits.
 
 ### Shell/exec handling
 
@@ -1114,6 +1404,7 @@ The `SshHandler` implements `russh::server::Handler`:
 ### PTY child process
 
 `spawn_pty_shell()`:
+
 1. `openpty()` to create a master/slave PTY pair
 2. Build `std::process::Command` (not tokio) with slave FDs for stdin/stdout/stderr
 3. Set environment: `OPENSHELL_SANDBOX=1`, `HOME=/sandbox`, `USER=sandbox`, `TERM={negotiated}`, proxy URLs, TLS trust store paths, provider credentials
@@ -1126,6 +1417,90 @@ The `SshHandler` implements `russh::server::Handler`:
    - **Writer thread**: Reads from `mpsc::Receiver`, writes to PTY master
    - **Reader thread**: Reads from PTY master, sends SSH channel data, sends EOF when done, signals the exit thread
    - **Exit thread**: Waits for child to exit, waits for reader to finish (ensures correct SSH protocol ordering: data -> EOF -> exit-status -> close), sends exit status and closes the channel
+
+## Supervisor Session
+
+**File:** `crates/openshell-sandbox/src/supervisor_session.rs`
+
+The sandbox pod has no inbound network surface. Instead, the supervisor opens a single persistent outbound gRPC stream to the gateway and the gateway uses that stream to request on-demand byte relays back into the sandbox. All SSH connect traffic and `ExecSandbox` calls ride this connection -- there is no reverse HTTP CONNECT, no TCP listener on the pod, and no per-session TLS handshake.
+
+### Connection model
+
+```mermaid
+sequenceDiagram
+    participant S as Supervisor (sandbox)
+    participant GW as Gateway
+    participant SSHD as Local sshd (Unix socket)
+    participant Client as Operator / CLI
+
+    S->>GW: ConnectSupervisor stream (mTLS, HTTP/2)
+    S->>GW: SupervisorMessage::Hello{sandbox_id, instance_id}
+    GW-->>S: GatewayMessage::SessionAccepted{session_id, heartbeat_interval_secs}
+    loop Heartbeats (max(accepted.heartbeat_interval_secs, 5))
+        S-->>GW: SupervisorHeartbeat
+        GW-->>S: GatewayHeartbeat
+    end
+
+    Client->>GW: sandbox connect / ExecSandbox
+    GW-->>S: GatewayMessage::RelayOpen{channel_id}
+    S->>GW: RelayStream RPC (new HTTP/2 stream on same Channel)
+    S->>GW: RelayFrame::Init{channel_id}
+    S->>SSHD: UnixStream::connect(ssh_socket_path)
+    loop Relay active
+        GW-->>S: RelayFrame::Data (raw SSH bytes from operator)
+        S->>SSHD: write_all
+        SSHD-->>S: read chunk (up to 16 KiB)
+        S-->>GW: RelayFrame::Data
+    end
+```
+
+One TCP+TLS+HTTP/2 connection carries both the long-lived control stream and every concurrent relay. The sandbox-side `Endpoint` uses `adaptive_window(true)` so HTTP/2 flow control does not throttle bulk transfers (SFTP, `sandbox rsync`) to the 64 KiB default window.
+
+### Session lifecycle
+
+`spawn(endpoint, sandbox_id, ssh_socket_path)` launches `run_session_loop()`, which runs for the lifetime of the supervisor:
+
+1. **Connect**: `grpc_client::connect_channel_pub(endpoint)` builds an mTLS `tonic::transport::Channel`. The same `Channel` is cloned into every subsequent `RelayStream` call so no additional TLS handshakes occur.
+2. **Hello**: The supervisor sends `SupervisorMessage::Hello { sandbox_id, instance_id }` as the first envelope, where `instance_id` is a fresh UUID per session. The gateway uses the sandbox ID and instance ID to supersede a stale prior session (see [Supersede](#session-supersede)).
+3. **Wait for `SessionAccepted` / `SessionRejected`**: If rejected, the loop returns an error and backs off. On accept, the supervisor clamps `heartbeat_interval_secs` to a minimum of 5 seconds.
+4. **Main select loop**: Concurrently reads inbound `GatewayMessage`s and fires heartbeat ticks. Inbound `Heartbeat` messages are acknowledged by the supervisor's outbound heartbeat cadence; `RelayOpen` and `RelayClose` are dispatched to `handle_gateway_message()`.
+5. **Reconnect**: Any error in the session (stream error, connect failure, rejected hello) is reported as an OCSF event and the loop sleeps with exponential backoff (`INITIAL_BACKOFF = 1s`, doubled up to `MAX_BACKOFF = 30s`) before redialing.
+
+### Relay bridge loop
+
+`handle_gateway_message()` is a synchronous dispatcher. When a `RelayOpen { channel_id }` arrives, it spawns a dedicated task running `handle_relay_open()`. That task:
+
+1. Creates an outbound `mpsc::channel::<RelayFrame>(16)` wrapped in a `ReceiverStream`.
+2. Sends `RelayFrame { payload: RelayInit { channel_id } }` as the first frame -- this claims the matching pending-relay slot on the gateway.
+3. Calls `OpenShellClient::relay_stream(outbound)` on the shared `Channel`. This opens a new HTTP/2 stream on the existing connection -- no new TCP or TLS handshake.
+4. `UnixStream::connect(ssh_socket_path)` dials the local sshd. The split read/write halves become the local endpoints of the bridge.
+5. Spawns a task that reads from the Unix socket in 16 KiB chunks (`RELAY_CHUNK_SIZE`, matching the default HTTP/2 frame size) and forwards each chunk as `RelayFrame::Data` on the outbound stream.
+6. The main loop drains inbound `RelayFrame::Data` messages and writes them to the socket. Non-data inbound frames (e.g. a second `Init`) are treated as protocol errors.
+7. On any side closing, the bridge calls `ssh_w.shutdown()` to propagate EOF, drops the outbound sender to close the gRPC stream, and joins the reader task.
+
+The supervisor has no SSH or HTTP awareness -- it is purely a byte bridge. The protocol on top of the relay is whatever the gateway's caller (interactive `sandbox connect`, `ExecSandbox`, `rsync`-over-ssh) speaks to the sshd.
+
+### Session supersede
+
+If the gateway restarts or the sandbox restarts and reconnects with a new `instance_id` for the same `sandbox_id`, the gateway atomically replaces any prior session it has recorded. The new supervisor continues normally; the old stream (if still live on the gateway side) is torn down by the gateway's `remove_if_current` logic. Supervisors never need to coordinate between themselves -- each just keeps trying to connect, and the most recent `Hello` wins.
+
+If the gateway closes the stream cleanly (`inbound.message()` returns `Ok(None)`), `run_single_session` returns `Ok(())` and a `session_closed` event is emitted. Otherwise the loop reconnects.
+
+### OCSF telemetry
+
+Every session and relay transition emits an OCSF `NetworkActivity` event via `ocsf_emit!()` so operators can audit the control-plane connection from the sandbox's own logs. All events are built in `supervisor_session.rs` and covered by unit tests in the `ocsf_event_tests` module.
+
+| Helper | `activity_id` | `severity` | `status` | Fires when |
+|--------|---------------|------------|----------|------------|
+| `session_established_event` | `Open` | `Informational` | `Success` | After `SessionAccepted`, includes `session_id` and `heartbeat_secs` in the message |
+| `session_closed_event` | `Close` | `Informational` | `Success` | Gateway closed the stream cleanly (`Ok(None)`) |
+| `session_failed_event` | `Fail` | `Low` | `Failure` | Connect failed, hello rejected, or stream errored. Includes reconnect attempt counter |
+| `relay_open_event` | `Open` | `Informational` | `Success` | `RelayOpen` received from the gateway |
+| `relay_closed_event` | `Close` | `Informational` | `Success` | Relay bridge task exited without error |
+| `relay_failed_event` | `Fail` | `Low` | `Failure` | Bridge task returned an error (e.g., socket write failure, inbound non-data frame) |
+| `relay_close_from_gateway_event` | `Close` | `Informational` | -- | Gateway sent an explicit `RelayClose` on the control stream, with its `reason` |
+
+The `dst_endpoint` on session events is parsed from the gateway URI by `ocsf_gateway_endpoint()`. Relay events omit a destination (the bridge is sandbox-internal).
 
 ## Zombie Reaping (PID 1 Init Duties)
 
@@ -1157,9 +1532,7 @@ This two-phase approach (peek with `WNOWAIT`, then selectively reap) avoids `ECH
 | `OPENSHELL_LOG_LEVEL` | `--log-level` | `warn` | Log level (trace/debug/info/warn/error) |
 | `OPENSHELL_POLICY_POLL_INTERVAL_SECS` | | `30` | Poll interval for gRPC policy updates (seconds). Only active in gRPC mode. |
 | `OPENSHELL_LOG_PUSH_LEVEL` | | `info` | Maximum tracing level for log push to gateway. Events above this level are not streamed. Only active in gRPC mode. |
-| `OPENSHELL_SSH_LISTEN_ADDR` | `--ssh-listen-addr` | | SSH server bind address |
-| `OPENSHELL_SSH_HANDSHAKE_SECRET` | `--ssh-handshake-secret` | | HMAC secret for SSH handshake |
-| `OPENSHELL_SSH_HANDSHAKE_SKEW_SECS` | `--ssh-handshake-skew-secs` | `300` | Allowed clock skew for handshake |
+| `OPENSHELL_SSH_SOCKET_PATH` | `--ssh-socket-path` | | Filesystem path to the Unix socket the embedded sshd binds (e.g. `/run/openshell/ssh.sock`). |
 | `OPENSHELL_INFERENCE_ROUTES` | `--inference-routes` | | Path to YAML inference routes file for standalone routing |
 
 ### Injected into child process
@@ -1213,8 +1586,8 @@ The sandbox uses `miette` for error reporting and `thiserror` for typed errors. 
 | SSRF: DNS resolution failure | Deny the specific CONNECT request |
 | Inference route file load/parse error | Fatal -- sandbox startup aborts |
 | Inference route file with empty routes | Inference routing disabled (graceful) |
-| Inference cluster bundle with empty routes | Inference routing stays enabled with empty cache; refresh can activate routes later |
-| Inference cluster bundle fetch failure | Warn + inference routing disabled (graceful) |
+| Inference gateway bundle with empty routes | Inference routing stays enabled with empty cache; refresh can activate routes later |
+| Inference gateway bundle fetch failure | Warn + inference routing disabled (graceful) |
 | Inference interception: missing InferenceContext | Denied outcome + structured CONNECT deny log |
 | Inference interception: missing TLS state | Denied outcome + structured CONNECT deny log |
 | Inference interception: TLS handshake failure | Denied outcome + structured CONNECT deny log |
@@ -1231,20 +1604,35 @@ The sandbox uses `miette` for error reporting and `thiserror` for typed errors. 
 | Log push gRPC stream breaks | Push loop exits, flushes remaining batch |
 | Proxy accept error | Log + break accept loop |
 | Benign connection close (EOF, reset, pipe) | Debug level (not visible to user by default) |
-| L7 parse error | Close the connection |
-| SSH server failure | Async task error logged, main process unaffected |
+| Credential injection: unresolved placeholder detected | HTTP 500, connection closed (fail-closed) |
+| Credential injection: resolved value contains CR/LF/null | Placeholder treated as unresolvable, fail-closed |
+| Credential injection: path credential contains traversal/separator | HTTP 500, connection closed (fail-closed) |
+| Credential injection: percent-encoded placeholder bypass attempt | HTTP 500, connection closed (fail-closed) |
+| L7 parse or path-canonicalization error | Emit denied OCSF network event with `status_detail`, close the connection |
+| SSH socket bind failure | Fatal -- reported through the readiness channel and aborts startup |
+| SSH server accept failure | Async task error logged, main process unaffected |
+| Supervisor session: connect failure | Emit `session_failed` OCSF event, sleep with exponential backoff (1s -> 30s) and reconnect |
+| Supervisor session: `SessionRejected` | Emit `session_failed` event with rejection reason; backoff and reconnect |
+| Supervisor session: stream error mid-session | Emit `session_failed` event; backoff and reconnect |
+| Supervisor session: gateway closes stream cleanly | Emit `session_closed` event and exit the task (no reconnect) |
+| Relay bridge: `RelayStream` RPC failure | Emit `relay_failed` event; the individual relay is abandoned, the session stays up |
+| Relay bridge: Unix socket connect failure | Emit `relay_failed` event; gateway observes EOF on the RelayStream |
+| Relay bridge: non-data inbound frame after Init | Emit `relay_failed` event with protocol error |
 | Process timeout | Kill process, return exit code 124 |
 
 ## Logging
 
 Dual-output logging is configured in `main.rs`:
+
 - **stdout**: Filtered by `--log-level` (default `warn`), uses ANSI colors
 - **`/var/log/openshell.log`**: Fixed at `info` level, no ANSI, non-blocking writer
 
 Key structured log events:
+
 - `CONNECT`: One per proxy CONNECT request (for non-`inference.local` targets) with full identity context. Inference interception failures produce a separate `info!()` log with `action=deny` and the denial reason.
 - `BYPASS_DETECT`: One per detected direct connection attempt that bypassed the HTTP CONNECT proxy. Includes destination, protocol, process identity (best-effort), and remediation hint. Emitted at `warn` level.
 - `L7_REQUEST`: One per L7-inspected request with method, path, and decision
+- Supervisor session / relay OCSF events: `session_established`, `session_closed`, `session_failed`, `relay_open`, `relay_closed`, `relay_failed`, `relay_close_from_gateway` (see [Supervisor Session](#supervisor-session)).
 - Sandbox lifecycle events: process start, exit, namespace creation/cleanup, bypass rule installation
 - Policy reload events: new version detected, reload success/failure, status report outcomes
 
@@ -1275,6 +1663,7 @@ flowchart LR
 ```
 
 Two log sources feed the same `TracingLogBus`:
+
 - **Gateway logs** (`source: "gateway"`): Generated by the server's `SandboxLogLayer` tracing layer when server-side code emits events containing a `sandbox_id` field. These capture reconciliation, provisioning, and management operations.
 - **Sandbox logs** (`source: "sandbox"`): Pushed from the sandbox supervisor via the `PushSandboxLogs` client-streaming RPC. These capture proxy decisions, policy reloads, process lifecycle, and all other sandbox-internal tracing events.
 
@@ -1293,6 +1682,7 @@ pub struct LogPushLayer {
 ```
 
 Key behaviors:
+
 - **Level filtering**: Defaults to `INFO`. Configurable via the `OPENSHELL_LOG_PUSH_LEVEL` environment variable (accepts `trace`, `debug`, `info`, `warn`, `error`). Events above the configured level are silently discarded.
 - **Best-effort delivery**: Uses `try_send()` on the mpsc channel. If the channel is full (1024 lines buffered), the event is dropped. Logging never blocks the sandbox supervisor.
 - **Structured fields**: Implements a `LogVisitor` that collects all tracing key-value fields (e.g., `dst_host`, `action`, `policy`) into a `HashMap<String, String>`. The `message` field is extracted separately; all other fields go into `SandboxLogLine.fields`.
@@ -1329,6 +1719,7 @@ The background task batches log lines and streams them to the gateway:
 **File:** `crates/openshell-server/src/grpc.rs` (`push_sandbox_logs`)
 
 The `PushSandboxLogs` RPC handler processes each batch:
+
 1. Validates `sandbox_id` is non-empty (skips empty batches).
 2. Iterates over `batch.logs`, capped at 100 lines per batch to prevent abuse.
 3. Forces `log.source = "sandbox"` on every line -- the sandbox cannot claim to be the gateway.
@@ -1340,6 +1731,7 @@ The `PushSandboxLogs` RPC handler processes each batch:
 **File:** `crates/openshell-server/src/tracing_bus.rs`
 
 `publish_external()` wraps the `SandboxLogLine` in a `SandboxStreamEvent` and calls the internal `publish()` method, which:
+
 1. Sends the event to the per-sandbox `broadcast::Sender` (capacity 1024). Subscribers (active `WatchSandbox` streams) receive the event immediately.
 2. Appends the event to the per-sandbox tail buffer (`VecDeque`), capped at 2000 lines. Overflow evicts the oldest entry.
 
@@ -1413,12 +1805,13 @@ Filtering is implemented server-side. For `WatchSandbox`, filters apply to both 
 
 `print_log_line()` in `crates/openshell-cli/src/run.rs` formats each log line:
 
-```
+```text
 [timestamp] [source ] [level] [target] message key=value key=value
 ```
 
 Example output:
-```
+
+```text
 [1708891234.567] [sandbox] [INFO ] [openshell_sandbox::proxy] CONNECT api.example.com:443 dst_host=api.example.com action=allow
 [1708891234.890] [gateway] [INFO ] [openshell_server::grpc] ReportPolicyStatus: sandbox reported policy load result
 ```

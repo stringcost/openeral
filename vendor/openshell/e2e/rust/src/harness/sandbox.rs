@@ -25,7 +25,11 @@ fn extract_sandbox_name(output: &str) -> Option<String> {
 }
 
 /// Default timeout for waiting for a sandbox to become ready.
-const SANDBOX_READY_TIMEOUT: Duration = Duration::from_secs(300);
+/// In VM mode, the overlayfs snapshotter re-extracts all image layers
+/// from the content store on every boot (~250s for the 1GB sandbox
+/// base image), so 600s accommodates extraction + workspace-init + pod
+/// startup.
+const SANDBOX_READY_TIMEOUT: Duration = Duration::from_secs(600);
 
 /// RAII guard that deletes a sandbox on drop.
 ///
@@ -70,9 +74,11 @@ impl SandboxGuard {
         }
         cmd.stdout(Stdio::piped()).stderr(Stdio::piped());
 
-        let output = cmd
-            .output()
+        let output = timeout(SANDBOX_READY_TIMEOUT, cmd.output())
             .await
+            .map_err(|_| {
+                format!("sandbox create timed out after {SANDBOX_READY_TIMEOUT:?}")
+            })?
             .map_err(|e| format!("failed to spawn openshell: {e}"))?;
 
         let stdout = String::from_utf8_lossy(&output.stdout).to_string();
@@ -147,10 +153,10 @@ impl SandboxGuard {
                 accumulated.push('\n');
 
                 // Try to extract the sandbox name from the header.
-                if name.is_none() {
-                    if let Some(n) = extract_sandbox_name(&accumulated) {
-                        name = Some(n);
-                    }
+                if name.is_none()
+                    && let Some(n) = extract_sandbox_name(&accumulated)
+                {
+                    name = Some(n);
                 }
 
                 // Check for the ready marker.
@@ -222,9 +228,13 @@ impl SandboxGuard {
             .args(command);
         cmd.stdout(Stdio::piped()).stderr(Stdio::piped());
 
-        let output = cmd
-            .output()
+        let output = timeout(SANDBOX_READY_TIMEOUT, cmd.output())
             .await
+            .map_err(|_| {
+                format!(
+                    "sandbox create --upload timed out after {SANDBOX_READY_TIMEOUT:?}"
+                )
+            })?
             .map_err(|e| format!("failed to spawn openshell: {e}"))?;
 
         let stdout = String::from_utf8_lossy(&output.stdout).to_string();

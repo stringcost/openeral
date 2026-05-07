@@ -1,7 +1,7 @@
 // SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
-//! OpenShell Sandbox library.
+//! `OpenShell` Sandbox library.
 //!
 //! This crate provides process sandboxing and monitoring capabilities.
 
@@ -22,31 +22,85 @@ pub mod proxy;
 mod sandbox;
 mod secrets;
 mod ssh;
+mod supervisor_session;
 
 use miette::{IntoDiagnostic, Result};
 #[cfg(target_os = "linux")]
 use std::collections::HashSet;
+use std::future::Future;
 use std::net::SocketAddr;
 use std::sync::Arc;
+use std::sync::LazyLock;
+#[cfg(any(target_os = "linux", test))]
+use std::sync::Mutex;
+use std::sync::OnceLock;
 use std::sync::atomic::{AtomicU32, Ordering};
-#[cfg(target_os = "linux")]
-use std::sync::{LazyLock, Mutex};
 use std::time::Duration;
 use tokio::time::timeout;
-use tracing::{debug, error, info, trace, warn};
+use tracing::{debug, info, trace, warn};
+
+use openshell_ocsf::{
+    ActionId, ActivityId, AppLifecycleBuilder, ConfigStateChangeBuilder, DetectionFindingBuilder,
+    DispositionId, FindingInfo, LaunchTypeId, Process as OcsfProcess, ProcessActivityBuilder,
+    SandboxContext, SeverityId, StateId, StatusId, ocsf_emit,
+};
+
+// ---------------------------------------------------------------------------
+// OCSF Context
+// ---------------------------------------------------------------------------
+//
+// The following log sites intentionally remain as plain `tracing` macros
+// and are NOT migrated to OCSF builders:
+//
+// - DEBUG/TRACE events (zombie reaping, ip commands, gRPC connects, PTY state)
+// - Transient "about to do X" events where the result is logged separately
+//   (e.g., "Fetching sandbox policy via gRPC", "Creating OPA engine from proto")
+// - Internal SSH channel warnings (unknown channel, PTY resize failures)
+// - Denial flush telemetry (the individual denials are already OCSF events)
+// - Status reporting failures (sync to gateway, non-actionable)
+// - Route refresh interval validation warnings
+//
+// These are operational plumbing that don't represent security decisions,
+// policy changes, or observable sandbox behavior worth structuring.
+// ---------------------------------------------------------------------------
+
+/// Process-wide OCSF sandbox context. Initialized once during `run_sandbox()`
+/// startup and accessible from any module in the crate via [`ocsf_ctx()`].
+static OCSF_CTX: OnceLock<SandboxContext> = OnceLock::new();
+
+/// Fallback context used when `OCSF_CTX` has not been initialized (e.g. in
+/// unit tests that exercise individual functions without calling `run_sandbox`).
+static OCSF_CTX_FALLBACK: LazyLock<SandboxContext> = LazyLock::new(|| SandboxContext {
+    sandbox_id: String::new(),
+    sandbox_name: String::new(),
+    container_image: String::new(),
+    hostname: "test".to_string(),
+    product_version: openshell_core::VERSION.to_string(),
+    proxy_ip: std::net::IpAddr::from([127, 0, 0, 1]),
+    proxy_port: 3128,
+});
+
+/// Return a reference to the process-wide [`SandboxContext`].
+///
+/// Falls back to a default context if `run_sandbox()` has not yet been called
+/// (e.g. during unit tests).
+pub(crate) fn ocsf_ctx() -> &'static SandboxContext {
+    OCSF_CTX.get().unwrap_or(&OCSF_CTX_FALLBACK)
+}
 
 use crate::identity::BinaryIdentityCache;
 use crate::l7::tls::{
-    CertCache, ProxyTlsState, SandboxCa, build_upstream_client_config,
-    write_ca_files_with_extra_certs,
+    CertCache, ProxyTlsState, SandboxCa, build_upstream_client_config, read_system_ca_bundle,
+    write_ca_files,
 };
 use crate::opa::OpaEngine;
 use crate::policy::{NetworkMode, NetworkPolicy, ProxyPolicy, SandboxPolicy};
-use crate::proxy::{PackageProxyConfig, ProxyHandle};
+use crate::proxy::ProxyHandle;
 #[cfg(target_os = "linux")]
 use crate::sandbox::linux::netns::NetworkNamespace;
 use crate::secrets::SecretResolver;
 pub use process::{ProcessHandle, ProcessStatus};
+pub use sandbox::apply_supervisor_startup_hardening;
 
 /// Default interval (seconds) for re-fetching the inference route bundle from
 /// the gateway in cluster mode. Override at runtime with the
@@ -81,27 +135,27 @@ fn disable_inference_on_empty_routes(source: InferenceRouteSource) -> bool {
 }
 
 fn route_refresh_interval_secs() -> u64 {
-    match std::env::var("OPENSHELL_ROUTE_REFRESH_INTERVAL_SECS") {
-        Ok(value) => match value.parse::<u64>() {
-            Ok(interval) if interval > 0 => interval,
-            Ok(_) => {
-                warn!(
-                    default_interval_secs = DEFAULT_ROUTE_REFRESH_INTERVAL_SECS,
-                    "Ignoring zero route refresh interval"
-                );
-                DEFAULT_ROUTE_REFRESH_INTERVAL_SECS
-            }
-            Err(error) => {
-                warn!(
-                    interval = %value,
-                    error = %error,
-                    default_interval_secs = DEFAULT_ROUTE_REFRESH_INTERVAL_SECS,
-                    "Ignoring invalid route refresh interval"
-                );
-                DEFAULT_ROUTE_REFRESH_INTERVAL_SECS
-            }
-        },
-        Err(_) => DEFAULT_ROUTE_REFRESH_INTERVAL_SECS,
+    let Ok(value) = std::env::var("OPENSHELL_ROUTE_REFRESH_INTERVAL_SECS") else {
+        return DEFAULT_ROUTE_REFRESH_INTERVAL_SECS;
+    };
+    match value.parse::<u64>() {
+        Ok(interval) if interval > 0 => interval,
+        Ok(_) => {
+            warn!(
+                default_interval_secs = DEFAULT_ROUTE_REFRESH_INTERVAL_SECS,
+                "Ignoring zero route refresh interval"
+            );
+            DEFAULT_ROUTE_REFRESH_INTERVAL_SECS
+        }
+        Err(error) => {
+            warn!(
+                interval = %value,
+                error = %error,
+                default_interval_secs = DEFAULT_ROUTE_REFRESH_INTERVAL_SECS,
+                "Ignoring invalid route refresh interval"
+            );
+            DEFAULT_ROUTE_REFRESH_INTERVAL_SECS
+        }
     }
 }
 
@@ -158,21 +212,48 @@ pub async fn run_sandbox(
     openshell_endpoint: Option<String>,
     policy_rules: Option<String>,
     policy_data: Option<String>,
-    ssh_listen_addr: Option<String>,
+    ssh_socket_path: Option<String>,
     ssh_handshake_secret: Option<String>,
     ssh_handshake_skew_secs: u64,
     _health_check: bool,
     _health_port: u16,
     inference_routes: Option<String>,
+    ocsf_enabled: Arc<std::sync::atomic::AtomicBool>,
 ) -> Result<i32> {
     let (program, args) = command
         .split_first()
         .ok_or_else(|| miette::miette!("No command specified"))?;
 
+    // Initialize the process-wide OCSF context early so that events emitted
+    // during policy loading (filesystem config, validation) have a context.
+    // Proxy IP/port use defaults here; they are only significant for network
+    // events which happen after the netns is created.
+    {
+        let hostname = std::fs::read_to_string("/etc/hostname").map_or_else(
+            |_| "openshell-sandbox".to_string(),
+            |s| s.trim().to_string(),
+        );
+
+        if OCSF_CTX
+            .set(SandboxContext {
+                sandbox_id: sandbox_id.clone().unwrap_or_default(),
+                sandbox_name: sandbox.as_deref().unwrap_or_default().to_string(),
+                container_image: std::env::var("OPENSHELL_CONTAINER_IMAGE").unwrap_or_default(),
+                hostname,
+                product_version: openshell_core::VERSION.to_string(),
+                proxy_ip: std::net::IpAddr::from([127, 0, 0, 1]),
+                proxy_port: 3128,
+            })
+            .is_err()
+        {
+            debug!("OCSF context already initialized, keeping existing");
+        }
+    }
+
     // Load policy and initialize OPA engine
     let openshell_endpoint_for_proxy = openshell_endpoint.clone();
     let sandbox_name_for_agg = sandbox.clone();
-    let (mut policy, opa_engine) = load_policy(
+    let (mut policy, opa_engine, retained_proto) = load_policy(
         sandbox_id.clone(),
         sandbox,
         openshell_endpoint.clone(),
@@ -192,11 +273,30 @@ pub async fn run_sandbox(
     let provider_env = if let (Some(id), Some(endpoint)) = (&sandbox_id, &openshell_endpoint) {
         match grpc_client::fetch_provider_environment(endpoint, id).await {
             Ok(env) => {
-                info!(env_count = env.len(), "Fetched provider environment");
+                ocsf_emit!(
+                    ConfigStateChangeBuilder::new(ocsf_ctx())
+                        .severity(SeverityId::Informational)
+                        .status(StatusId::Success)
+                        .state(StateId::Enabled, "loaded")
+                        .message(format!(
+                            "Fetched provider environment [env_count:{}]",
+                            env.len()
+                        ))
+                        .build()
+                );
                 env
             }
             Err(e) => {
-                warn!(error = %e, "Failed to fetch provider environment, continuing without");
+                ocsf_emit!(
+                    ConfigStateChangeBuilder::new(ocsf_ctx())
+                        .severity(SeverityId::Medium)
+                        .status(StatusId::Failure)
+                        .state(StateId::Other, "degraded")
+                        .message(format!(
+                            "Failed to fetch provider environment, continuing without: {e}"
+                        ))
+                        .build()
+                );
                 std::collections::HashMap::new()
             }
         }
@@ -204,19 +304,17 @@ pub async fn run_sandbox(
         std::collections::HashMap::new()
     };
 
-    // Set up FUSE mounts BEFORE SecretResolver transforms provider_env.
-    // SecretResolver replaces credential values with openshell:resolve:env: references,
-    // but FUSE daemons need the actual values (database connection strings, etc.).
+    // Prepare normal filesystem paths before FUSE so mountpoints exist with the
+    // sandbox user ownership expected by the child process.
     prepare_filesystem(&policy)?;
+
+    // Set up FUSE mounts before SecretResolver transforms provider_env.
+    // SecretResolver replaces credential values with openshell:resolve:env:*
+    // placeholders for child processes, but FUSE daemons need the real values.
     let _fuse_daemons = fuse::setup_fuse_mounts(&mut policy, &provider_env)?;
 
     let (provider_env, secret_resolver) = SecretResolver::from_provider_env(provider_env);
     let secret_resolver = secret_resolver.map(Arc::new);
-    let package_proxy = PackageProxyConfig::from_env()?;
-    let package_proxy_extra_certs = package_proxy
-        .as_ref()
-        .map(PackageProxyConfig::extra_ca_paths)
-        .unwrap_or_default();
 
     // Create identity cache for SHA256 TOFU when OPA is active
     let identity_cache = opa_engine
@@ -229,31 +327,51 @@ pub async fn run_sandbox(
         match SandboxCa::generate() {
             Ok(ca) => {
                 let tls_dir = std::path::Path::new("/etc/openshell-tls");
-                match write_ca_files_with_extra_certs(&ca, tls_dir, &package_proxy_extra_certs) {
+                let system_ca_bundle = read_system_ca_bundle();
+                match write_ca_files(&ca, tls_dir, &system_ca_bundle) {
                     Ok(paths) => {
                         // /etc/openshell-tls is subsumed by the /etc baseline
                         // path injected by enrich_*_baseline_paths(), so no
                         // explicit Landlock entry is needed here.
 
-                        let upstream_config = build_upstream_client_config();
+                        let upstream_config = build_upstream_client_config(&system_ca_bundle);
                         let cert_cache = CertCache::new(ca);
                         let state = Arc::new(ProxyTlsState::new(cert_cache, upstream_config));
-                        info!("TLS termination enabled: ephemeral CA generated");
+                        ocsf_emit!(
+                            ConfigStateChangeBuilder::new(ocsf_ctx())
+                                .severity(SeverityId::Informational)
+                                .status(StatusId::Success)
+                                .state(StateId::Enabled, "enabled")
+                                .message("TLS termination enabled: ephemeral CA generated")
+                                .build()
+                        );
                         (Some(state), Some(paths))
                     }
                     Err(e) => {
-                        tracing::warn!(
-                            error = %e,
-                            "Failed to write CA files, TLS termination disabled"
+                        ocsf_emit!(
+                            ConfigStateChangeBuilder::new(ocsf_ctx())
+                                .severity(SeverityId::Medium)
+                                .status(StatusId::Failure)
+                                .state(StateId::Disabled, "disabled")
+                                .message(format!(
+                                    "Failed to write CA files, TLS termination disabled: {e}"
+                                ))
+                                .build()
                         );
                         (None, None)
                     }
                 }
             }
             Err(e) => {
-                tracing::warn!(
-                    error = %e,
-                    "Failed to generate ephemeral CA, TLS termination disabled"
+                ocsf_emit!(
+                    ConfigStateChangeBuilder::new(ocsf_ctx())
+                        .severity(SeverityId::Medium)
+                        .status(StatusId::Failure)
+                        .state(StateId::Disabled, "disabled")
+                        .message(format!(
+                            "Failed to generate ephemeral CA, TLS termination disabled: {e}"
+                        ))
+                        .build()
                 );
                 (None, None)
             }
@@ -279,9 +397,15 @@ pub async fn run_sandbox(
                     .and_then(|p| p.http_addr)
                     .map_or(3128, |addr| addr.port());
                 if let Err(e) = ns.install_bypass_rules(proxy_port) {
-                    warn!(
-                        error = %e,
-                        "Failed to install bypass detection rules (non-fatal)"
+                    ocsf_emit!(
+                        ConfigStateChangeBuilder::new(ocsf_ctx())
+                            .severity(SeverityId::Medium)
+                            .status(StatusId::Failure)
+                            .state(StateId::Disabled, "degraded")
+                            .message(format!(
+                                "Failed to install bypass detection rules (non-fatal): {e}"
+                            ))
+                            .build()
                     );
                 }
                 Some(ns)
@@ -302,6 +426,11 @@ pub async fn run_sandbox(
     #[cfg(not(target_os = "linux"))]
     #[allow(clippy::no_effect_underscore_binding)]
     let _netns: Option<()> = None;
+
+    // Install the supervisor seccomp prelude after privileged startup helpers
+    // (network namespace setup, iptables probes) complete, but before the SSH
+    // listener and workload process are exposed.
+    apply_supervisor_startup_hardening()?;
 
     // Shared PID: set after process spawn so the proxy can look up
     // the entrypoint process's /proc/net/tcp for identity binding.
@@ -359,7 +488,6 @@ pub async fn run_sandbox(
             tls_state,
             inference_ctx,
             secret_resolver.clone(),
-            package_proxy.clone(),
             denial_tx,
         )
         .await?;
@@ -372,15 +500,13 @@ pub async fn run_sandbox(
     // Reads /dev/kmsg for iptables LOG entries and emits structured
     // tracing events for direct connection attempts that bypass the proxy.
     #[cfg(target_os = "linux")]
-    let _bypass_monitor = if netns.is_some() {
+    let _bypass_monitor = netns.as_ref().and_then(|ns| {
         bypass_monitor::spawn(
-            netns.as_ref().expect("netns is Some").name().to_string(),
+            ns.name().to_string(),
             entrypoint_pid.clone(),
             bypass_denial_tx,
         )
-    } else {
-        None
-    };
+    });
 
     // On non-Linux, bypass_denial_tx is unused (no /dev/kmsg).
     #[cfg(not(target_os = "linux"))]
@@ -477,11 +603,11 @@ pub async fn run_sandbox(
                 }
 
                 match waitpid(pid, Some(WaitPidFlag::WNOHANG)) {
-                    Ok(WaitStatus::StillAlive) | Err(nix::errno::Errno::ECHILD) => {}
+                    Ok(WaitStatus::StillAlive)
+                    | Err(nix::errno::Errno::ECHILD | nix::errno::Errno::EINTR) => {}
                     Ok(reaped) => {
                         tracing::debug!(?reaped, "Reaped orphaned child process");
                     }
-                    Err(nix::errno::Errno::EINTR) => {}
                     Err(e) => {
                         tracing::debug!(error = %e, "waitpid error during orphan reap");
                         break;
@@ -491,18 +617,12 @@ pub async fn run_sandbox(
         }
     });
 
-    if let Some(listen_addr) = ssh_listen_addr {
-        let addr: SocketAddr = listen_addr.parse().into_diagnostic()?;
+    let ssh_socket_path: Option<std::path::PathBuf> = ssh_socket_path.map(std::path::PathBuf::from);
+    if let Some(listen_path) = ssh_socket_path.clone() {
         let policy_clone = policy.clone();
         let workdir_clone = workdir.clone();
-        let secret = ssh_handshake_secret
-            .filter(|s| !s.is_empty())
-            .ok_or_else(|| {
-                miette::miette!(
-                    "OPENSHELL_SSH_HANDSHAKE_SECRET is required when SSH is enabled.\n\
-                     Set --ssh-handshake-secret or the OPENSHELL_SSH_HANDSHAKE_SECRET env var."
-                )
-            })?;
+        let _ = ssh_handshake_secret; // retained in the signature for compat; unused
+        let _ = ssh_handshake_skew_secs;
         let proxy_url = ssh_proxy_url;
         let netns_fd = ssh_netns_fd;
         let ca_paths = ca_file_paths.clone();
@@ -512,12 +632,10 @@ pub async fn run_sandbox(
 
         tokio::spawn(async move {
             if let Err(err) = ssh::run_ssh_server(
-                addr,
+                listen_path,
                 ssh_ready_tx,
                 policy_clone,
                 workdir_clone,
-                secret,
-                ssh_handshake_skew_secs,
                 netns_fd,
                 proxy_url,
                 ca_paths,
@@ -525,7 +643,14 @@ pub async fn run_sandbox(
             )
             .await
             {
-                tracing::error!(error = %err, "SSH server failed");
+                ocsf_emit!(
+                    AppLifecycleBuilder::new(ocsf_ctx())
+                        .activity(ActivityId::Fail)
+                        .severity(SeverityId::Critical)
+                        .status(StatusId::Failure)
+                        .message(format!("SSH server failed: {err}"))
+                        .build()
+                );
             }
         });
 
@@ -534,7 +659,14 @@ pub async fn run_sandbox(
         // SSH server startup when Kubernetes marks the pod Ready.
         match timeout(Duration::from_secs(10), ssh_ready_rx).await {
             Ok(Ok(Ok(()))) => {
-                info!("SSH server is ready to accept connections");
+                ocsf_emit!(
+                    AppLifecycleBuilder::new(ocsf_ctx())
+                        .activity(ActivityId::Open)
+                        .severity(SeverityId::Informational)
+                        .status(StatusId::Success)
+                        .message("SSH server is ready to accept connections")
+                        .build()
+                );
             }
             Ok(Ok(Err(err))) => {
                 return Err(err.context("SSH server failed during startup"));
@@ -550,6 +682,18 @@ pub async fn run_sandbox(
                 ));
             }
         }
+    }
+
+    // Spawn the persistent supervisor session if we have a gateway endpoint
+    // and sandbox identity. The session provides relay channels for SSH
+    // connect and ExecSandbox through the gateway.
+    if let (Some(endpoint), Some(id), Some(socket)) = (
+        openshell_endpoint.as_ref(),
+        sandbox_id.as_ref(),
+        ssh_socket_path.as_ref(),
+    ) {
+        supervisor_session::spawn(endpoint.clone(), id.clone(), socket.clone());
+        info!("supervisor session task spawned");
     }
 
     #[cfg(target_os = "linux")]
@@ -577,7 +721,78 @@ pub async fn run_sandbox(
 
     // Store the entrypoint PID so the proxy can resolve TCP peer identity
     entrypoint_pid.store(handle.pid(), Ordering::Release);
-    info!(pid = handle.pid(), "Process started");
+    ocsf_emit!(
+        ProcessActivityBuilder::new(ocsf_ctx())
+            .activity(ActivityId::Open)
+            .action(ActionId::Allowed)
+            .disposition(DispositionId::Allowed)
+            .severity(SeverityId::Informational)
+            .status(StatusId::Success)
+            .launch_type(LaunchTypeId::Spawn)
+            .process(OcsfProcess::new(program, i64::from(handle.pid())))
+            .message(format!("Process started: pid={}", handle.pid()))
+            .build()
+    );
+
+    // Spawn a task to resolve policy binary symlinks after the container
+    // filesystem becomes accessible via /proc/<pid>/root/. This expands
+    // symlinks like /usr/bin/python3 → /usr/bin/python3.11 in the OPA
+    // policy data so that either path matches at evaluation time.
+    //
+    // We cannot do this synchronously here because the child process has
+    // just been spawned and its mount namespace / procfs entries may not
+    // be fully populated yet. Instead, we probe with retries until
+    // /proc/<pid>/root/ is accessible or we exhaust attempts.
+    if let (Some(engine), Some(proto)) = (&opa_engine, &retained_proto) {
+        let resolve_engine = engine.clone();
+        let resolve_proto = proto.clone();
+        let resolve_pid = entrypoint_pid.clone();
+        tokio::spawn(async move {
+            let pid = resolve_pid.load(Ordering::Acquire);
+            let probe_path = format!("/proc/{pid}/root/");
+            // Retry up to 10 times with 500ms intervals (5s total).
+            // The child's mount namespace is typically ready within a
+            // few hundred ms of spawn.
+            for attempt in 1..=10 {
+                tokio::time::sleep(Duration::from_millis(500)).await;
+                if std::fs::metadata(&probe_path).is_ok() {
+                    info!(
+                        pid = pid,
+                        attempt = attempt,
+                        "Container filesystem accessible, resolving policy binary symlinks"
+                    );
+                    match resolve_engine.reload_from_proto_with_pid(&resolve_proto, pid) {
+                        Ok(()) => {
+                            info!(
+                                pid = pid,
+                                "Policy binary symlink resolution complete \
+                                 (check logs above for per-binary results)"
+                            );
+                        }
+                        Err(e) => {
+                            warn!(
+                                "Failed to rebuild OPA engine with symlink resolution \
+                                 (non-fatal, falling back to literal path matching): {e}"
+                            );
+                        }
+                    }
+                    return;
+                }
+                debug!(
+                    pid = pid,
+                    attempt = attempt,
+                    probe_path = %probe_path,
+                    "Container filesystem not yet accessible, retrying symlink resolution"
+                );
+            }
+            warn!(
+                "Container filesystem /proc/{pid}/root/ not accessible after 10 attempts (5s); \
+                 binary symlink resolution skipped. Policy binary paths will be matched literally. \
+                 If binaries are symlinks, use canonical paths in your policy \
+                 (run 'readlink -f <path>' inside the sandbox)"
+            );
+        });
+    }
 
     // Spawn background policy poll task (gRPC mode only).
     if let (Some(id), Some(endpoint), Some(engine)) =
@@ -586,17 +801,32 @@ pub async fn run_sandbox(
         let poll_id = id.clone();
         let poll_endpoint = endpoint.clone();
         let poll_engine = engine.clone();
+        let poll_ocsf_enabled = ocsf_enabled.clone();
+        let poll_pid = entrypoint_pid.clone();
         let poll_interval_secs: u64 = std::env::var("OPENSHELL_POLICY_POLL_INTERVAL_SECS")
             .ok()
             .and_then(|v| v.parse().ok())
             .unwrap_or(10);
 
         tokio::spawn(async move {
-            if let Err(e) =
-                run_policy_poll_loop(&poll_endpoint, &poll_id, &poll_engine, poll_interval_secs)
-                    .await
+            if let Err(e) = run_policy_poll_loop(
+                &poll_endpoint,
+                &poll_id,
+                &poll_engine,
+                &poll_pid,
+                poll_interval_secs,
+                &poll_ocsf_enabled,
+            )
+            .await
             {
-                warn!(error = %e, "Policy poll loop exited with error");
+                ocsf_emit!(
+                    AppLifecycleBuilder::new(ocsf_ctx())
+                        .activity(ActivityId::Fail)
+                        .severity(SeverityId::Medium)
+                        .status(StatusId::Failure)
+                        .message(format!("Policy poll loop exited with error: {e}"))
+                        .build()
+                );
             }
         });
 
@@ -636,7 +866,16 @@ pub async fn run_sandbox(
         if let Ok(result) = timeout(Duration::from_secs(timeout_secs), handle.wait()).await {
             result
         } else {
-            error!("Process timed out, killing");
+            ocsf_emit!(
+                ProcessActivityBuilder::new(ocsf_ctx())
+                    .activity(ActivityId::Close)
+                    .action(ActionId::Denied)
+                    .disposition(DispositionId::Blocked)
+                    .severity(SeverityId::Critical)
+                    .status(StatusId::Failure)
+                    .message("Process timed out, killing")
+                    .build()
+            );
             handle.kill()?;
             return Ok(124); // Standard timeout exit code
         }
@@ -646,7 +885,17 @@ pub async fn run_sandbox(
 
     let status = result.into_diagnostic()?;
 
-    info!(exit_code = status.code(), "Process exited");
+    ocsf_emit!(
+        ProcessActivityBuilder::new(ocsf_ctx())
+            .activity(ActivityId::Close)
+            .action(ActionId::Allowed)
+            .disposition(DispositionId::Allowed)
+            .severity(SeverityId::Informational)
+            .status(StatusId::Success)
+            .exit_code(status.code())
+            .message(format!("Process exited with code {}", status.code()))
+            .build()
+    );
 
     Ok(status.code())
 }
@@ -661,6 +910,9 @@ pub async fn run_sandbox(
 /// wins and the cluster bundle is not fetched.
 ///
 /// Returns `None` if neither source is configured (inference routing disabled).
+// `routes`/`router` are intentionally distinct nouns (the route list vs the
+// router that consumes them); both names are clearer than alternatives.
+#[allow(clippy::similar_names)]
 async fn build_inference_context(
     sandbox_id: Option<&str>,
     openshell_endpoint: Option<&str>,
@@ -683,12 +935,25 @@ async fn build_inference_context(
 
             // Standalone mode: load routes from file (fail-fast on errors)
             if sandbox_id.is_some() {
-                info!(
-                    inference_routes = %path,
-                    "Inference routes file takes precedence over cluster bundle"
-                );
+                ocsf_emit!(ConfigStateChangeBuilder::new(ocsf_ctx())
+                    .severity(SeverityId::Informational)
+                    .status(StatusId::Success)
+                    .state(StateId::Enabled, "loaded")
+                    .unmapped("inference_routes", serde_json::json!(path))
+                    .message(format!(
+                        "Inference routes file takes precedence over cluster bundle [path:{path}]"
+                    ))
+                    .build());
             }
-            info!(inference_routes = %path, "Loading inference routes from file");
+            ocsf_emit!(
+                ConfigStateChangeBuilder::new(ocsf_ctx())
+                    .severity(SeverityId::Informational)
+                    .status(StatusId::Success)
+                    .state(StateId::Other, "loading")
+                    .unmapped("inference_routes", serde_json::json!(path))
+                    .message(format!("Loading inference routes from file [path:{path}]"))
+                    .build()
+            );
             let config = RouterConfig::load_from_file(std::path::Path::new(path))
                 .map_err(|e| miette::miette!("failed to load inference routes {path}: {e}"))?;
             config
@@ -705,10 +970,19 @@ async fn build_inference_context(
             match grpc_client::fetch_inference_bundle(endpoint).await {
                 Ok(bundle) => {
                     initial_revision = Some(bundle.revision.clone());
-                    info!(
-                        route_count = bundle.routes.len(),
-                        revision = %bundle.revision,
-                        "Loaded inference route bundle"
+                    ocsf_emit!(
+                        ConfigStateChangeBuilder::new(ocsf_ctx())
+                            .severity(SeverityId::Informational)
+                            .status(StatusId::Success)
+                            .state(StateId::Enabled, "loaded")
+                            .unmapped("route_count", serde_json::json!(bundle.routes.len()))
+                            .unmapped("revision", serde_json::json!(&bundle.revision))
+                            .message(format!(
+                                "Loaded inference route bundle [route_count:{} revision:{}]",
+                                bundle.routes.len(),
+                                bundle.revision
+                            ))
+                            .build()
                     );
                     bundle_to_resolved_routes(&bundle)
                 }
@@ -718,10 +992,28 @@ async fn build_inference_context(
                     // for this sandbox — skip gracefully. Other errors are unexpected.
                     let msg = e.to_string();
                     if msg.contains("permission denied") || msg.contains("not found") {
-                        info!(error = %e, "Inference bundle unavailable, routing disabled");
+                        ocsf_emit!(
+                            ConfigStateChangeBuilder::new(ocsf_ctx())
+                                .severity(SeverityId::Informational)
+                                .status(StatusId::Success)
+                                .state(StateId::Disabled, "disabled")
+                                .unmapped("error", serde_json::json!(e.to_string()))
+                                .message(format!(
+                                    "Inference bundle unavailable, routing disabled [error:{e}]"
+                                ))
+                                .build()
+                        );
                         return Ok(None);
                     }
-                    warn!(error = %e, "Failed to fetch inference bundle, inference routing disabled");
+                    ocsf_emit!(ConfigStateChangeBuilder::new(ocsf_ctx())
+                        .severity(SeverityId::Medium)
+                        .status(StatusId::Failure)
+                        .state(StateId::Disabled, "disabled")
+                        .unmapped("error", serde_json::json!(e.to_string()))
+                        .message(format!(
+                            "Failed to fetch inference bundle, inference routing disabled [error:{e}]"
+                        ))
+                        .build());
                     return Ok(None);
                 }
             }
@@ -733,17 +1025,37 @@ async fn build_inference_context(
     };
 
     if routes.is_empty() && disable_inference_on_empty_routes(source) {
-        info!("No usable inference routes, inference routing disabled");
+        ocsf_emit!(
+            ConfigStateChangeBuilder::new(ocsf_ctx())
+                .severity(SeverityId::Informational)
+                .status(StatusId::Success)
+                .state(StateId::Disabled, "disabled")
+                .message("No usable inference routes, inference routing disabled")
+                .build()
+        );
         return Ok(None);
     }
 
     if routes.is_empty() {
-        info!("Inference route bundle is empty; keeping routing enabled and waiting for refresh");
+        ocsf_emit!(ConfigStateChangeBuilder::new(ocsf_ctx())
+            .severity(SeverityId::Informational)
+            .status(StatusId::Success)
+            .state(StateId::Other, "waiting")
+            .message("Inference route bundle is empty; keeping routing enabled and waiting for refresh")
+            .build());
     }
 
-    info!(
-        route_count = routes.len(),
-        "Inference routing enabled with local execution"
+    ocsf_emit!(
+        ConfigStateChangeBuilder::new(ocsf_ctx())
+            .severity(SeverityId::Informational)
+            .status(StatusId::Success)
+            .state(StateId::Enabled, "enabled")
+            .unmapped("route_count", serde_json::json!(routes.len()))
+            .message(format!(
+                "Inference routing enabled with local execution [route_count:{}]",
+                routes.len()
+            ))
+            .build()
     );
 
     // Partition routes by name into user-facing and system caches.
@@ -810,8 +1122,13 @@ pub(crate) fn bundle_to_resolved_routes(
         .routes
         .iter()
         .map(|r| {
-            let (auth, default_headers) =
-                openshell_core::inference::auth_for_provider_type(&r.provider_type);
+            let (auth, default_headers, passthrough_headers) =
+                openshell_core::inference::route_headers_for_provider_type(&r.provider_type);
+            let timeout = if r.timeout_secs == 0 {
+                openshell_router::config::DEFAULT_ROUTE_TIMEOUT
+            } else {
+                Duration::from_secs(r.timeout_secs)
+            };
             openshell_router::config::ResolvedRoute {
                 name: r.name.clone(),
                 endpoint: r.base_url.clone(),
@@ -820,6 +1137,8 @@ pub(crate) fn bundle_to_resolved_routes(
                 protocols: r.protocols.clone(),
                 auth,
                 default_headers,
+                passthrough_headers,
+                timeout,
             }
         })
         .collect()
@@ -858,18 +1177,34 @@ pub(crate) fn spawn_route_refresh(
 
                     let routes = bundle_to_resolved_routes(&bundle);
                     let (user_routes, system_routes) = partition_routes(routes);
-                    info!(
-                        user_route_count = user_routes.len(),
-                        system_route_count = system_routes.len(),
-                        revision = %bundle.revision,
-                        "Inference routes updated"
-                    );
+                    ocsf_emit!(ConfigStateChangeBuilder::new(ocsf_ctx())
+                        .severity(SeverityId::Informational)
+                        .status(StatusId::Success)
+                        .state(StateId::Enabled, "updated")
+                        .unmapped("user_route_count", serde_json::json!(user_routes.len()))
+                        .unmapped("system_route_count", serde_json::json!(system_routes.len()))
+                        .unmapped("revision", serde_json::json!(&bundle.revision))
+                        .message(format!(
+                            "Inference routes updated [user_route_count:{} system_route_count:{} revision:{}]",
+                            user_routes.len(),
+                            system_routes.len(),
+                            bundle.revision
+                        ))
+                        .build());
                     current_revision = Some(bundle.revision);
                     *user_cache.write().await = user_routes;
                     *system_cache.write().await = system_routes;
                 }
                 Err(e) => {
-                    warn!(error = %e, "Failed to refresh inference route cache, keeping stale routes");
+                    ocsf_emit!(ConfigStateChangeBuilder::new(ocsf_ctx())
+                        .severity(SeverityId::Medium)
+                        .status(StatusId::Failure)
+                        .state(StateId::Other, "stale")
+                        .unmapped("error", serde_json::json!(e.to_string()))
+                        .message(format!(
+                            "Failed to refresh inference route cache, keeping stale routes [error:{e}]"
+                        ))
+                        .build());
                 }
             }
         }
@@ -882,12 +1217,127 @@ pub(crate) fn spawn_route_refresh(
 
 /// Minimum read-only paths required for a proxy-mode sandbox child process to
 /// function: dynamic linker, shared libraries, DNS resolution, CA certs,
-/// Python venv, and openshell logs.
-const PROXY_BASELINE_READ_ONLY: &[&str] = &["/usr", "/lib", "/etc", "/app", "/var/log"];
+/// Python venv, openshell logs, process info, and random bytes.
+///
+/// `/proc` and `/dev/urandom` are included here for the same reasons they
+/// appear in `restrictive_default_policy()`: virtually every process needs
+/// them.  Before the Landlock per-path fix (#677) these were effectively free
+/// because a missing path silently disabled the entire ruleset; now they must
+/// be explicit.
+const PROXY_BASELINE_READ_ONLY: &[&str] = &[
+    "/usr",
+    "/lib",
+    "/etc",
+    "/app",
+    "/var/log",
+    "/proc",
+    "/dev/urandom",
+];
 
 /// Minimum read-write paths required for a proxy-mode sandbox child process:
 /// user working directory and temporary files.
 const PROXY_BASELINE_READ_WRITE: &[&str] = &["/sandbox", "/tmp"];
+
+/// GPU read-only paths.
+///
+/// `/run/nvidia-persistenced`: NVML tries to connect to the persistenced
+/// socket at init time.  If the directory exists but Landlock denies traversal
+/// (EACCES vs ECONNREFUSED), NVML returns `NVML_ERROR_INSUFFICIENT_PERMISSIONS`
+/// even though the daemon is optional.  Only read/traversal access is needed.
+///
+/// `/usr/lib/wsl`: On WSL2, CDI bind-mounts GPU libraries (libdxcore.so,
+/// libcuda.so.1.1, etc.) into paths under `/usr/lib/wsl/`.  Although `/usr`
+/// is already in `PROXY_BASELINE_READ_ONLY`, individual file bind-mounts may
+/// not be covered by the parent-directory Landlock rule when the mount crosses
+/// a filesystem boundary.  Listing `/usr/lib/wsl` explicitly ensures traversal
+/// is permitted regardless of Landlock's cross-mount behaviour.
+const GPU_BASELINE_READ_ONLY: &[&str] = &[
+    "/run/nvidia-persistenced",
+    "/usr/lib/wsl", // WSL2: CDI-injected GPU library directory
+];
+
+/// GPU read-write paths (static).
+///
+/// `/dev/nvidiactl`, `/dev/nvidia-uvm`, `/dev/nvidia-uvm-tools`,
+/// `/dev/nvidia-modeset`: control and UVM devices injected by CDI on native
+/// Linux.  Landlock restricts `open(2)` on device files even when DAC allows
+/// it; these need read-write because NVML/CUDA opens them with `O_RDWR`.
+/// These devices do not exist on WSL2 and will be skipped by the existence
+/// check in `enrich_proto_baseline_paths()`.
+///
+/// `/dev/dxg`: On WSL2, NVIDIA GPUs are exposed through the DXG kernel driver
+/// (DirectX Graphics) rather than the native nvidia* devices.  CDI injects
+/// `/dev/dxg` as the sole GPU device node; it does not exist on native Linux
+/// and will be skipped there by the existence check.
+///
+/// `/proc`: CUDA writes to `/proc/<pid>/task/<tid>/comm` during `cuInit()`
+/// to set thread names.  Without write access, `cuInit()` returns error 304.
+/// Must use `/proc` (not `/proc/self/task`) because Landlock rules bind to
+/// inodes and child processes have different procfs inodes than the parent.
+///
+/// Per-GPU device files (`/dev/nvidia0`, …) are enumerated at runtime by
+/// `enumerate_gpu_device_nodes()` since the count varies.
+const GPU_BASELINE_READ_WRITE: &[&str] = &[
+    "/dev/nvidiactl",
+    "/dev/nvidia-uvm",
+    "/dev/nvidia-uvm-tools",
+    "/dev/nvidia-modeset",
+    "/dev/dxg", // WSL2: DXG device (GPU via DirectX kernel driver, injected by CDI)
+    "/proc",
+];
+
+/// Returns true if GPU devices are present in the container.
+///
+/// Checks both the native Linux NVIDIA control device (`/dev/nvidiactl`) and
+/// the WSL2 DXG device (`/dev/dxg`).  CDI injects exactly one of these
+/// depending on the host kernel; the other will not exist.
+fn has_gpu_devices() -> bool {
+    std::path::Path::new("/dev/nvidiactl").exists() || std::path::Path::new("/dev/dxg").exists()
+}
+
+/// Enumerate per-GPU device nodes (`/dev/nvidia0`, `/dev/nvidia1`, …).
+fn enumerate_gpu_device_nodes() -> Vec<String> {
+    let mut paths = Vec::new();
+    if let Ok(entries) = std::fs::read_dir("/dev") {
+        for entry in entries.flatten() {
+            let name = entry.file_name();
+            let name = name.to_string_lossy();
+            if let Some(suffix) = name.strip_prefix("nvidia") {
+                if suffix.is_empty() || !suffix.chars().all(|c| c.is_ascii_digit()) {
+                    continue;
+                }
+                paths.push(entry.path().to_string_lossy().into_owned());
+            }
+        }
+    }
+    paths
+}
+
+/// Collect all baseline paths for enrichment: proxy defaults + GPU (if present).
+/// Returns `(read_only, read_write)` as owned `String` vecs.
+fn baseline_enrichment_paths() -> (Vec<String>, Vec<String>) {
+    let mut ro: Vec<String> = PROXY_BASELINE_READ_ONLY
+        .iter()
+        .map(|&s| s.to_string())
+        .collect();
+    let mut rw: Vec<String> = PROXY_BASELINE_READ_WRITE
+        .iter()
+        .map(|&s| s.to_string())
+        .collect();
+
+    if has_gpu_devices() {
+        ro.extend(GPU_BASELINE_READ_ONLY.iter().map(|&s| s.to_string()));
+        rw.extend(GPU_BASELINE_READ_WRITE.iter().map(|&s| s.to_string()));
+        rw.extend(enumerate_gpu_device_nodes());
+    }
+
+    // A path promoted to read_write (e.g. /proc for GPU) should not also
+    // appear in read_only — Landlock handles the overlap correctly but the
+    // duplicate is confusing when inspecting the effective policy.
+    ro.retain(|p| !rw.contains(p));
+
+    (ro, rw)
+}
 
 /// Ensure a proto `SandboxPolicy` includes the baseline filesystem paths
 /// required for proxy-mode sandboxes.  Paths are only added if missing;
@@ -907,22 +1357,51 @@ fn enrich_proto_baseline_paths(proto: &mut openshell_core::proto::SandboxPolicy)
             ..Default::default()
         });
 
+    let (ro, rw) = baseline_enrichment_paths();
+
+    // Baseline paths are system-injected, not user-specified.  Skip paths
+    // that do not exist in this container image to avoid noisy warnings from
+    // Landlock and, more critically, to prevent a single missing baseline
+    // path from abandoning the entire Landlock ruleset under best-effort
+    // mode (see issue #664).
     let mut modified = false;
-    for &path in PROXY_BASELINE_READ_ONLY {
-        if !fs.read_only.iter().any(|p| p.as_str() == path) {
-            fs.read_only.push(path.to_string());
+    for path in &ro {
+        if !fs.read_only.iter().any(|p| p == path) && !fs.read_write.iter().any(|p| p == path) {
+            if !std::path::Path::new(path).exists() {
+                debug!(
+                    path,
+                    "Baseline read-only path does not exist, skipping enrichment"
+                );
+                continue;
+            }
+            fs.read_only.push(path.clone());
             modified = true;
         }
     }
-    for &path in PROXY_BASELINE_READ_WRITE {
-        if !fs.read_write.iter().any(|p| p.as_str() == path) {
-            fs.read_write.push(path.to_string());
-            modified = true;
+    for path in &rw {
+        if fs.read_only.iter().any(|p| p == path) || fs.read_write.iter().any(|p| p == path) {
+            continue;
         }
+        if !std::path::Path::new(path).exists() {
+            debug!(
+                path,
+                "Baseline read-write path does not exist, skipping enrichment"
+            );
+            continue;
+        }
+        fs.read_write.push(path.clone());
+        modified = true;
     }
 
     if modified {
-        info!("Enriched policy with baseline filesystem paths for proxy mode");
+        ocsf_emit!(
+            ConfigStateChangeBuilder::new(ocsf_ctx())
+                .severity(SeverityId::Informational)
+                .status(StatusId::Success)
+                .state(StateId::Enabled, "enriched")
+                .message("Enriched policy with baseline filesystem paths for proxy mode")
+                .build()
+        );
     }
 
     modified
@@ -936,25 +1415,292 @@ fn enrich_sandbox_baseline_paths(policy: &mut SandboxPolicy) {
         return;
     }
 
+    let (ro, rw) = baseline_enrichment_paths();
+
     let mut modified = false;
-    for &path in PROXY_BASELINE_READ_ONLY {
+    for path in &ro {
         let p = std::path::PathBuf::from(path);
-        if !policy.filesystem.read_only.contains(&p) {
+        if !policy.filesystem.read_only.contains(&p) && !policy.filesystem.read_write.contains(&p) {
+            if !p.exists() {
+                debug!(
+                    path,
+                    "Baseline read-only path does not exist, skipping enrichment"
+                );
+                continue;
+            }
             policy.filesystem.read_only.push(p);
             modified = true;
         }
     }
-    for &path in PROXY_BASELINE_READ_WRITE {
+    for path in &rw {
         let p = std::path::PathBuf::from(path);
-        if !policy.filesystem.read_write.contains(&p) {
-            policy.filesystem.read_write.push(p);
-            modified = true;
+        if policy.filesystem.read_only.contains(&p) || policy.filesystem.read_write.contains(&p) {
+            continue;
         }
+        if !p.exists() {
+            debug!(
+                path,
+                "Baseline read-write path does not exist, skipping enrichment"
+            );
+            continue;
+        }
+        policy.filesystem.read_write.push(p);
+        modified = true;
     }
 
     if modified {
-        info!("Enriched policy with baseline filesystem paths for proxy mode");
+        ocsf_emit!(
+            ConfigStateChangeBuilder::new(ocsf_ctx())
+                .severity(SeverityId::Informational)
+                .status(StatusId::Success)
+                .state(StateId::Enabled, "enriched")
+                .message("Enriched policy with baseline filesystem paths for proxy mode")
+                .build()
+        );
     }
+}
+
+#[cfg(test)]
+#[allow(
+    clippy::needless_raw_string_hashes,
+    clippy::iter_on_single_items,
+    clippy::similar_names,
+    clippy::manual_string_new,
+    clippy::doc_markdown,
+    reason = "Test code: test fixtures often use idiomatic forms not flagged in production."
+)]
+mod baseline_tests {
+    use super::*;
+    use crate::policy::{FilesystemPolicy, LandlockPolicy, ProcessPolicy};
+
+    #[test]
+    fn proc_not_in_both_read_only_and_read_write_when_gpu_present() {
+        // When GPU devices are present, /proc is promoted to read_write
+        // (CUDA needs to write /proc/<pid>/task/<tid>/comm). It should
+        // NOT also appear in read_only.
+        if !has_gpu_devices() {
+            // Can't test GPU dedup without GPU devices; skip silently.
+            return;
+        }
+        let (ro, rw) = baseline_enrichment_paths();
+        assert!(
+            rw.contains(&"/proc".to_string()),
+            "/proc should be in read_write when GPU is present"
+        );
+        assert!(
+            !ro.contains(&"/proc".to_string()),
+            "/proc should NOT be in read_only when it is already in read_write"
+        );
+    }
+
+    #[test]
+    fn proc_in_read_only_without_gpu() {
+        if has_gpu_devices() {
+            // On a GPU host we can't test the non-GPU path; skip silently.
+            return;
+        }
+        let (ro, _rw) = baseline_enrichment_paths();
+        assert!(
+            ro.contains(&"/proc".to_string()),
+            "/proc should be in read_only when GPU is not present"
+        );
+    }
+
+    #[test]
+    fn baseline_read_write_always_includes_sandbox_and_tmp() {
+        let (_ro, rw) = baseline_enrichment_paths();
+        assert!(rw.contains(&"/sandbox".to_string()));
+        assert!(rw.contains(&"/tmp".to_string()));
+    }
+
+    #[test]
+    fn enumerate_gpu_device_nodes_skips_bare_nvidia() {
+        // "nvidia" (without a trailing digit) is a valid /dev entry on some
+        // systems but is not a per-GPU device node.  The enumerator must
+        // not match it.
+        let nodes = enumerate_gpu_device_nodes();
+        assert!(
+            !nodes.contains(&"/dev/nvidia".to_string()),
+            "bare /dev/nvidia should not be enumerated: {nodes:?}"
+        );
+    }
+
+    #[test]
+    fn no_duplicate_paths_in_baseline() {
+        let (ro, rw) = baseline_enrichment_paths();
+        // No path should appear in both lists.
+        for path in &ro {
+            assert!(
+                !rw.contains(path),
+                "path {path} appears in both read_only and read_write"
+            );
+        }
+    }
+
+    #[test]
+    fn proto_enrichment_preserves_explicit_read_only_for_baseline_read_write_paths() {
+        let mut policy = openshell_policy::restrictive_default_policy();
+        policy.filesystem = Some(openshell_core::proto::FilesystemPolicy {
+            read_only: vec!["/tmp".to_string()],
+            read_write: vec![],
+            include_workdir: false,
+        });
+        policy.network_policies.insert(
+            "test".into(),
+            openshell_core::proto::NetworkPolicyRule {
+                name: "test-rule".into(),
+                endpoints: vec![openshell_core::proto::NetworkEndpoint {
+                    host: "example.com".into(),
+                    port: 443,
+                    ..Default::default()
+                }],
+                ..Default::default()
+            },
+        );
+
+        enrich_proto_baseline_paths(&mut policy);
+
+        let filesystem = policy.filesystem.expect("filesystem policy");
+        assert!(
+            filesystem.read_only.contains(&"/tmp".to_string()),
+            "explicit read_only baseline path should be preserved"
+        );
+        assert!(
+            !filesystem.read_write.contains(&"/tmp".to_string()),
+            "baseline enrichment must not promote explicit read_only /tmp to read_write"
+        );
+    }
+
+    #[test]
+    fn gpu_baseline_read_write_contains_dxg() {
+        // /dev/dxg must be present so WSL2 sandboxes get the Landlock
+        // read-write rule for the CDI-injected DXG device.  The existence
+        // check in enrich_proto_baseline_paths() skips it on native Linux.
+        assert!(
+            GPU_BASELINE_READ_WRITE.contains(&"/dev/dxg"),
+            "/dev/dxg must be in GPU_BASELINE_READ_WRITE for WSL2 support"
+        );
+    }
+
+    #[test]
+    fn local_enrichment_preserves_explicit_read_only_for_baseline_read_write_paths() {
+        let mut policy = SandboxPolicy {
+            version: 1,
+            filesystem: FilesystemPolicy {
+                read_only: vec![std::path::PathBuf::from("/tmp")],
+                read_write: vec![],
+                include_workdir: false,
+            },
+            network: NetworkPolicy {
+                mode: NetworkMode::Proxy,
+                proxy: Some(ProxyPolicy { http_addr: None }),
+            },
+            landlock: LandlockPolicy::default(),
+            process: ProcessPolicy::default(),
+        };
+
+        enrich_sandbox_baseline_paths(&mut policy);
+
+        assert!(
+            policy
+                .filesystem
+                .read_only
+                .contains(&std::path::PathBuf::from("/tmp")),
+            "explicit read_only baseline path should be preserved"
+        );
+        assert!(
+            !policy
+                .filesystem
+                .read_write
+                .contains(&std::path::PathBuf::from("/tmp")),
+            "baseline enrichment must not promote explicit read_only /tmp to read_write"
+        );
+    }
+
+    #[test]
+    fn gpu_baseline_read_only_contains_usr_lib_wsl() {
+        // /usr/lib/wsl must be present so CDI-injected WSL2 GPU library
+        // bind-mounts are accessible under Landlock.  Skipped on native Linux.
+        assert!(
+            GPU_BASELINE_READ_ONLY.contains(&"/usr/lib/wsl"),
+            "/usr/lib/wsl must be in GPU_BASELINE_READ_ONLY for WSL2 CDI library paths"
+        );
+    }
+
+    #[test]
+    fn has_gpu_devices_reflects_dxg_or_nvidiactl() {
+        // Verify the OR logic: result must match the manual disjunction of
+        // the two path checks.  Passes in all environments.
+        let nvidiactl = std::path::Path::new("/dev/nvidiactl").exists();
+        let dxg = std::path::Path::new("/dev/dxg").exists();
+        assert_eq!(
+            has_gpu_devices(),
+            nvidiactl || dxg,
+            "has_gpu_devices() should be true iff /dev/nvidiactl or /dev/dxg exists"
+        );
+    }
+}
+
+/// Returns `true` if the error is transient and worth retrying.
+///
+/// Walks the `miette::Report` error chain looking for a `tonic::Status`. If
+/// found, only the gRPC codes that represent transient failures are retryable.
+/// If no `tonic::Status` is present (e.g. a raw connection error), assume the
+/// failure is transient.
+fn is_retryable_error(err: &miette::Report) -> bool {
+    let mut source: Option<&dyn std::error::Error> = Some(err.as_ref());
+    while let Some(e) = source {
+        if let Some(status) = e.downcast_ref::<tonic::Status>() {
+            return matches!(
+                status.code(),
+                tonic::Code::Unavailable
+                    | tonic::Code::DeadlineExceeded
+                    | tonic::Code::ResourceExhausted
+                    | tonic::Code::Aborted
+                    | tonic::Code::Internal
+                    | tonic::Code::Unknown
+            );
+        }
+        source = e.source();
+    }
+    true
+}
+
+/// Retry a gRPC operation with exponential backoff (capped at 4 s).
+///
+/// Non-transient gRPC errors (e.g. `NOT_FOUND`, `INVALID_ARGUMENT`,
+/// `PERMISSION_DENIED`) are returned immediately without retrying.
+async fn grpc_retry<T, F, Fut>(op_name: &str, f: F) -> Result<T>
+where
+    F: Fn() -> Fut,
+    Fut: Future<Output = Result<T>>,
+{
+    let mut last_err = None;
+    for attempt in 1..=5u32 {
+        match f().await {
+            Ok(val) => return Ok(val),
+            Err(e) => {
+                if !is_retryable_error(&e) {
+                    return Err(e);
+                }
+                if attempt < 5 {
+                    warn!(
+                        attempt,
+                        max_attempts = 5,
+                        error = %e,
+                        "{op_name} failed, retrying"
+                    );
+                    let backoff = Duration::from_secs((1u64 << (attempt - 1)).min(4));
+                    tokio::time::sleep(backoff).await;
+                }
+                last_err = Some(e);
+            }
+        }
+    }
+    Err(miette::miette!(
+        "{op_name} failed after 5 attempts: {}",
+        last_err.expect("loop executed at least once")
+    ))
 }
 
 /// Load sandbox policy from local files or gRPC.
@@ -964,20 +1710,33 @@ fn enrich_sandbox_baseline_paths(policy: &mut SandboxPolicy) {
 /// 2. If `sandbox_id` and `openshell_endpoint` are provided, fetch via gRPC
 /// 3. If the server returns no policy, discover from disk or use restrictive default
 /// 4. Otherwise, return an error
+///
+/// Returns the policy, the OPA engine, and (for gRPC mode) the original proto
+/// policy. The proto is retained so the OPA engine can be rebuilt with symlink
+/// resolution after the container entrypoint starts.
 async fn load_policy(
     sandbox_id: Option<String>,
     sandbox: Option<String>,
     openshell_endpoint: Option<String>,
     policy_rules: Option<String>,
     policy_data: Option<String>,
-) -> Result<(SandboxPolicy, Option<Arc<OpaEngine>>)> {
+) -> Result<(
+    SandboxPolicy,
+    Option<Arc<OpaEngine>>,
+    Option<openshell_core::proto::SandboxPolicy>,
+)> {
     // File mode: load OPA engine from rego rules + YAML data (dev override)
     if let (Some(policy_file), Some(data_file)) = (&policy_rules, &policy_data) {
-        info!(
-            policy_rules = %policy_file,
-            policy_data = %data_file,
-            "Loading OPA policy engine from local files"
-        );
+        ocsf_emit!(ConfigStateChangeBuilder::new(ocsf_ctx())
+            .severity(SeverityId::Informational)
+            .status(StatusId::Success)
+            .state(StateId::Other, "loading")
+            .unmapped("policy_rules", serde_json::json!(policy_file))
+            .unmapped("policy_data", serde_json::json!(data_file))
+            .message(format!(
+                "Loading OPA policy engine from local files [rules:{policy_file} data:{data_file}]"
+            ))
+            .build());
         let engine = OpaEngine::from_files(
             std::path::Path::new(policy_file),
             std::path::Path::new(data_file),
@@ -994,7 +1753,7 @@ async fn load_policy(
             process: config.process,
         };
         enrich_sandbox_baseline_paths(&mut policy);
-        return Ok((policy, Some(Arc::new(engine))));
+        return Ok((policy, Some(Arc::new(engine)), None));
     }
 
     // gRPC mode: fetch typed proto policy, construct OPA engine from baked rules + proto data
@@ -1004,57 +1763,67 @@ async fn load_policy(
             endpoint = %endpoint,
             "Fetching sandbox policy via gRPC"
         );
-        let proto_policy = grpc_client::fetch_policy(endpoint, id).await?;
+        let proto_policy =
+            grpc_retry("Policy fetch", || grpc_client::fetch_policy(endpoint, id)).await?;
 
-        let mut proto_policy = match proto_policy {
-            Some(p) => p,
-            None => {
-                // No policy configured on the server. Discover from disk or
-                // fall back to the restrictive default, then sync to the
-                // gateway so it becomes the authoritative baseline.
-                info!("Server returned no policy; attempting local discovery");
-                let mut discovered = discover_policy_from_disk_or_default();
-                // Enrich before syncing so the gateway baseline includes
-                // baseline paths from the start.
-                enrich_proto_baseline_paths(&mut discovered);
-                let sandbox = sandbox.as_deref().ok_or_else(|| {
-                    miette::miette!(
-                        "Cannot sync discovered policy: sandbox not available.\n\
-                         Set OPENSHELL_SANDBOX or --sandbox to enable policy sync."
-                    )
-                })?;
+        let mut proto_policy = if let Some(p) = proto_policy {
+            p
+        } else {
+            // No policy configured on the server. Discover from disk or
+            // fall back to the restrictive default, then sync to the
+            // gateway so it becomes the authoritative baseline.
+            ocsf_emit!(
+                ConfigStateChangeBuilder::new(ocsf_ctx())
+                    .severity(SeverityId::Informational)
+                    .status(StatusId::Success)
+                    .state(StateId::Other, "discovery")
+                    .message("Server returned no policy; attempting local discovery")
+                    .build()
+            );
+            let mut discovered = discover_policy_from_disk_or_default();
+            // Enrich before syncing so the gateway baseline includes
+            // baseline paths from the start.
+            enrich_proto_baseline_paths(&mut discovered);
+            let sandbox = sandbox.as_deref().ok_or_else(|| {
+                miette::miette!(
+                    "Cannot sync discovered policy: sandbox not available.\n\
+                     Set OPENSHELL_SANDBOX or --sandbox to enable policy sync."
+                )
+            })?;
 
-                // Sync and re-fetch over a single connection to avoid extra
-                // TLS handshakes.
-                grpc_client::discover_and_sync_policy(endpoint, id, sandbox, &discovered).await?
-            }
+            // Sync and re-fetch over a single connection to avoid extra
+            // TLS handshakes.
+            grpc_retry("Policy discovery sync", || {
+                grpc_client::discover_and_sync_policy(endpoint, id, sandbox, &discovered)
+            })
+            .await?
         };
 
         // Ensure baseline filesystem paths are present for proxy-mode
         // sandboxes.  If the policy was enriched, sync the updated version
         // back to the gateway so users can see the effective policy.
         let enriched = enrich_proto_baseline_paths(&mut proto_policy);
-        if enriched {
-            if let Some(sandbox_name) = sandbox.as_deref() {
-                if let Err(e) =
-                    grpc_client::sync_policy(endpoint, sandbox_name, &proto_policy).await
-                {
-                    warn!(
-                        error = %e,
-                        "Failed to sync enriched policy back to gateway (non-fatal)"
-                    );
-                }
-            }
+        if enriched
+            && let Some(sandbox_name) = sandbox.as_deref()
+            && let Err(e) = grpc_client::sync_policy(endpoint, sandbox_name, &proto_policy).await
+        {
+            warn!(
+                error = %e,
+                "Failed to sync enriched policy back to gateway (non-fatal)"
+            );
         }
 
         // Build OPA engine from baked-in rules + typed proto data.
         // In cluster mode, proxy networking is always enabled so OPA is
         // always required for allow/deny decisions.
+        // The initial load uses pid=0 (no symlink resolution) because the
+        // container hasn't started yet. After the entrypoint spawns, the
+        // engine is rebuilt with the real PID for symlink resolution.
         info!("Creating OPA engine from proto policy data");
         let opa_engine = Some(Arc::new(OpaEngine::from_proto(&proto_policy)?));
 
-        let policy = SandboxPolicy::try_from(proto_policy)?;
-        return Ok((policy, opa_engine));
+        let policy = SandboxPolicy::try_from(proto_policy.clone())?;
+        return Ok((policy, opa_engine, Some(proto_policy)));
     }
 
     // No policy source available
@@ -1074,10 +1843,22 @@ fn discover_policy_from_disk_or_default() -> openshell_core::proto::SandboxPolic
     }
     let legacy = std::path::Path::new(openshell_policy::LEGACY_CONTAINER_POLICY_PATH);
     if legacy.exists() {
-        info!(
-            legacy_path = %legacy.display(),
-            new_path = %primary.display(),
-            "Policy found at legacy path; consider moving to the new path"
+        ocsf_emit!(
+            ConfigStateChangeBuilder::new(ocsf_ctx())
+                .severity(SeverityId::Informational)
+                .status(StatusId::Success)
+                .state(StateId::Enabled, "loaded")
+                .unmapped(
+                    "legacy_path",
+                    serde_json::json!(legacy.display().to_string())
+                )
+                .unmapped("new_path", serde_json::json!(primary.display().to_string()))
+                .message(format!(
+                    "Policy found at legacy path; consider moving [legacy_path:{} new_path:{}]",
+                    legacy.display(),
+                    primary.display()
+                ))
+                .build()
         );
         return discover_policy_from_path(legacy);
     }
@@ -1091,42 +1872,71 @@ fn discover_policy_from_path(path: &std::path::Path) -> openshell_core::proto::S
         parse_sandbox_policy, restrictive_default_policy, validate_sandbox_policy,
     };
 
-    match std::fs::read_to_string(path) {
-        Ok(yaml) => {
-            info!(
-                path = %path.display(),
-                "Loaded sandbox policy from container disk"
-            );
-            match parse_sandbox_policy(&yaml) {
-                Ok(policy) => {
-                    // Validate the disk-loaded policy for safety.
-                    if let Err(violations) = validate_sandbox_policy(&policy) {
-                        let messages: Vec<String> =
-                            violations.iter().map(ToString::to_string).collect();
-                        warn!(
-                            path = %path.display(),
-                            violations = %messages.join("; "),
-                            "Disk policy contains unsafe content, using restrictive default"
-                        );
-                        return restrictive_default_policy();
-                    }
-                    policy
-                }
-                Err(e) => {
-                    warn!(
-                        path = %path.display(),
-                        error = %e,
-                        "Failed to parse disk policy, using restrictive default"
-                    );
-                    restrictive_default_policy()
-                }
+    let Ok(yaml) = std::fs::read_to_string(path) else {
+        ocsf_emit!(
+            ConfigStateChangeBuilder::new(ocsf_ctx())
+                .severity(SeverityId::Informational)
+                .status(StatusId::Success)
+                .state(StateId::Enabled, "default")
+                .message(format!(
+                    "No policy file on disk, using restrictive default [path:{}]",
+                    path.display()
+                ))
+                .build()
+        );
+        return restrictive_default_policy();
+    };
+    ocsf_emit!(
+        ConfigStateChangeBuilder::new(ocsf_ctx())
+            .severity(SeverityId::Informational)
+            .status(StatusId::Success)
+            .state(StateId::Enabled, "loaded")
+            .message(format!(
+                "Loaded sandbox policy from container disk [path:{}]",
+                path.display()
+            ))
+            .build()
+    );
+    match parse_sandbox_policy(&yaml) {
+        Ok(policy) => {
+            // Validate the disk-loaded policy for safety.
+            if let Err(violations) = validate_sandbox_policy(&policy) {
+                let messages: Vec<String> = violations.iter().map(ToString::to_string).collect();
+                ocsf_emit!(DetectionFindingBuilder::new(ocsf_ctx())
+                    .activity(ActivityId::Open)
+                    .severity(SeverityId::Medium)
+                    .action(ActionId::Denied)
+                    .disposition(DispositionId::Blocked)
+                    .finding_info(
+                        FindingInfo::new(
+                            "unsafe-disk-policy",
+                            "Unsafe Disk Policy Content",
+                        )
+                        .with_desc(&format!(
+                            "Disk policy at {} contains unsafe content: {}",
+                            path.display(),
+                            messages.join("; "),
+                        )),
+                    )
+                    .message(format!(
+                        "Disk policy contains unsafe content, using restrictive default [path:{}]",
+                        path.display()
+                    ))
+                    .build());
+                return restrictive_default_policy();
             }
+            policy
         }
-        Err(_) => {
-            info!(
-                path = %path.display(),
-                "No policy file on disk, using restrictive default"
-            );
+        Err(e) => {
+            ocsf_emit!(ConfigStateChangeBuilder::new(ocsf_ctx())
+                .severity(SeverityId::Medium)
+                .status(StatusId::Failure)
+                .state(StateId::Other, "fallback")
+                .message(format!(
+                    "Failed to parse disk policy, using restrictive default [path:{} error:{e}]",
+                    path.display()
+                ))
+                .build());
             restrictive_default_policy()
         }
     }
@@ -1147,7 +1957,14 @@ fn validate_sandbox_user(policy: &SandboxPolicy) -> Result<()> {
     if user_name.is_empty() || user_name == "sandbox" {
         match User::from_name("sandbox") {
             Ok(Some(_)) => {
-                info!("Validated 'sandbox' user exists in image");
+                ocsf_emit!(
+                    ConfigStateChangeBuilder::new(ocsf_ctx())
+                        .severity(SeverityId::Informational)
+                        .status(StatusId::Success)
+                        .state(StateId::Enabled, "validated")
+                        .message("Validated 'sandbox' user exists in image")
+                        .build()
+                );
             }
             Ok(None) => {
                 return Err(miette::miette!(
@@ -1164,11 +1981,44 @@ fn validate_sandbox_user(policy: &SandboxPolicy) -> Result<()> {
     Ok(())
 }
 
+/// Prepare a `read_write` path for the sandboxed process.
+///
+/// Returns `true` when the path was created by the supervisor and therefore
+/// still needs to be chowned to the sandbox user/group. Existing paths keep
+/// their image-defined ownership.
+#[cfg(unix)]
+fn prepare_read_write_path(path: &std::path::Path) -> Result<bool> {
+    // SECURITY: use symlink_metadata (lstat) to inspect each path *before*
+    // calling chown. chown follows symlinks, so a malicious container image
+    // could place a symlink (e.g. /sandbox -> /etc/shadow) to trick the
+    // root supervisor into transferring ownership of arbitrary files.
+    // The TOCTOU window between lstat and chown is not exploitable because
+    // no untrusted process is running yet (the child has not been forked).
+    if let Ok(meta) = std::fs::symlink_metadata(path) {
+        if meta.file_type().is_symlink() {
+            return Err(miette::miette!(
+                "read_write path '{}' is a symlink — refusing to chown (potential privilege escalation)",
+                path.display()
+            ));
+        }
+
+        debug!(
+            path = %path.display(),
+            "Preserving ownership for existing read_write path"
+        );
+        Ok(false)
+    } else {
+        debug!(path = %path.display(), "Creating read_write directory");
+        std::fs::create_dir_all(path).into_diagnostic()?;
+        Ok(true)
+    }
+}
+
 /// Prepare filesystem for the sandboxed process.
 ///
 /// Creates `read_write` directories if they don't exist and sets ownership
-/// to the configured sandbox user/group. This runs as the supervisor (root)
-/// before forking the child process.
+/// on newly-created paths to the configured sandbox user/group. This runs as
+/// the supervisor (root) before forking the child process.
 #[cfg(unix)]
 fn prepare_filesystem(policy: &SandboxPolicy) -> Result<()> {
     use nix::unistd::{Group, User, chown};
@@ -1210,31 +2060,17 @@ fn prepare_filesystem(policy: &SandboxPolicy) -> Result<()> {
         None
     };
 
-    // Create and chown each read_write path.
-    //
-    // SECURITY: use symlink_metadata (lstat) to inspect each path *before*
-    // calling chown.  chown follows symlinks, so a malicious container image
-    // could place a symlink (e.g. /sandbox -> /etc/shadow) to trick the
-    // root supervisor into transferring ownership of arbitrary files.
-    // The TOCTOU window between lstat and chown is not exploitable because
-    // no untrusted process is running yet (the child has not been forked).
+    // Create missing read_write paths and only chown the ones we created.
     for path in &policy.filesystem.read_write {
-        // Check for symlinks before touching the path.  Character/block devices
-        // (e.g. /dev/null) are legitimate read_write entries and must be allowed.
-        if let Ok(meta) = std::fs::symlink_metadata(path) {
-            if meta.file_type().is_symlink() {
-                return Err(miette::miette!(
-                    "read_write path '{}' is a symlink — refusing to chown (potential privilege escalation)",
-                    path.display()
-                ));
-            }
-        } else {
-            debug!(path = %path.display(), "Creating read_write directory");
-            std::fs::create_dir_all(path).into_diagnostic()?;
+        if prepare_read_write_path(path)? {
+            debug!(
+                path = %path.display(),
+                ?uid,
+                ?gid,
+                "Setting ownership on newly created read_write path"
+            );
+            chown(path, uid, gid).into_diagnostic()?;
         }
-
-        debug!(path = %path.display(), ?uid, ?gid, "Setting ownership on read_write directory");
-        chown(path, uid, gid).into_diagnostic()?;
     }
 
     Ok(())
@@ -1265,7 +2101,7 @@ async fn flush_proposals_to_gateway(
         .map(|s| DenialSummary {
             sandbox_id: String::new(),
             host: s.host,
-            port: s.port as u32,
+            port: u32::from(s.port),
             binary: s.binary,
             ancestors: s.ancestors,
             deny_reason: s.deny_reason,
@@ -1311,27 +2147,44 @@ async fn flush_proposals_to_gateway(
     Ok(())
 }
 
-/// `reload_from_proto()`. Reports load success/failure back to the server.
-/// On failure, the previous engine is untouched (LKG behavior).
+/// `reload_from_proto_with_pid()`. Reports load success/failure back to the
+/// server. On failure, the previous engine is untouched (LKG behavior).
+///
+/// When the entrypoint PID is available, policy reloads include symlink
+/// resolution for binary paths via the container filesystem.
 async fn run_policy_poll_loop(
     endpoint: &str,
     sandbox_id: &str,
     opa_engine: &Arc<OpaEngine>,
+    entrypoint_pid: &Arc<AtomicU32>,
     interval_secs: u64,
+    ocsf_enabled: &std::sync::atomic::AtomicBool,
 ) -> Result<()> {
     use crate::grpc_client::CachedOpenShellClient;
+    use openshell_core::proto::PolicySource;
+    use std::sync::atomic::Ordering;
 
     let client = CachedOpenShellClient::connect(endpoint).await?;
-    let mut current_version: u32 = 0;
+    let mut current_config_revision: u64 = 0;
+    let mut current_policy_hash = String::new();
+    let mut current_settings: std::collections::HashMap<
+        String,
+        openshell_core::proto::EffectiveSetting,
+    > = std::collections::HashMap::new();
 
-    // Initialize current_version from the first poll.
-    match client.poll_policy(sandbox_id).await {
+    // Initialize revision from the first poll.
+    match client.poll_settings(sandbox_id).await {
         Ok(result) => {
-            current_version = result.version;
-            debug!(version = current_version, "Policy poll: initial version");
+            current_config_revision = result.config_revision;
+            current_policy_hash = result.policy_hash.clone();
+            current_settings = result.settings;
+            debug!(
+                config_revision = current_config_revision,
+                "Settings poll: initial config revision"
+            );
         }
         Err(e) => {
-            warn!(error = %e, "Policy poll: failed to fetch initial version, will retry");
+            warn!(error = %e, "Settings poll: failed to fetch initial version, will retry");
         }
     }
 
@@ -1339,64 +2192,229 @@ async fn run_policy_poll_loop(
     loop {
         tokio::time::sleep(interval).await;
 
-        let result = match client.poll_policy(sandbox_id).await {
+        let result = match client.poll_settings(sandbox_id).await {
             Ok(r) => r,
             Err(e) => {
-                debug!(error = %e, "Policy poll: server unreachable, will retry");
+                debug!(error = %e, "Settings poll: server unreachable, will retry");
                 continue;
             }
         };
 
-        if result.version <= current_version {
+        if result.config_revision == current_config_revision {
             continue;
         }
 
-        info!(
-            old_version = current_version,
-            new_version = result.version,
-            policy_hash = %result.policy_hash,
-            "Policy poll: new version detected, reloading"
-        );
+        let policy_changed = result.policy_hash != current_policy_hash;
 
-        match opa_engine.reload_from_proto(&result.policy) {
-            Ok(()) => {
-                current_version = result.version;
-                info!(
-                    version = current_version,
-                    policy_hash = %result.policy_hash,
-                    "Policy reloaded successfully"
-                );
-                if let Err(e) = client
-                    .report_policy_status(sandbox_id, result.version, true, "")
-                    .await
-                {
-                    warn!(error = %e, "Failed to report policy load success");
+        // Log which settings changed.
+        log_setting_changes(&current_settings, &result.settings);
+
+        ocsf_emit!(ConfigStateChangeBuilder::new(ocsf_ctx())
+            .severity(SeverityId::Informational)
+            .status(StatusId::Success)
+            .state(StateId::Other, "detected")
+            .unmapped("old_config_revision", serde_json::json!(current_config_revision))
+            .unmapped("new_config_revision", serde_json::json!(result.config_revision))
+            .unmapped("policy_changed", serde_json::json!(policy_changed))
+            .message(format!(
+                "Settings poll: config change detected [old_revision:{current_config_revision} new_revision:{} policy_changed:{policy_changed}]",
+                result.config_revision
+            ))
+            .build());
+
+        // Only reload OPA when the policy payload actually changed.
+        if policy_changed {
+            let Some(policy) = result.policy.as_ref() else {
+                ocsf_emit!(ConfigStateChangeBuilder::new(ocsf_ctx())
+                    .severity(SeverityId::Medium)
+                    .status(StatusId::Failure)
+                    .state(StateId::Other, "skipped")
+                    .message("Settings poll: policy hash changed but no policy payload present; skipping reload")
+                    .build());
+                current_config_revision = result.config_revision;
+                current_policy_hash = result.policy_hash;
+                current_settings = result.settings;
+                continue;
+            };
+
+            let pid = entrypoint_pid.load(Ordering::Acquire);
+            match opa_engine.reload_from_proto_with_pid(policy, pid) {
+                Ok(()) => {
+                    if result.global_policy_version > 0 {
+                        ocsf_emit!(ConfigStateChangeBuilder::new(ocsf_ctx())
+                            .severity(SeverityId::Informational)
+                            .status(StatusId::Success)
+                            .state(StateId::Enabled, "loaded")
+                            .unmapped("policy_hash", serde_json::json!(&result.policy_hash))
+                            .unmapped("global_version", serde_json::json!(result.global_policy_version))
+                            .message(format!(
+                                "Policy reloaded successfully (global) [policy_hash:{} global_version:{}]",
+                                result.policy_hash,
+                                result.global_policy_version
+                            ))
+                            .build());
+                    } else {
+                        ocsf_emit!(
+                            ConfigStateChangeBuilder::new(ocsf_ctx())
+                                .severity(SeverityId::Informational)
+                                .status(StatusId::Success)
+                                .state(StateId::Enabled, "loaded")
+                                .unmapped("policy_hash", serde_json::json!(&result.policy_hash))
+                                .message(format!(
+                                    "Policy reloaded successfully [policy_hash:{}]",
+                                    result.policy_hash
+                                ))
+                                .build()
+                        );
+                    }
+                    if result.version > 0
+                        && result.policy_source == PolicySource::Sandbox
+                        && let Err(e) = client
+                            .report_policy_status(sandbox_id, result.version, true, "")
+                            .await
+                    {
+                        warn!(error = %e, "Failed to report policy load success");
+                    }
+                }
+                Err(e) => {
+                    ocsf_emit!(ConfigStateChangeBuilder::new(ocsf_ctx())
+                        .severity(SeverityId::Medium)
+                        .status(StatusId::Failure)
+                        .state(StateId::Other, "failed")
+                        .unmapped("version", serde_json::json!(result.version))
+                        .unmapped("error", serde_json::json!(e.to_string()))
+                        .message(format!(
+                            "Policy reload failed, keeping last-known-good policy [version:{} error:{e}]",
+                            result.version
+                        ))
+                        .build());
+                    if result.version > 0
+                        && result.policy_source == PolicySource::Sandbox
+                        && let Err(report_err) = client
+                            .report_policy_status(sandbox_id, result.version, false, &e.to_string())
+                            .await
+                    {
+                        warn!(error = %report_err, "Failed to report policy load failure");
+                    }
                 }
             }
-            Err(e) => {
-                warn!(
-                    version = result.version,
-                    error = %e,
-                    "Policy reload failed, keeping last-known-good policy"
-                );
-                if let Err(report_err) = client
-                    .report_policy_status(sandbox_id, result.version, false, &e.to_string())
-                    .await
-                {
-                    warn!(error = %report_err, "Failed to report policy load failure");
+        }
+
+        // Apply OCSF JSON toggle from the `ocsf_json_enabled` setting.
+        let new_ocsf = extract_bool_setting(&result.settings, "ocsf_json_enabled").unwrap_or(false);
+        let prev_ocsf = ocsf_enabled.swap(new_ocsf, Ordering::Relaxed);
+        if new_ocsf != prev_ocsf {
+            info!(ocsf_json_enabled = new_ocsf, "OCSF JSONL logging toggled");
+        }
+
+        current_config_revision = result.config_revision;
+        current_policy_hash = result.policy_hash;
+        current_settings = result.settings;
+    }
+}
+
+/// Extract a bool value from an effective setting, if present.
+fn extract_bool_setting(
+    settings: &std::collections::HashMap<String, openshell_core::proto::EffectiveSetting>,
+    key: &str,
+) -> Option<bool> {
+    use openshell_core::proto::setting_value;
+    settings
+        .get(key)
+        .and_then(|es| es.value.as_ref())
+        .and_then(|sv| sv.value.as_ref())
+        .and_then(|v| match v {
+            setting_value::Value::BoolValue(b) => Some(*b),
+            _ => None,
+        })
+}
+
+/// Log individual setting changes between two snapshots.
+fn log_setting_changes(
+    old: &std::collections::HashMap<String, openshell_core::proto::EffectiveSetting>,
+    new: &std::collections::HashMap<String, openshell_core::proto::EffectiveSetting>,
+) {
+    for (key, new_es) in new {
+        let new_val = format_setting_value(new_es);
+        match old.get(key) {
+            Some(old_es) => {
+                let old_val = format_setting_value(old_es);
+                if old_val != new_val {
+                    ocsf_emit!(
+                        ConfigStateChangeBuilder::new(ocsf_ctx())
+                            .severity(SeverityId::Informational)
+                            .status(StatusId::Success)
+                            .state(StateId::Enabled, "updated")
+                            .unmapped("key", serde_json::json!(key))
+                            .unmapped("old", serde_json::json!(old_val.clone()))
+                            .unmapped("new", serde_json::json!(new_val.clone()))
+                            .message(format!(
+                                "Setting changed [key:{key} old:{old_val} new:{new_val}]"
+                            ))
+                            .build()
+                    );
                 }
             }
+            None => {
+                ocsf_emit!(
+                    ConfigStateChangeBuilder::new(ocsf_ctx())
+                        .severity(SeverityId::Informational)
+                        .status(StatusId::Success)
+                        .state(StateId::Enabled, "enabled")
+                        .unmapped("key", serde_json::json!(key))
+                        .unmapped("value", serde_json::json!(new_val.clone()))
+                        .message(format!("Setting added [key:{key} value:{new_val}]"))
+                        .build()
+                );
+            }
+        }
+    }
+    for key in old.keys() {
+        if !new.contains_key(key) {
+            ocsf_emit!(
+                ConfigStateChangeBuilder::new(ocsf_ctx())
+                    .severity(SeverityId::Informational)
+                    .status(StatusId::Success)
+                    .state(StateId::Disabled, "disabled")
+                    .unmapped("key", serde_json::json!(key))
+                    .message(format!("Setting removed [key:{key}]"))
+                    .build()
+            );
         }
     }
 }
 
+/// Format an `EffectiveSetting` value for log display.
+fn format_setting_value(es: &openshell_core::proto::EffectiveSetting) -> String {
+    use openshell_core::proto::setting_value;
+    match es.value.as_ref().and_then(|sv| sv.value.as_ref()) {
+        None => "<unset>".to_string(),
+        Some(setting_value::Value::StringValue(v)) => v.clone(),
+        Some(setting_value::Value::BoolValue(v)) => v.to_string(),
+        Some(setting_value::Value::IntValue(v)) => v.to_string(),
+        Some(setting_value::Value::BytesValue(_)) => "<bytes>".to_string(),
+    }
+}
+
 #[cfg(test)]
+#[allow(
+    clippy::needless_raw_string_hashes,
+    clippy::iter_on_single_items,
+    clippy::similar_names,
+    clippy::manual_string_new,
+    clippy::doc_markdown,
+    reason = "Test code: test fixtures often use idiomatic forms not flagged in production."
+)]
 mod tests {
     use super::*;
+    use crate::policy::{FilesystemPolicy, LandlockPolicy, ProcessPolicy};
+    #[cfg(unix)]
+    use nix::unistd::{Group, User};
+    #[cfg(unix)]
+    use std::os::unix::fs::{MetadataExt, symlink};
     use temp_env::with_vars;
 
-    static ENV_LOCK: std::sync::LazyLock<std::sync::Mutex<()>> =
-        std::sync::LazyLock::new(|| std::sync::Mutex::new(()));
+    static ENV_LOCK: LazyLock<Mutex<()>> = LazyLock::new(|| Mutex::new(()));
 
     #[test]
     fn bundle_to_resolved_routes_converts_all_fields() {
@@ -1412,6 +2430,7 @@ mod tests {
                         "openai_responses".to_string(),
                     ],
                     provider_type: "openai".to_string(),
+                    timeout_secs: 0,
                 },
                 openshell_core::proto::ResolvedRoute {
                     name: "local".to_string(),
@@ -1420,6 +2439,7 @@ mod tests {
                     model_id: "llama-3".to_string(),
                     protocols: vec!["openai_chat_completions".to_string()],
                     provider_type: String::new(),
+                    timeout_secs: 120,
                 },
             ],
             revision: "abc123".to_string(),
@@ -1440,10 +2460,20 @@ mod tests {
             routes[0].protocols,
             vec!["openai_chat_completions", "openai_responses"]
         );
+        assert_eq!(
+            routes[0].timeout,
+            openshell_router::config::DEFAULT_ROUTE_TIMEOUT,
+            "timeout_secs=0 should map to default"
+        );
         assert_eq!(routes[1].endpoint, "http://vllm:8000/v1");
         assert_eq!(
             routes[1].auth,
             openshell_core::inference::AuthHeader::Bearer
+        );
+        assert_eq!(
+            routes[1].timeout,
+            Duration::from_secs(120),
+            "timeout_secs=120 should map to 120s"
         );
     }
 
@@ -1469,6 +2499,7 @@ mod tests {
                 model_id: "model".to_string(),
                 protocols: vec!["openai_chat_completions".to_string()],
                 provider_type: "openai".to_string(),
+                timeout_secs: 0,
             }],
             revision: "rev".to_string(),
             generated_at_ms: 0,
@@ -1489,6 +2520,8 @@ mod tests {
                 protocols: vec!["openai_chat_completions".to_string()],
                 auth: openshell_core::inference::AuthHeader::Bearer,
                 default_headers: vec![],
+                passthrough_headers: vec![],
+                timeout: openshell_router::config::DEFAULT_ROUTE_TIMEOUT,
             },
             openshell_router::config::ResolvedRoute {
                 name: "sandbox-system".to_string(),
@@ -1498,6 +2531,8 @@ mod tests {
                 protocols: vec!["anthropic_messages".to_string()],
                 auth: openshell_core::inference::AuthHeader::Custom("x-api-key"),
                 default_headers: vec![],
+                passthrough_headers: vec![],
+                timeout: openshell_router::config::DEFAULT_ROUTE_TIMEOUT,
             },
         ];
 
@@ -1786,6 +2821,8 @@ filesystem_policy:
             auth: openshell_core::inference::AuthHeader::Bearer,
             protocols: vec!["openai_chat_completions".to_string()],
             default_headers: vec![],
+            passthrough_headers: vec![],
+            timeout: openshell_router::config::DEFAULT_ROUTE_TIMEOUT,
         }];
 
         let cache = Arc::new(RwLock::new(routes));
@@ -1796,5 +2833,101 @@ filesystem_policy:
         let read = cache.read().await;
         assert_eq!(read.len(), 1);
         assert_eq!(read[0].model, "original-model");
+    }
+
+    #[cfg(unix)]
+    fn sandbox_policy_with_read_write(
+        path: std::path::PathBuf,
+        run_as_user: Option<String>,
+        run_as_group: Option<String>,
+    ) -> SandboxPolicy {
+        SandboxPolicy {
+            version: 1,
+            filesystem: FilesystemPolicy {
+                read_only: vec![],
+                read_write: vec![path],
+                include_workdir: false,
+            },
+            network: NetworkPolicy::default(),
+            landlock: LandlockPolicy::default(),
+            process: ProcessPolicy {
+                run_as_user,
+                run_as_group,
+            },
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn prepare_read_write_path_creates_missing_directory() {
+        let dir = tempfile::tempdir().unwrap();
+        let missing = dir.path().join("missing").join("nested");
+
+        assert!(prepare_read_write_path(&missing).unwrap());
+        assert!(missing.is_dir());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn prepare_read_write_path_preserves_existing_directory() {
+        let dir = tempfile::tempdir().unwrap();
+        let existing = dir.path().join("existing");
+        std::fs::create_dir(&existing).unwrap();
+
+        assert!(!prepare_read_write_path(&existing).unwrap());
+        assert!(existing.is_dir());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn prepare_read_write_path_rejects_symlink() {
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("target");
+        let link = dir.path().join("link");
+        std::fs::create_dir(&target).unwrap();
+        symlink(&target, &link).unwrap();
+
+        let error = prepare_read_write_path(&link).unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("is a symlink — refusing to chown"),
+            "unexpected error: {error}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn prepare_filesystem_skips_chown_for_existing_read_write_paths() {
+        if nix::unistd::geteuid().is_root() {
+            return;
+        }
+
+        let current_user = User::from_uid(nix::unistd::geteuid())
+            .unwrap()
+            .expect("current user entry");
+        let restricted_group = Group::from_gid(nix::unistd::Gid::from_raw(0))
+            .unwrap()
+            .expect("gid 0 group entry");
+        if restricted_group.gid == nix::unistd::getegid() {
+            return;
+        }
+
+        let dir = tempfile::tempdir().unwrap();
+        let existing = dir.path().join("existing");
+        std::fs::create_dir(&existing).unwrap();
+        let before = std::fs::metadata(&existing).unwrap();
+
+        let policy = sandbox_policy_with_read_write(
+            existing.clone(),
+            Some(current_user.name),
+            Some(restricted_group.name),
+        );
+
+        prepare_filesystem(&policy).expect("existing path should not be re-owned");
+
+        let after = std::fs::metadata(&existing).unwrap();
+        assert_eq!(after.uid(), before.uid());
+        assert_eq!(after.gid(), before.gid());
     }
 }

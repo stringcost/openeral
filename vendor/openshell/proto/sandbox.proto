@@ -5,6 +5,14 @@ syntax = "proto3";
 
 package openshell.sandbox.v1;
 
+// Sandbox-supervisor configuration and policy messages.
+//
+// Conventions:
+// - This file owns messages exchanged between the gateway and the sandbox
+//   supervisor/runtime.
+// - Public sandbox resource types live in `openshell.proto`.
+// - Internal compute-driver sandbox observation types live in `compute_driver.proto`.
+
 // Sandbox security policy configuration.
 message SandboxPolicy {
   // Policy version.
@@ -62,7 +70,7 @@ message NetworkEndpoint {
   // Single port (backwards compat). Use `ports` for multiple ports.
   // Mutually exclusive with `ports` — if both are set, `ports` takes precedence.
   uint32 port = 2;
-  // Application protocol for L7 inspection: "rest", "sql", or "" (L4-only).
+  // Application protocol for L7 inspection: "rest", "graphql", "sql", or "" (L4-only).
   string protocol = 3;
   // TLS handling: "terminate" or "passthrough" (default).
   string tls = 4;
@@ -85,29 +93,83 @@ message NetworkEndpoint {
   // If `port` is set and `ports` is empty, `port` is normalized to `ports: [port]`.
   // If both are set, `ports` takes precedence.
   repeated uint32 ports = 9;
-  // Egress route for allowed traffic. Empty/default means direct egress.
-  // Supported values include "direct" and "package_proxy".
-  string egress_via = 10;
-  // Optional routing profile metadata for the selected egress path.
-  // For package proxy routing this can identify the backend, for example "socket".
-  string egress_profile = 11;
-  // Optional boundary secret injection rules for REST endpoints.
-  repeated SecretInjectionRule secret_injection = 12;
+  // Explicit L7 deny rules. When present, requests matching any deny rule
+  // are blocked even if they match an allow rule or access preset.
+  // Deny rules take precedence over allow rules.
+  repeated L7DenyRule deny_rules = 10;
+  // When true, percent-encoded '/' (%2F) is preserved in path segments
+  // rather than rejected by the L7 path canonicalizer. Required for
+  // upstreams like GitLab that embed %2F in namespaced resource paths.
+  // Defaults to false (strict).
+  bool allow_encoded_slash = 11;
+  // GraphQL persisted-query behavior for hash-only/saved-query requests:
+  // "deny" (default) or "allow_registered".
+  string persisted_queries = 12;
+  // Trusted GraphQL persisted-query registry keyed by hash or service-specific ID.
+  // Only used when persisted_queries is "allow_registered".
+  map<string, GraphqlOperation> graphql_persisted_queries = 13;
+  // Maximum GraphQL request body bytes to buffer for inspection.
+  // Defaults to 65536 when unset.
+  uint32 graphql_max_body_bytes = 14;
+  // Optional HTTP path glob that scopes this L7 endpoint on shared host:port APIs.
+  // Example: use path "/graphql" for protocol "graphql" and "/repos/**" for
+  // protocol "rest" when both surfaces live under api.example.com:443.
+  // Empty means all paths.
+  string path = 15;
+  // Optional egress route selector. Supported openeral value:
+  // "package_proxy". Empty or "direct" means direct origin egress.
+  string egress_via = 16;
+  // Optional package-proxy profile label used for logs/auditing.
+  string egress_profile = 17;
+  // Endpoint-scoped boundary secret injection rules.
+  repeated SecretInjectionRule secret_injection = 18;
 }
 
-// A boundary secret injection rule for an endpoint.
 message SecretInjectionRule {
-  // Provider env var holding the real secret value.
+  // Provider env var containing the real secret.
   string env_var = 1;
-  // Optional placeholder token visible inside the sandbox. When empty, defaults
-  // to "openshell:resolve:env:<ENV_VAR>".
+  // Placeholder value expected from the workload. Defaults to
+  // openshell:resolve:env:<env_var> when empty.
   string proxy_value = 2;
-  // Optional header names to scan. Empty means all headers.
+  // Header names where the placeholder may be rewritten. Empty means all
+  // headers.
   repeated string match_headers = 3;
-  // Whether to rewrite query parameters for this secret.
+  // Whether query-string placeholders may be rewritten.
   bool match_query = 4;
-  // Reserved for future request-body rewriting support.
+  // Reserved for a future body-rewrite implementation. Rejected in v1.
   bool match_body = 5;
+}
+
+// Trusted GraphQL operation classification.
+message GraphqlOperation {
+  // Operation type: "query", "mutation", or "subscription".
+  string operation_type = 1;
+  // Operation name, if known.
+  string operation_name = 2;
+  // Root field names selected by the operation.
+  repeated string fields = 3;
+}
+
+// An L7 deny rule that blocks specific requests.
+// Mirrors L7Allow — same fields, same matching semantics, inverted effect.
+// Deny rules are evaluated after allow rules and take precedence.
+message L7DenyRule {
+  // HTTP method (REST): GET, POST, etc. or "*" for any.
+  string method = 1;
+  // URL path glob pattern (REST): "/repos/*/pulls/*/reviews", "**" for any.
+  string path = 2;
+  // SQL command (SQL): SELECT, INSERT, etc. or "*" for any.
+  string command = 3;
+  // Query parameter matcher map (REST).
+  // Same semantics as L7Allow.query.
+  map<string, L7QueryMatcher> query = 4;
+  // GraphQL operation type: "query", "mutation", "subscription", or "*" for any.
+  string operation_type = 5;
+  // GraphQL operation name glob. "*" matches any operation name.
+  string operation_name = 6;
+  // GraphQL root field globs. Deny rules match when any selected root field
+  // matches any configured glob.
+  repeated string fields = 7;
 }
 
 // An L7 policy rule (allow-only).
@@ -123,6 +185,25 @@ message L7Allow {
   string path = 2;
   // SQL command (SQL): SELECT, INSERT, etc. or "*" for any.
   string command = 3;
+  // Query parameter matcher map (REST).
+  // Key is the decoded query parameter name (case-sensitive).
+  // Value supports either a single glob (`glob`) or a list (`any`).
+  map<string, L7QueryMatcher> query = 4;
+  // GraphQL operation type: "query", "mutation", "subscription", or "*" for any.
+  string operation_type = 5;
+  // GraphQL operation name glob. "*" matches any operation name.
+  string operation_name = 6;
+  // GraphQL root field globs. Allow rules match only when every selected root
+  // field matches one of the configured globs. Omit to match all fields.
+  repeated string fields = 7;
+}
+
+// Query value matcher for one query parameter key.
+message L7QueryMatcher {
+  // Single glob pattern.
+  string glob = 1;
+  // Any-of glob patterns.
+  repeated string any = 2;
 }
 
 // A binary identity for network policy matching.
@@ -132,18 +213,70 @@ message NetworkBinary {
   bool harness = 2 [deprecated = true];
 }
 
-// Request to get sandbox policy by sandbox ID.
-message GetSandboxPolicyRequest {
+// Request to get sandbox settings by sandbox ID.
+message GetSandboxConfigRequest {
   // The sandbox ID.
   string sandbox_id = 1;
 }
 
-// Response containing sandbox policy.
-message GetSandboxPolicyResponse {
+// Request to get gateway-global settings.
+message GetGatewayConfigRequest {}
+
+// Response containing gateway-global settings.
+message GetGatewayConfigResponse {
+  // Gateway-global settings map excluding the reserved policy key.
+  // Registered keys without a configured value are returned with an empty SettingValue.
+  map<string, SettingValue> settings = 1;
+  // Monotonically increasing revision for gateway-global settings.
+  uint64 settings_revision = 2;
+}
+
+// Scope that currently controls a setting.
+enum SettingScope {
+  SETTING_SCOPE_UNSPECIFIED = 0;
+  SETTING_SCOPE_SANDBOX = 1;
+  SETTING_SCOPE_GLOBAL = 2;
+}
+
+// Type-aware setting value for sandbox/gateway settings.
+message SettingValue {
+  oneof value {
+    string string_value = 1;
+    bool bool_value = 2;
+    int64 int_value = 3;
+    bytes bytes_value = 4;
+  }
+}
+
+// Effective setting value and the scope it was resolved from.
+message EffectiveSetting {
+  SettingValue value = 1;
+  SettingScope scope = 2;
+}
+
+// Source used for the policy payload in GetSandboxConfigResponse.
+enum PolicySource {
+  POLICY_SOURCE_UNSPECIFIED = 0;
+  POLICY_SOURCE_SANDBOX = 1;
+  POLICY_SOURCE_GLOBAL = 2;
+}
+
+// Response containing effective sandbox settings and policy.
+message GetSandboxConfigResponse {
   // The sandbox policy configuration.
   SandboxPolicy policy = 1;
   // Current policy version (monotonically increasing per sandbox).
   uint32 version = 2;
   // SHA-256 hash of the serialized policy payload.
   string policy_hash = 3;
+  // Effective settings resolved for this sandbox, excluding the reserved policy key.
+  // Registered keys without a configured value are returned with an empty EffectiveSetting.value.
+  map<string, EffectiveSetting> settings = 4;
+  // Fingerprint for effective config (policy + settings). Changes when any effective input changes.
+  uint64 config_revision = 5;
+  // Source of the policy payload for this response.
+  PolicySource policy_source = 6;
+  // When policy_source is GLOBAL, the version of the global policy revision.
+  // Zero when no global policy is active or when policy_source is SANDBOX.
+  uint32 global_policy_version = 7;
 }

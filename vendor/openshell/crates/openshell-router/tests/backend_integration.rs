@@ -15,6 +15,8 @@ fn mock_candidates(base_url: &str) -> Vec<ResolvedRoute> {
         protocols: vec!["openai_chat_completions".to_string()],
         auth: AuthHeader::Bearer,
         default_headers: Vec::new(),
+        passthrough_headers: vec!["openai-organization".to_string(), "x-model-id".to_string()],
+        timeout: openshell_router::config::DEFAULT_ROUTE_TIMEOUT,
     }]
 }
 
@@ -117,6 +119,8 @@ async fn proxy_no_compatible_route_returns_error() {
         protocols: vec!["anthropic_messages".to_string()],
         auth: AuthHeader::Custom("x-api-key"),
         default_headers: Vec::new(),
+        passthrough_headers: Vec::new(),
+        timeout: openshell_router::config::DEFAULT_ROUTE_TIMEOUT,
     }];
 
     let err = router
@@ -168,6 +172,39 @@ async fn proxy_strips_auth_header() {
 }
 
 #[tokio::test]
+async fn proxy_forwards_openai_organization_header() {
+    let mock_server = MockServer::start().await;
+
+    Mock::given(method("POST"))
+        .and(path("/v1/chat/completions"))
+        .and(bearer_token("test-api-key"))
+        .and(header("openai-organization", "org_123"))
+        .respond_with(ResponseTemplate::new(200).set_body_string("{}"))
+        .mount(&mock_server)
+        .await;
+
+    let router = Router::new().unwrap();
+    let candidates = mock_candidates(&mock_server.uri());
+
+    let response = router
+        .proxy_with_candidates(
+            "openai_chat_completions",
+            "POST",
+            "/v1/chat/completions",
+            vec![
+                ("openai-organization".to_string(), "org_123".to_string()),
+                ("cookie".to_string(), "session=abc".to_string()),
+            ],
+            bytes::Bytes::new(),
+            &candidates,
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(response.status, 200);
+}
+
+#[tokio::test]
 async fn proxy_mock_route_returns_canned_response() {
     let router = Router::new().unwrap();
     let candidates = vec![ResolvedRoute {
@@ -178,6 +215,8 @@ async fn proxy_mock_route_returns_canned_response() {
         protocols: vec!["openai_chat_completions".to_string()],
         auth: AuthHeader::Bearer,
         default_headers: Vec::new(),
+        passthrough_headers: Vec::new(),
+        timeout: openshell_router::config::DEFAULT_ROUTE_TIMEOUT,
     }];
 
     let body = serde_json::to_vec(&serde_json::json!({
@@ -312,6 +351,11 @@ async fn proxy_uses_x_api_key_for_anthropic_route() {
         protocols: vec!["anthropic_messages".to_string()],
         auth: AuthHeader::Custom("x-api-key"),
         default_headers: vec![("anthropic-version".to_string(), "2023-06-01".to_string())],
+        passthrough_headers: vec![
+            "anthropic-version".to_string(),
+            "anthropic-beta".to_string(),
+        ],
+        timeout: openshell_router::config::DEFAULT_ROUTE_TIMEOUT,
     }];
 
     let body = serde_json::to_vec(&serde_json::json!({
@@ -370,6 +414,11 @@ async fn proxy_anthropic_does_not_send_bearer_auth() {
         protocols: vec!["anthropic_messages".to_string()],
         auth: AuthHeader::Custom("x-api-key"),
         default_headers: vec![("anthropic-version".to_string(), "2023-06-01".to_string())],
+        passthrough_headers: vec![
+            "anthropic-version".to_string(),
+            "anthropic-beta".to_string(),
+        ],
+        timeout: openshell_router::config::DEFAULT_ROUTE_TIMEOUT,
     }];
 
     let response = router
@@ -414,6 +463,11 @@ async fn proxy_forwards_client_anthropic_version_header() {
         protocols: vec!["anthropic_messages".to_string()],
         auth: AuthHeader::Custom("x-api-key"),
         default_headers: vec![("anthropic-version".to_string(), "2023-06-01".to_string())],
+        passthrough_headers: vec![
+            "anthropic-version".to_string(),
+            "anthropic-beta".to_string(),
+        ],
+        timeout: openshell_router::config::DEFAULT_ROUTE_TIMEOUT,
     }];
 
     let body = serde_json::to_vec(&serde_json::json!({
@@ -461,4 +515,137 @@ fn config_resolves_routes_with_protocol() {
     };
     let routes = config.resolve_routes().unwrap();
     assert_eq!(routes[0].protocols, vec!["openai_chat_completions"]);
+}
+
+/// Streaming proxy must not apply a total request timeout to the body stream.
+///
+/// The backend delays its response longer than the route timeout. With the old
+/// code this would fail (reqwest's total `.timeout()` fires), but the streaming
+/// path now omits that timeout — only the client-level `connect_timeout` and
+/// the sandbox idle timeout govern liveness.
+#[tokio::test]
+async fn streaming_proxy_completes_despite_exceeding_route_timeout() {
+    use std::time::Duration;
+
+    let mock_server = MockServer::start().await;
+
+    let sse_body = concat!(
+        "data: {\"choices\":[{\"delta\":{\"content\":\"hello\"}}]}\n\n",
+        "data: {\"choices\":[{\"delta\":{\"content\":\" world\"}}]}\n\n",
+        "data: [DONE]\n\n",
+    );
+
+    // Delay the response 3s — longer than the 1s route timeout.
+    Mock::given(method("POST"))
+        .and(path("/v1/chat/completions"))
+        .and(bearer_token("test-api-key"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .append_header("content-type", "text/event-stream")
+                .set_body_string(sse_body)
+                .set_delay(Duration::from_secs(3)),
+        )
+        .mount(&mock_server)
+        .await;
+
+    let router = Router::new().unwrap();
+    let candidates = vec![ResolvedRoute {
+        name: "inference.local".to_string(),
+        endpoint: mock_server.uri(),
+        model: "test-model".to_string(),
+        api_key: "test-api-key".to_string(),
+        protocols: vec!["openai_chat_completions".to_string()],
+        auth: AuthHeader::Bearer,
+        default_headers: Vec::new(),
+        passthrough_headers: Vec::new(),
+        // Route timeout shorter than the backend delay — streaming must
+        // NOT be constrained by this.
+        timeout: Duration::from_secs(1),
+    }];
+
+    let body = serde_json::to_vec(&serde_json::json!({
+        "model": "test-model",
+        "messages": [{"role": "user", "content": "hi"}],
+        "stream": true
+    }))
+    .unwrap();
+
+    // The streaming path should succeed despite the 3s delay exceeding
+    // the 1s route timeout.
+    let mut resp = router
+        .proxy_with_candidates_streaming(
+            "openai_chat_completions",
+            "POST",
+            "/v1/chat/completions",
+            vec![("content-type".to_string(), "application/json".to_string())],
+            bytes::Bytes::from(body),
+            &candidates,
+        )
+        .await
+        .expect("streaming proxy should not be killed by route timeout");
+
+    assert_eq!(resp.status, 200);
+
+    // Drain all chunks to verify the full body is received.
+    let mut total_bytes = 0;
+    while let Ok(Some(chunk)) = resp.next_chunk().await {
+        total_bytes += chunk.len();
+    }
+    assert!(total_bytes > 0, "should have received body chunks");
+}
+
+/// Non-streaming (buffered) proxy must still enforce the route timeout.
+#[tokio::test]
+async fn buffered_proxy_enforces_route_timeout() {
+    use std::time::Duration;
+
+    let mock_server = MockServer::start().await;
+
+    Mock::given(method("POST"))
+        .and(path("/v1/chat/completions"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_string("{}")
+                // Delay longer than the route timeout.
+                .set_delay(Duration::from_secs(5)),
+        )
+        .mount(&mock_server)
+        .await;
+
+    let router = Router::new().unwrap();
+    let candidates = vec![ResolvedRoute {
+        name: "inference.local".to_string(),
+        endpoint: mock_server.uri(),
+        model: "test-model".to_string(),
+        api_key: "test-api-key".to_string(),
+        protocols: vec!["openai_chat_completions".to_string()],
+        auth: AuthHeader::Bearer,
+        default_headers: Vec::new(),
+        passthrough_headers: Vec::new(),
+        timeout: Duration::from_secs(1),
+    }];
+
+    let body = serde_json::to_vec(&serde_json::json!({
+        "model": "test-model",
+        "messages": [{"role": "user", "content": "hi"}]
+    }))
+    .unwrap();
+
+    let result = router
+        .proxy_with_candidates(
+            "openai_chat_completions",
+            "POST",
+            "/v1/chat/completions",
+            vec![("content-type".to_string(), "application/json".to_string())],
+            bytes::Bytes::from(body),
+            &candidates,
+        )
+        .await;
+
+    assert!(result.is_err(), "buffered proxy should timeout");
+    let err = result.unwrap_err().to_string();
+    assert!(
+        err.contains("timed out"),
+        "error should mention timeout, got: {err}"
+    );
 }

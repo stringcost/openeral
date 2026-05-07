@@ -17,10 +17,14 @@
 //! still provide fast-fail UX — the monitor only adds diagnostic visibility.
 
 use crate::denial_aggregator::DenialEvent;
+use openshell_ocsf::{
+    ActionId, ActivityId, ConfidenceId, DetectionFindingBuilder, DispositionId, Endpoint,
+    FindingInfo, NetworkActivityBuilder, Process, SeverityId, ocsf_emit,
+};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU32, Ordering};
 use tokio::sync::mpsc;
-use tracing::{debug, warn};
+use tracing::debug;
 
 /// A parsed iptables LOG entry from `/dev/kmsg`.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -126,10 +130,15 @@ pub fn spawn(
         .status();
 
     if !dmesg_check.is_ok_and(|s| s.success()) {
-        warn!(
-            "dmesg not available; bypass detection monitor will not run. \
-             Bypass REJECT rules still provide fast-fail behavior."
-        );
+        let event = NetworkActivityBuilder::new(crate::ocsf_ctx())
+            .activity(ActivityId::Other)
+            .severity(SeverityId::Low)
+            .message(
+                "dmesg not available; bypass detection monitor will not run. \
+                 Bypass REJECT rules still provide fast-fail behavior.",
+            )
+            .build();
+        ocsf_emit!(event);
         return None;
     }
 
@@ -149,17 +158,26 @@ pub fn spawn(
         {
             Ok(c) => c,
             Err(e) => {
-                warn!(error = %e, "Failed to start dmesg --follow; bypass monitor will not run");
+                let event = NetworkActivityBuilder::new(crate::ocsf_ctx())
+                    .activity(ActivityId::Other)
+                    .severity(SeverityId::Low)
+                    .message(format!(
+                        "Failed to start dmesg --follow; bypass monitor will not run: {e}"
+                    ))
+                    .build();
+                ocsf_emit!(event);
                 return;
             }
         };
 
-        let stdout = match child.stdout.take() {
-            Some(s) => s,
-            None => {
-                warn!("dmesg --follow produced no stdout; bypass monitor will not run");
-                return;
-            }
+        let Some(stdout) = child.stdout.take() else {
+            let event = NetworkActivityBuilder::new(crate::ocsf_ctx())
+                .activity(ActivityId::Other)
+                .severity(SeverityId::Low)
+                .message("dmesg --follow produced no stdout; bypass monitor will not run")
+                .build();
+            ocsf_emit!(event);
+            return;
         };
 
         let reader = std::io::BufReader::new(stdout);
@@ -186,19 +204,59 @@ pub fn spawn(
                 };
 
             let hint = hint_for_event(&event);
+            let reason = "direct connection bypassed HTTP CONNECT proxy";
 
-            warn!(
-                dst_addr = %event.dst_addr,
-                dst_port = event.dst_port,
-                proto = %event.proto,
-                binary = %binary,
-                binary_pid = %binary_pid,
-                ancestors = %ancestors,
-                action = "reject",
-                reason = "direct connection bypassed HTTP CONNECT proxy",
-                hint = hint,
-                "BYPASS_DETECT",
-            );
+            // Dual-emit: Network Activity [4001] + Detection Finding [2004]
+            {
+                let dst_ep = if let Ok(ip) = event.dst_addr.parse::<std::net::IpAddr>() {
+                    Endpoint::from_ip(ip, event.dst_port)
+                } else {
+                    Endpoint::from_domain(&event.dst_addr, event.dst_port)
+                };
+
+                let net_event = NetworkActivityBuilder::new(crate::ocsf_ctx())
+                    .activity(ActivityId::Refuse)
+                    .action(ActionId::Denied)
+                    .disposition(DispositionId::Blocked)
+                    .severity(SeverityId::Medium)
+                    .dst_endpoint(dst_ep.clone())
+                    .actor_process(Process::from_bypass(&binary, &binary_pid, &ancestors))
+                    .firewall_rule("bypass-detect", "iptables")
+                    .observation_point(3)
+                    .message(format!(
+                        "BYPASS_DETECT {}:{} proto={} binary={binary} action=reject reason={reason}",
+                        event.dst_addr, event.dst_port, event.proto,
+                    ))
+                    .build();
+                ocsf_emit!(net_event);
+
+                let finding_event = DetectionFindingBuilder::new(crate::ocsf_ctx())
+                    .activity(ActivityId::Open)
+                    .action(ActionId::Denied)
+                    .disposition(DispositionId::Blocked)
+                    .severity(SeverityId::Medium)
+                    .is_alert(true)
+                    .confidence(ConfidenceId::High)
+                    .finding_info(
+                        FindingInfo::new("bypass-detect", "Proxy Bypass Detected")
+                            .with_desc(reason),
+                    )
+                    .remediation(hint)
+                    .evidence_pairs(&[
+                        ("dst_addr", &event.dst_addr),
+                        ("dst_port", &event.dst_port.to_string()),
+                        ("proto", &event.proto),
+                        ("binary", &binary),
+                        ("binary_pid", &binary_pid),
+                        ("ancestors", &ancestors),
+                    ])
+                    .message(format!(
+                        "BYPASS_DETECT {}:{} proto={} binary={binary} hint={hint}",
+                        event.dst_addr, event.dst_port, event.proto,
+                    ))
+                    .build();
+                ocsf_emit!(finding_event);
+            }
 
             // Send to denial aggregator if available.
             if let Some(ref tx) = denial_tx {
@@ -239,9 +297,59 @@ fn resolve_process_identity(entrypoint_pid: u32, src_port: u16) -> (String, Stri
     {
         use crate::procfs;
 
-        match procfs::resolve_tcp_peer_identity(entrypoint_pid, src_port) {
-            Ok((binary_path, pid)) => {
-                let ancestors = procfs::collect_ancestor_binaries(pid, entrypoint_pid);
+        match procfs::resolve_tcp_peer_socket_owners(entrypoint_pid, src_port) {
+            Ok(socket_owners) => {
+                let mut identities = Vec::new();
+                for owner in &socket_owners.owners {
+                    let Ok(binary_path) = procfs::binary_path(owner.pid.cast_signed()) else {
+                        continue;
+                    };
+                    let ancestors = procfs::collect_ancestor_binaries(owner.pid, entrypoint_pid);
+                    identities.push((owner.pid, binary_path, ancestors));
+                }
+
+                if identities.is_empty() {
+                    return ("-".to_string(), "-".to_string(), "-".to_string());
+                }
+
+                identities.sort_by_key(|(pid, _, _)| *pid);
+                let first_identity = (identities[0].1.clone(), identities[0].2.clone());
+                let ambiguous = identities
+                    .iter()
+                    .skip(1)
+                    .any(|(_, binary_path, ancestors)| {
+                        binary_path != &first_identity.0 || ancestors != &first_identity.1
+                    });
+
+                if ambiguous {
+                    let pids = identities
+                        .iter()
+                        .map(|(pid, _, _)| pid.to_string())
+                        .collect::<Vec<_>>()
+                        .join(", ");
+                    let owner_summary = identities
+                        .iter()
+                        .map(|(pid, binary_path, ancestors)| {
+                            let ancestors_str = if ancestors.is_empty() {
+                                "-".to_string()
+                            } else {
+                                ancestors
+                                    .iter()
+                                    .map(|p| p.display().to_string())
+                                    .collect::<Vec<_>>()
+                                    .join(" -> ")
+                            };
+                            format!(
+                                "pid={pid} binary={} ancestors=[{ancestors_str}]",
+                                binary_path.display()
+                            )
+                        })
+                        .collect::<Vec<_>>()
+                        .join("; ");
+                    return ("ambiguous".to_string(), pids, owner_summary);
+                }
+
+                let (pid, binary_path, ancestors) = identities.remove(0);
                 let ancestors_str = if ancestors.is_empty() {
                     "-".to_string()
                 } else {
@@ -382,6 +490,88 @@ mod tests {
             uid: None,
         };
         assert!(hint_for_event(&event).contains("UDP"));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn resolve_process_identity_surfaces_ambiguous_shared_socket() {
+        use std::ffi::CString;
+        use std::net::{TcpListener, TcpStream};
+        use std::os::fd::AsRawFd;
+        use std::time::{Duration, Instant};
+
+        if !std::path::Path::new("/bin/sleep").exists() {
+            eprintln!("skipping: /bin/sleep not available");
+            return;
+        }
+
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind listener");
+        let listener_port = listener.local_addr().unwrap().port();
+        let stream = TcpStream::connect(("127.0.0.1", listener_port)).expect("connect");
+        let peer_port = stream.local_addr().unwrap().port();
+        let (_accepted, _) = listener.accept().expect("accept");
+
+        let fd = stream.as_raw_fd();
+        // libc/syscall FFI requires unsafe
+        #[allow(unsafe_code)]
+        unsafe {
+            let flags = libc::fcntl(fd, libc::F_GETFD);
+            assert!(flags >= 0, "F_GETFD failed");
+            assert_eq!(
+                libc::fcntl(fd, libc::F_SETFD, flags & !libc::FD_CLOEXEC),
+                0,
+                "F_SETFD failed"
+            );
+        }
+
+        let sleep_path = CString::new("/bin/sleep").unwrap();
+        let arg0 = CString::new("sleep").unwrap();
+        let arg1 = CString::new("30").unwrap();
+        // libc/syscall FFI requires unsafe
+        #[allow(unsafe_code)]
+        let child_pid = unsafe { libc::fork() };
+        assert!(child_pid >= 0, "fork failed");
+        if child_pid == 0 {
+            // libc/syscall FFI requires unsafe
+            #[allow(unsafe_code)]
+            unsafe {
+                libc::execl(
+                    sleep_path.as_ptr(),
+                    arg0.as_ptr(),
+                    arg1.as_ptr(),
+                    std::ptr::null::<libc::c_char>(),
+                );
+                libc::_exit(127);
+            }
+        }
+
+        let deadline = Instant::now() + Duration::from_secs(2);
+        loop {
+            if let Ok(link) = std::fs::read_link(format!("/proc/{child_pid}/exe"))
+                && link.to_string_lossy().contains("sleep")
+            {
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "child pid {child_pid} did not exec into sleep within 2s"
+            );
+            std::thread::sleep(Duration::from_millis(20));
+        }
+
+        let (binary, pid, ancestors) = resolve_process_identity(std::process::id(), peer_port);
+
+        // libc/syscall FFI requires unsafe
+        #[allow(unsafe_code)]
+        unsafe {
+            libc::kill(child_pid, libc::SIGKILL);
+            libc::waitpid(child_pid, std::ptr::null_mut(), 0);
+        }
+
+        assert_eq!(binary, "ambiguous");
+        assert!(pid.contains(&std::process::id().to_string()));
+        assert!(pid.contains(&child_pid.to_string()));
+        assert!(ancestors.contains("binary="));
     }
 
     #[test]

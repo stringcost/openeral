@@ -105,6 +105,10 @@ OPENERAL_BIN="${OPENERAL_BIN:-$PROJECT_ROOT/target/debug/openeral}"
 OPENERAL_HELPER_LINK="/usr/local/bin/openeral"
 OPENERAL_HELPER_BACKUP=""
 OPENERAL_HELPER_CREATED=0
+SUDO=()
+if [ "$(id -u)" -ne 0 ] && command -v sudo >/dev/null 2>&1 && sudo -n true 2>/dev/null; then
+    SUDO=(sudo -n)
+fi
 
 # Issue #11: reliable cleanup via trap
 cleanup() {
@@ -115,9 +119,9 @@ cleanup() {
     fusermount -u /tmp/openeral_fuse3_ws_test 2>/dev/null || true
     fusermount -u /tmp/openeral_fuse3_consistency 2>/dev/null || true
     if [ "$OPENERAL_HELPER_CREATED" -eq 1 ]; then
-        rm -f "$OPENERAL_HELPER_LINK"
+        "${SUDO[@]}" rm -f "$OPENERAL_HELPER_LINK"
         if [ -n "$OPENERAL_HELPER_BACKUP" ] && [ -e "$OPENERAL_HELPER_BACKUP" ]; then
-            mv "$OPENERAL_HELPER_BACKUP" "$OPENERAL_HELPER_LINK"
+            "${SUDO[@]}" mv "$OPENERAL_HELPER_BACKUP" "$OPENERAL_HELPER_LINK"
         fi
     fi
     if [ -n "${MOUNT_PID:-}" ]; then
@@ -133,9 +137,30 @@ echo ""
 # ---- Setup ----
 echo "--- Setup ---"
 
+if [ ! -e /dev/fuse ]; then
+    echo "FATAL: /dev/fuse is not available in this test container."
+    echo "Run act from this repository so .actrc starts the job container with FUSE privileges."
+    exit 1
+fi
+
+DB_PORT="$(echo "$DB_CONN" | grep -oP '(^|[[:space:]])port=\K[^[:space:]]+' || true)"
+if [ -n "$DB_PORT" ]; then
+    export PGPORT="$DB_PORT"
+fi
+
+if ! grep -Eq '^[[:space:]]*user_allow_other([[:space:]]|$)' /etc/fuse.conf 2>/dev/null; then
+    if [ "$(id -u)" -eq 0 ]; then
+        sed -i 's/#user_allow_other/user_allow_other/' /etc/fuse.conf 2>/dev/null || true
+        grep -Eq '^[[:space:]]*user_allow_other([[:space:]]|$)' /etc/fuse.conf 2>/dev/null ||
+            printf '\nuser_allow_other\n' >>/etc/fuse.conf
+    elif [ "${#SUDO[@]}" -gt 0 ]; then
+        "${SUDO[@]}" sh -c "sed -i 's/#user_allow_other/user_allow_other/' /etc/fuse.conf 2>/dev/null || true; grep -Eq '^[[:space:]]*user_allow_other([[:space:]]|$)' /etc/fuse.conf 2>/dev/null || printf '\\nuser_allow_other\\n' >>/etc/fuse.conf"
+    fi
+fi
+
 # Create test schema and tables
 export PGPASSWORD=pgmount
-psql -h "$DB_HOST" -U pgmount -d testdb -q <<'SQL'
+if ! psql -h "$DB_HOST" -U pgmount -d testdb -q <<'SQL'
 -- Clean slate
 DROP SCHEMA IF EXISTS test_schema CASCADE;
 CREATE SCHEMA test_schema;
@@ -219,6 +244,10 @@ INSERT INTO public.users (name, email, age, active) VALUES
 -- Run ANALYZE for stats
 ANALYZE;
 SQL
+then
+    echo "Failed to create test data in PostgreSQL"
+    exit 1
+fi
 echo "Test data created"
 
 # Build openeral
@@ -230,15 +259,29 @@ if [ ! -x "$OPENERAL_BIN" ]; then
     exit 1
 fi
 
+OPENERAL_BIN_DIR="$(dirname "$OPENERAL_BIN")"
+case ":$PATH:" in
+    *":$OPENERAL_BIN_DIR:"*) ;;
+    *) export PATH="$OPENERAL_BIN_DIR:$PATH" ;;
+esac
+
 # mount.fuse3 resolves the filesystem helper from a standard system PATH,
 # not from this script's injected PATH. Install a temporary symlink so the
 # helper uses the exact binary that was just built for the test.
 if [ -e "$OPENERAL_HELPER_LINK" ] || [ -L "$OPENERAL_HELPER_LINK" ]; then
     OPENERAL_HELPER_BACKUP="${OPENERAL_HELPER_LINK}.bak.$$"
-    mv "$OPENERAL_HELPER_LINK" "$OPENERAL_HELPER_BACKUP"
+    if "${SUDO[@]}" mv "$OPENERAL_HELPER_LINK" "$OPENERAL_HELPER_BACKUP"; then
+        OPENERAL_HELPER_CREATED=1
+    else
+        echo "Warning: could not back up $OPENERAL_HELPER_LINK; relying on PATH for mount.fuse3"
+        OPENERAL_HELPER_BACKUP=""
+    fi
 fi
-ln -s "$OPENERAL_BIN" "$OPENERAL_HELPER_LINK"
-OPENERAL_HELPER_CREATED=1
+if "${SUDO[@]}" ln -s "$OPENERAL_BIN" "$OPENERAL_HELPER_LINK"; then
+    OPENERAL_HELPER_CREATED=1
+else
+    echo "Warning: could not install $OPENERAL_HELPER_LINK; relying on PATH for mount.fuse3"
+fi
 
 # Create mount point and mount
 mkdir -p "$MNT"
@@ -248,10 +291,23 @@ sleep 0.5
 echo "Mounting filesystem..."
 RUST_LOG=warn "$OPENERAL_BIN" mount -c "$DB_CONN" "$MNT" &
 MOUNT_PID=$!
-sleep 2
 
 # Verify mount succeeded
-if ! mountpoint -q "$MNT" 2>/dev/null && ! ls "$MNT" >/dev/null 2>&1; then
+MOUNT_READY=0
+for _ in $(seq 1 50); do
+    if ! kill -0 "$MOUNT_PID" 2>/dev/null; then
+        wait "$MOUNT_PID" 2>/dev/null || true
+        echo "FATAL: Mount process exited before $MNT became a mount point"
+        exit 1
+    fi
+    if mountpoint -q "$MNT" 2>/dev/null; then
+        MOUNT_READY=1
+        break
+    fi
+    sleep 0.2
+done
+
+if [ "$MOUNT_READY" -ne 1 ]; then
     echo "FATAL: Mount failed!"
     exit 1
 fi
@@ -601,13 +657,6 @@ echo ""
 
 # ---- mount.fuse3 Integration Tests ----
 
-# Keep PATH aligned with the freshly built binary for direct invocations too.
-OPENERAL_BIN_DIR="$(dirname "$OPENERAL_BIN")"
-case ":$PATH:" in
-    *":$OPENERAL_BIN_DIR:"*) ;;
-    *) export PATH="$OPENERAL_BIN_DIR:$PATH" ;;
-esac
-
 # `allow_other` requires an explicit host opt-in via /etc/fuse.conf.
 # CI enables this ahead of the test run; local development often does not.
 FUSE3_ALLOW_OTHER_OPT=""
@@ -615,6 +664,17 @@ if grep -Eq '^[[:space:]]*user_allow_other([[:space:]]|$)' /etc/fuse.conf 2>/dev
     FUSE3_ALLOW_OTHER_OPT=",allow_other"
 fi
 
+if [ -z "$FUSE3_ALLOW_OTHER_OPT" ]; then
+    echo "--- 19. mount.fuse3 Database Mount ---"
+    echo "  SKIP: /etc/fuse.conf does not enable user_allow_other"
+    echo ""
+    echo "--- 20. mount.fuse3 Workspace Mount ---"
+    echo "  SKIP: /etc/fuse.conf does not enable user_allow_other"
+    echo ""
+    echo "--- 21. Consistency: Direct vs mount.fuse3 ---"
+    echo "  SKIP: /etc/fuse.conf does not enable user_allow_other"
+    echo ""
+else
 echo "--- 19. mount.fuse3 Database Mount ---"
 FUSE3_MNT="/tmp/openeral_fuse3_test"
 mkdir -p "$FUSE3_MNT"
@@ -732,6 +792,7 @@ else
 fi
 rmdir "$FUSE3_CONS_MNT" 2>/dev/null
 echo ""
+fi
 
 # ---- Summary ----
 # (Cleanup happens via the EXIT trap handler — Issue #11)

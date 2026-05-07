@@ -7,161 +7,85 @@
 #
 # Targets:
 #   gateway             Final gateway image
+#   supervisor          Final supervisor image (Ubuntu base, supervisor binary)
 #   cluster             Final cluster image
-#   gateway-builder     Release openshell-server binary
-#   supervisor-builder  Release openshell-sandbox binary
-#   supervisor-output   Minimal stage exporting only the supervisor binary
+#
+# Rust binaries are built natively before the image build and staged at:
+#   deploy/docker/.build/prebuilt-binaries/<arch>/openshell-{gateway,sandbox}
+#
+# For local dev (Skaffold), pass --build-arg BUILD_FROM_SOURCE=1 to compile
+# binaries inside Docker instead. BuildKit only executes the selected binary
+# staging stage, so missing prebuilt files do not cause a build failure.
 
-ARG K3S_VERSION=v1.35.2-k3s1
+# Pin by tag AND manifest-list digest to prevent silent upstream republishes
+# from breaking the build. Update both when bumping k3s versions.
+# To refresh: docker buildx imagetools inspect rancher/k3s:<tag> | head -3
+ARG K3S_VERSION=v1.35.3-k3s1
+ARG K3S_DIGEST=sha256:4607083d3cac07e1ccde7317297271d13ed5f60f35a78f33fcef84858a9f1d69
 ARG K9S_VERSION=v0.50.18
 ARG HELM_VERSION=v3.17.3
 ARG NVIDIA_CONTAINER_TOOLKIT_VERSION=1.18.2-1
-ARG CRANE_VERSION=v0.20.6
-ARG OPENERAL_DEFAULT_IMAGE_REPO_BASE=""
-ARG OPENERAL_DEFAULT_IMAGE_TAG=""
-ARG KLIPPER_HELM_IMAGE=rancher/klipper-helm:v0.9.14-build20260210
-ARG COREDNS_IMAGE=rancher/mirrored-coredns-coredns:1.14.1
-ARG LOCAL_PATH_PROVISIONER_IMAGE=rancher/local-path-provisioner:v0.0.34
-ARG METRICS_SERVER_IMAGE=rancher/mirrored-metrics-server:v0.8.1
-ARG GENERIC_DEVICE_PLUGIN_IMAGE=squat/generic-device-plugin:0.1.0
-ARG AGENT_SANDBOX_CONTROLLER_IMAGE=registry.k8s.io/agent-sandbox/agent-sandbox-controller:v0.1.0
-ARG LOCAL_PATH_HELPER_IMAGE=rancher/mirrored-library-busybox:1.37.0
+# Controls binary source: 0 = prebuilt (release), 1 = compile in Docker (local dev).
+# Must be declared here (global scope) so it can be used in FROM instructions below.
+ARG BUILD_FROM_SOURCE=0
 
 # ---------------------------------------------------------------------------
-# Shared Rust build stages
+# Optional in-Docker Rust build (BUILD_FROM_SOURCE=1, local dev only)
 # ---------------------------------------------------------------------------
-FROM --platform=$BUILDPLATFORM rust:1.88-slim AS rust-builder-base
-ARG TARGETARCH
-ARG BUILDARCH
-ARG CARGO_TARGET_CACHE_SCOPE=default
-ARG SCCACHE_MEMCACHED_ENDPOINT
-# CI sets this to 1 for maximum optimization; local builds leave it unset
-# so cargo uses the Cargo.toml default (parallel codegen for fast linking).
-ARG CARGO_CODEGEN_UNITS
+FROM rust:1.95.0-slim-bookworm AS rust-builder
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
-    cmake g++ make protobuf-compiler curl && rm -rf /var/lib/apt/lists/*
-
-COPY deploy/docker/cross-build.sh /usr/local/bin/
-RUN . cross-build.sh && install_cross_toolchain && install_sccache && add_rust_target
+    build-essential \
+    cmake \
+    pkg-config \
+    libssl-dev \
+    ca-certificates \
+    && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /build
 
-FROM rust-builder-base AS rust-builder-skeleton
-
 COPY Cargo.toml Cargo.lock ./
-COPY crates/openshell-bootstrap/Cargo.toml crates/openshell-bootstrap/Cargo.toml
-COPY crates/openshell-cli/Cargo.toml crates/openshell-cli/Cargo.toml
-COPY crates/openshell-core/Cargo.toml crates/openshell-core/Cargo.toml
-COPY crates/openshell-policy/Cargo.toml crates/openshell-policy/Cargo.toml
-COPY crates/openshell-providers/Cargo.toml crates/openshell-providers/Cargo.toml
-COPY crates/openshell-router/Cargo.toml crates/openshell-router/Cargo.toml
-COPY crates/openshell-sandbox/Cargo.toml crates/openshell-sandbox/Cargo.toml
-COPY crates/openshell-server/Cargo.toml crates/openshell-server/Cargo.toml
-COPY crates/openshell-tui/Cargo.toml crates/openshell-tui/Cargo.toml
-COPY crates/openshell-core/build.rs crates/openshell-core/build.rs
+COPY crates/ crates/
 COPY proto/ proto/
+COPY providers/ providers/
 
-RUN mkdir -p \
-      crates/openshell-bootstrap/src \
-      crates/openshell-cli/src \
-      crates/openshell-core/src \
-      crates/openshell-policy/src \
-      crates/openshell-providers/src \
-      crates/openshell-router/src \
-      crates/openshell-sandbox/src \
-      crates/openshell-server/src \
-      crates/openshell-tui/src && \
-    touch crates/openshell-bootstrap/src/lib.rs && \
-    printf 'fn main() {}\n' > crates/openshell-cli/src/main.rs && \
-    touch crates/openshell-core/src/lib.rs && \
-    touch crates/openshell-policy/src/lib.rs && \
-    touch crates/openshell-providers/src/lib.rs && \
-    touch crates/openshell-router/src/lib.rs && \
-    touch crates/openshell-sandbox/src/lib.rs && \
-    printf 'fn main() {}\n' > crates/openshell-sandbox/src/main.rs && \
-    touch crates/openshell-server/src/lib.rs && \
-    printf 'fn main() {}\n' > crates/openshell-server/src/main.rs && \
-    touch crates/openshell-tui/src/lib.rs
-
-FROM rust-builder-skeleton AS rust-deps
-
-RUN --mount=type=cache,id=cargo-registry-${TARGETARCH},sharing=locked,target=/usr/local/cargo/registry \
-    --mount=type=cache,id=cargo-git-${TARGETARCH},sharing=locked,target=/usr/local/cargo/git \
-    --mount=type=cache,id=cargo-target-${TARGETARCH}-${CARGO_TARGET_CACHE_SCOPE},sharing=locked,target=/build/target \
-    --mount=type=cache,id=sccache-${TARGETARCH},sharing=locked,target=/tmp/sccache \
-    . cross-build.sh && cargo_cross_build --release -p openshell-server -p openshell-sandbox
+RUN --mount=type=cache,target=/usr/local/cargo/registry \
+    --mount=type=cache,target=/build/target \
+    cargo build --release \
+        --features "openshell-core/dev-settings" \
+        --bin openshell-gateway \
+        --bin openshell-sandbox \
+    && mkdir -p /build/out \
+    && install -m 0755 target/release/openshell-gateway /build/out/openshell-gateway \
+    && install -m 0755 target/release/openshell-sandbox /build/out/openshell-sandbox
 
 # ---------------------------------------------------------------------------
-# Per-target workspace stages
+# Per-arch binary stages
 # ---------------------------------------------------------------------------
-# Copy only the crates needed for each target so that a change to
-# openshell-sandbox does not invalidate the gateway build and vice versa.
-# The skeleton stage already has stub Cargo.toml + src/ for every crate,
-# so cargo workspace resolution continues to work — we just overwrite the
-# crates whose real source is needed for compilation.
 
-FROM rust-deps AS gateway-workspace
-ARG OPENSHELL_CARGO_VERSION
+# Prebuilt path (release default, BUILD_FROM_SOURCE=0)
+FROM scratch AS gateway-binary-0
+ARG TARGETARCH
+# --chmod=755 preserves the executable bit through actions/upload-artifact +
+# download-artifact, which strip exec perms during the roundtrip.
+COPY --chmod=755 deploy/docker/.build/prebuilt-binaries/${TARGETARCH}/openshell-gateway /build/out/openshell-gateway
 
-COPY crates/openshell-core/ crates/openshell-core/
-COPY crates/openshell-policy/ crates/openshell-policy/
-COPY crates/openshell-providers/ crates/openshell-providers/
-COPY crates/openshell-router/ crates/openshell-router/
-COPY crates/openshell-server/ crates/openshell-server/
+# Source-built path (local dev, BUILD_FROM_SOURCE=1)
+FROM rust-builder AS gateway-binary-1
 
-RUN touch \
-    crates/openshell-core/build.rs \
-    crates/openshell-server/src/main.rs \
-    proto/*.proto && \
-    if [ -n "${OPENSHELL_CARGO_VERSION:-}" ]; then \
-      sed -i -E '/^\[workspace\.package\]/,/^\[/{s/^version[[:space:]]*=[[:space:]]*".*"/version = "'"${OPENSHELL_CARGO_VERSION}"'"/}' Cargo.toml; \
-    fi
+FROM gateway-binary-${BUILD_FROM_SOURCE} AS gateway-binary
 
-FROM gateway-workspace AS gateway-builder
-ARG CARGO_CODEGEN_UNITS
+# Prebuilt path (release default, BUILD_FROM_SOURCE=0)
+FROM scratch AS supervisor-binary-0
+ARG TARGETARCH
+# --chmod=755 preserves the executable bit through actions/upload-artifact +
+# download-artifact, which strip exec perms during the roundtrip.
+COPY --chmod=755 deploy/docker/.build/prebuilt-binaries/${TARGETARCH}/openshell-sandbox /build/out/openshell-sandbox
 
-RUN --mount=type=cache,id=cargo-registry-${TARGETARCH},sharing=locked,target=/usr/local/cargo/registry \
-    --mount=type=cache,id=cargo-git-${TARGETARCH},sharing=locked,target=/usr/local/cargo/git \
-    --mount=type=cache,id=cargo-target-${TARGETARCH}-${CARGO_TARGET_CACHE_SCOPE},sharing=locked,target=/build/target \
-    --mount=type=cache,id=sccache-${TARGETARCH},sharing=locked,target=/tmp/sccache \
-    . cross-build.sh && \
-    cargo_cross_build --release -p openshell-server && \
-    mkdir -p /build/out && \
-    cp "$(cross_output_dir release)/openshell-server" /build/out/
+# Source-built path (local dev, BUILD_FROM_SOURCE=1)
+FROM rust-builder AS supervisor-binary-1
 
-FROM rust-deps AS supervisor-workspace
-ARG OPENSHELL_CARGO_VERSION
-
-COPY crates/openshell-core/ crates/openshell-core/
-COPY crates/openshell-policy/ crates/openshell-policy/
-COPY crates/openshell-router/ crates/openshell-router/
-COPY crates/openshell-sandbox/ crates/openshell-sandbox/
-
-RUN touch \
-    crates/openshell-core/build.rs \
-    crates/openshell-sandbox/src/main.rs \
-    proto/*.proto && \
-    if [ -n "${OPENSHELL_CARGO_VERSION:-}" ]; then \
-      sed -i -E '/^\[workspace\.package\]/,/^\[/{s/^version[[:space:]]*=[[:space:]]*".*"/version = "'"${OPENSHELL_CARGO_VERSION}"'"/}' Cargo.toml; \
-    fi
-
-FROM supervisor-workspace AS supervisor-builder
-ARG CARGO_CODEGEN_UNITS
-
-RUN --mount=type=cache,id=cargo-registry-${TARGETARCH},sharing=locked,target=/usr/local/cargo/registry \
-    --mount=type=cache,id=cargo-git-${TARGETARCH},sharing=locked,target=/usr/local/cargo/git \
-    --mount=type=cache,id=cargo-target-${TARGETARCH}-${CARGO_TARGET_CACHE_SCOPE},sharing=locked,target=/build/target \
-    --mount=type=cache,id=sccache-${TARGETARCH},sharing=locked,target=/tmp/sccache \
-    . cross-build.sh && \
-    cargo_cross_build --release -p openshell-sandbox && \
-    mkdir -p /build/out && \
-    cp "$(cross_output_dir release)/openshell-sandbox" /build/out/
-
-# Minimal extraction stage for fast-deploy: exports only the supervisor
-# binary (~20-40 MB) instead of the entire build environment (~968 MB).
-FROM scratch AS supervisor-output
-COPY --from=supervisor-builder /build/out/openshell-sandbox /openshell-sandbox
+FROM supervisor-binary-${BUILD_FROM_SOURCE} AS supervisor-binary
 
 # ---------------------------------------------------------------------------
 # Final gateway image
@@ -169,13 +93,15 @@ COPY --from=supervisor-builder /build/out/openshell-sandbox /openshell-sandbox
 FROM nvcr.io/nvidia/base/ubuntu:noble-20251013 AS gateway
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
-    ca-certificates && rm -rf /var/lib/apt/lists/*
+    ca-certificates && \
+    apt-get install -y --only-upgrade gpgv && \
+    rm -rf /var/lib/apt/lists/*
 
 RUN useradd --create-home --user-group openshell
 
 WORKDIR /app
 
-COPY --from=gateway-builder /build/out/openshell-server /usr/local/bin/
+COPY --from=gateway-binary /build/out/openshell-gateway /usr/local/bin/
 
 RUN mkdir -p /build/crates/openshell-server
 COPY --chmod=755 crates/openshell-server/migrations /build/crates/openshell-server/migrations
@@ -183,13 +109,31 @@ COPY --chmod=755 crates/openshell-server/migrations /build/crates/openshell-serv
 USER openshell
 EXPOSE 8080
 
-ENTRYPOINT ["openshell-server"]
-CMD ["--port", "8080"]
+ENTRYPOINT ["openshell-gateway"]
+CMD ["--bind-address", "0.0.0.0", "--port", "8080"]
+
+# ---------------------------------------------------------------------------
+# Final supervisor image
+# ---------------------------------------------------------------------------
+# Supervisor image based on the same NVIDIA Ubuntu base used by the gateway.
+#
+# Used by:
+#   - Docker driver: binary is extracted from the image and run inside the
+#     agent container.
+#   - Podman driver: image is mounted as an OCI volume at /opt/openshell/bin.
+#   - Kubernetes driver: image runs as an init container that invokes the
+#     binary's `copy-self` subcommand to seed an emptyDir volume.
+#
+# An Ubuntu base provides glibc and the dynamic loader needed to exec the
+# dynamically linked binary. `FROM scratch` would be smaller but cannot run
+# the binary, breaking the Kubernetes init-container path.
+FROM nvcr.io/nvidia/base/ubuntu:noble-20251013 AS supervisor
+COPY --from=supervisor-binary /build/out/openshell-sandbox /openshell-sandbox
 
 # ---------------------------------------------------------------------------
 # Cluster asset stages
 # ---------------------------------------------------------------------------
-FROM rancher/k3s:${K3S_VERSION} AS k3s
+FROM rancher/k3s:${K3S_VERSION}@${K3S_DIGEST} AS k3s
 
 FROM ubuntu:24.04 AS k9s
 ARG K9S_VERSION
@@ -209,14 +153,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends curl ca-certifi
     chmod +x /tmp/helm && \
     rm -rf /var/lib/apt/lists/*
 
-FROM ubuntu:24.04 AS cluster-charts
-COPY --from=helm /tmp/helm /usr/local/bin/helm
-WORKDIR /build
-COPY deploy/helm/ deploy/helm/
-RUN mkdir -p /build/out && \
-    helm package /build/deploy/helm/openshell -d /build/out >/dev/null
-
-FROM ubuntu:24.04 AS nvidia-toolkit
+FROM ubuntu:24.04 AS nvidia-container-toolkit
 ARG NVIDIA_CONTAINER_TOOLKIT_VERSION
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
@@ -228,65 +165,20 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
         | tee /etc/apt/sources.list.d/nvidia-container-toolkit.list && \
     apt-get update && \
     apt-get install -y --no-install-recommends \
-        "nvidia-container-toolkit=${NVIDIA_CONTAINER_TOOLKIT_VERSION}" \
-        "nvidia-container-toolkit-base=${NVIDIA_CONTAINER_TOOLKIT_VERSION}" \
-        "libnvidia-container-tools=${NVIDIA_CONTAINER_TOOLKIT_VERSION}" \
-        "libnvidia-container1=${NVIDIA_CONTAINER_TOOLKIT_VERSION}" && \
+        "nvidia-container-toolkit-base=${NVIDIA_CONTAINER_TOOLKIT_VERSION}" && \
     rm -rf /var/lib/apt/lists/*
-
-FROM ubuntu:24.04 AS cluster-image-preload
-ARG TARGETARCH
-ARG CRANE_VERSION
-ARG KLIPPER_HELM_IMAGE
-ARG COREDNS_IMAGE
-ARG LOCAL_PATH_PROVISIONER_IMAGE
-ARG METRICS_SERVER_IMAGE
-ARG GENERIC_DEVICE_PLUGIN_IMAGE
-ARG AGENT_SANDBOX_CONTROLLER_IMAGE
-ARG LOCAL_PATH_HELPER_IMAGE
-
-RUN apt-get update && apt-get install -y --no-install-recommends \
-    ca-certificates curl && rm -rf /var/lib/apt/lists/*
-
-RUN case "${TARGETARCH}" in \
-      amd64) crane_arch=x86_64 ;; \
-      arm64) crane_arch=arm64 ;; \
-      *) echo "Unsupported crane arch: ${TARGETARCH}" >&2; exit 1 ;; \
-    esac && \
-    curl -fsSL "https://github.com/google/go-containerregistry/releases/download/${CRANE_VERSION}/go-containerregistry_Linux_${crane_arch}.tar.gz" \
-      | tar xz -C /usr/local/bin crane && \
-    chmod +x /usr/local/bin/crane
-
-RUN mkdir -p /preload && \
-    for image in \
-      "${KLIPPER_HELM_IMAGE}" \
-      "${COREDNS_IMAGE}" \
-      "${LOCAL_PATH_PROVISIONER_IMAGE}" \
-      "${METRICS_SERVER_IMAGE}" \
-      "${GENERIC_DEVICE_PLUGIN_IMAGE}" \
-      "${AGENT_SANDBOX_CONTROLLER_IMAGE}" \
-      "${LOCAL_PATH_HELPER_IMAGE}"; do \
-      safe_name=$(printf '%s' "$image" | tr '/:@' '____'); \
-      crane pull "$image" "/preload/${safe_name}.tar"; \
-    done
 
 # ---------------------------------------------------------------------------
 # Final cluster image
 # ---------------------------------------------------------------------------
 FROM nvcr.io/nvidia/base/ubuntu:noble-20251013 AS cluster
-ARG OPENERAL_DEFAULT_IMAGE_REPO_BASE
-ARG OPENERAL_DEFAULT_IMAGE_TAG
-ARG OPENERAL_DEFAULT_PACKAGE_PROXY_ENABLED=false
-ARG OPENERAL_DEFAULT_PACKAGE_PROXY_PROFILE=""
-ARG OPENERAL_DEFAULT_PACKAGE_PROXY_UPSTREAM_URL=""
-ARG OPENERAL_DEFAULT_PACKAGE_PROXY_CA_SECRET_NAME=""
-ARG OPENERAL_DEFAULT_PACKAGE_PROXY_AUTH_SECRET_NAME=""
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
     ca-certificates \
     iptables \
     mount \
     dnsutils \
+    && apt-get install -y --only-upgrade gpgv \
     && rm -rf /var/lib/apt/lists/*
 
 COPY --from=k3s /bin/ /bin/
@@ -296,27 +188,16 @@ COPY --from=k3s /etc/ssl/certs/ca-certificates.crt /etc/ssl/certs/k3s-ca-certifi
 COPY --from=k3s /usr/share/zoneinfo/ /usr/share/zoneinfo/
 
 ENV PATH="/var/lib/rancher/k3s/data/cni:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:/bin/aux" \
-    CRI_CONFIG_FILE="/var/lib/rancher/k3s/agent/etc/crictl.yaml" \
-    OPENERAL_DEFAULT_IMAGE_REPO_BASE="${OPENERAL_DEFAULT_IMAGE_REPO_BASE}" \
-    OPENERAL_DEFAULT_IMAGE_TAG="${OPENERAL_DEFAULT_IMAGE_TAG}" \
-    OPENERAL_PACKAGE_PROXY_ENABLED="${OPENERAL_DEFAULT_PACKAGE_PROXY_ENABLED}" \
-    OPENERAL_PACKAGE_PROXY_PROFILE="${OPENERAL_DEFAULT_PACKAGE_PROXY_PROFILE}" \
-    OPENERAL_PACKAGE_PROXY_UPSTREAM_URL="${OPENERAL_DEFAULT_PACKAGE_PROXY_UPSTREAM_URL}" \
-    OPENERAL_PACKAGE_PROXY_CA_SECRET_NAME="${OPENERAL_DEFAULT_PACKAGE_PROXY_CA_SECRET_NAME}" \
-    OPENERAL_PACKAGE_PROXY_AUTH_SECRET_NAME="${OPENERAL_DEFAULT_PACKAGE_PROXY_AUTH_SECRET_NAME}"
+    CRI_CONFIG_FILE="/var/lib/rancher/k3s/agent/etc/crictl.yaml"
 
-COPY --from=nvidia-toolkit /usr/bin/nvidia-cdi-hook /usr/bin/
-COPY --from=nvidia-toolkit /usr/bin/nvidia-container-runtime /usr/bin/
-COPY --from=nvidia-toolkit /usr/bin/nvidia-container-runtime-hook /usr/bin/
-COPY --from=nvidia-toolkit /usr/bin/nvidia-container-cli /usr/bin/
-COPY --from=nvidia-toolkit /usr/bin/nvidia-ctk /usr/bin/
-COPY --from=nvidia-toolkit /etc/nvidia-container-runtime /etc/nvidia-container-runtime
-COPY --from=nvidia-toolkit /usr/lib/*-linux-gnu/libnvidia-container*.so* /usr/lib/
-COPY --from=supervisor-builder /build/out/openshell-sandbox /opt/openshell/bin/openshell-sandbox
+COPY --from=nvidia-container-toolkit /usr/bin/nvidia-cdi-hook /usr/bin/
+COPY --from=nvidia-container-toolkit /usr/bin/nvidia-container-runtime /usr/bin/
+COPY --from=nvidia-container-toolkit /usr/bin/nvidia-ctk /usr/bin/
+COPY --from=nvidia-container-toolkit /etc/nvidia-container-runtime /etc/nvidia-container-runtime
+COPY --from=supervisor-binary /build/out/openshell-sandbox /opt/openshell/bin/openshell-sandbox
 
 RUN mkdir -p /var/lib/rancher/k3s/server/manifests \
              /var/lib/rancher/k3s/server/static/charts \
-             /var/lib/rancher/k3s/agent/images \
              /etc/rancher/k3s \
              /opt/openshell/manifests \
              /opt/openshell/charts \
@@ -329,12 +210,22 @@ RUN chmod +x /usr/local/bin/cluster-entrypoint.sh
 COPY deploy/docker/cluster-healthcheck.sh /usr/local/bin/cluster-healthcheck.sh
 RUN chmod +x /usr/local/bin/cluster-healthcheck.sh
 
-COPY --from=cluster-charts /build/out/*.tgz /opt/openshell/charts/
-COPY deploy/kube/manifests/*.yaml /opt/openshell/manifests/
+COPY deploy/docker/.build/charts/*.tgz /opt/openshell/charts/
+# Only the core k3s auto-deploy manifests belong in the cluster image.
+# Gateway API routing is optional and requires Envoy Gateway CRDs, so
+# deploy/kube/manifests/envoy-gateway-openshell.yaml stays repo-local and is
+# applied manually by `mise run helm:gateway:apply` when grpcRoute is enabled.
+COPY deploy/kube/manifests/openshell-helmchart.yaml \
+     deploy/kube/manifests/agent-sandbox.yaml \
+     /opt/openshell/manifests/
 COPY deploy/kube/gpu-manifests/*.yaml /opt/openshell/gpu-manifests/
-COPY --from=cluster-image-preload /preload/*.tar /var/lib/rancher/k3s/agent/images/
 
 ENTRYPOINT ["/usr/local/bin/cluster-entrypoint.sh"]
+# Default to "server" so bare `docker run <image>` works without requiring
+# the caller to pass a subcommand.  The openshell CLI already passes
+# ["server", "--disable=traefik", ...] as CMD; this default only affects
+# manual `docker run` invocations that omit a command.
+CMD ["server"]
 
 HEALTHCHECK --interval=5s --timeout=5s --start-period=20s --retries=60 \
   CMD ["/usr/local/bin/cluster-healthcheck.sh"]

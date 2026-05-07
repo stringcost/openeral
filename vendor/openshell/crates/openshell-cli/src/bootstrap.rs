@@ -101,7 +101,7 @@ fn is_connectivity_error(error: &miette::Report) -> bool {
 /// `false` to skip bootstrap. Otherwise returns `true` — a gateway is created
 /// automatically without prompting the user.
 pub fn confirm_bootstrap(override_value: Option<bool>) -> Result<bool> {
-    if let Some(false) = override_value {
+    if override_value == Some(false) {
         return Ok(false);
     }
     Ok(true)
@@ -144,43 +144,71 @@ pub async fn run_bootstrap(
     );
     eprintln!();
 
-    // Auto-bootstrap always recreates if stale Docker resources are found
-    // (e.g. metadata was deleted but container/volume still exist).
-    let mut options = openshell_bootstrap::DeployOptions::new(&gateway_name).with_recreate(true);
-    if let Some(dest) = remote {
-        let mut remote_opts = openshell_bootstrap::RemoteOptions::new(dest);
-        if let Some(key) = ssh_key {
-            remote_opts = remote_opts.with_ssh_key(key);
+    // Build deploy options. The deploy flow auto-resumes from existing state
+    // (preserving sandboxes and secrets) when it finds an existing gateway.
+    // If the initial attempt fails, fall back to a full recreate.
+    let build_options = |recreate: bool| {
+        let mut opts = openshell_bootstrap::DeployOptions::new(&gateway_name)
+            .with_recreate(recreate)
+            .with_gpu(if gpu {
+                vec!["auto".to_string()]
+            } else {
+                vec![]
+            });
+        if let Some(dest) = remote {
+            let mut remote_opts = openshell_bootstrap::RemoteOptions::new(dest);
+            if let Some(key) = ssh_key {
+                remote_opts = remote_opts.with_ssh_key(key);
+            }
+            opts = opts.with_remote(remote_opts);
         }
-        options = options.with_remote(remote_opts);
-    }
-    // Read registry credentials from environment for the auto-bootstrap path.
-    // The explicit `--registry-username` / `--registry-token` flags are only
-    // on `gateway start`; when bootstrapping via `sandbox create`, the env
-    // vars are the mechanism.
-    if let Ok(username) = std::env::var("OPENSHELL_REGISTRY_USERNAME")
-        && !username.trim().is_empty()
-    {
-        options = options.with_registry_username(username);
-    }
-    if let Ok(token) = std::env::var("OPENSHELL_REGISTRY_TOKEN")
-        && !token.trim().is_empty()
-    {
-        options = options.with_registry_token(token);
-    }
-    // Read gateway host override from environment. Needed whenever the
-    // client cannot reach the Docker host at 127.0.0.1 — CI containers,
-    // WSL, remote Docker hosts, etc. The explicit `--gateway-host` flag
-    // is only on `gateway start`; this env var covers the auto-bootstrap
-    // path triggered by `sandbox create`.
-    if let Ok(host) = std::env::var("OPENSHELL_GATEWAY_HOST")
-        && !host.trim().is_empty()
-    {
-        options = options.with_gateway_host(host);
-    }
-    options = options.with_gpu(gpu);
+        // Read registry credentials from environment for the auto-bootstrap path.
+        // The explicit `--registry-username` / `--registry-token` flags are only
+        // on `gateway start`; when bootstrapping via `sandbox create`, the env
+        // vars are the mechanism.
+        if let Ok(username) = std::env::var("OPENSHELL_REGISTRY_USERNAME")
+            && !username.trim().is_empty()
+        {
+            opts = opts.with_registry_username(username);
+        }
+        if let Ok(token) = std::env::var("OPENSHELL_REGISTRY_TOKEN")
+            && !token.trim().is_empty()
+        {
+            opts = opts.with_registry_token(token);
+        }
+        // Read gateway host override from environment. Needed whenever the
+        // client cannot reach the Docker host at 127.0.0.1 — CI containers,
+        // WSL, remote Docker hosts, etc. The explicit `--gateway-host` flag
+        // is only on `gateway start`; this env var covers the auto-bootstrap
+        // path triggered by `sandbox create`.
+        if let Ok(host) = std::env::var("OPENSHELL_GATEWAY_HOST")
+            && !host.trim().is_empty()
+        {
+            opts = opts.with_gateway_host(host);
+        }
+        opts
+    };
 
-    let handle = deploy_gateway_with_panel(options, &gateway_name, location).await?;
+    // Deploy the gateway. The deploy flow auto-resumes from existing state
+    // when it finds one. If that fails, fall back to a full recreate.
+    let handle = match Box::pin(deploy_gateway_with_panel(
+        build_options(false),
+        &gateway_name,
+        location,
+    ))
+    .await
+    {
+        Ok(handle) => handle,
+        Err(resume_err) => {
+            tracing::warn!("auto-bootstrap resume failed, falling back to recreate: {resume_err}");
+            Box::pin(deploy_gateway_with_panel(
+                build_options(true),
+                &gateway_name,
+                location,
+            ))
+            .await?
+        }
+    };
     let server = handle.gateway_endpoint().to_string();
 
     print_deploy_summary(&gateway_name, &handle);
@@ -206,9 +234,13 @@ pub async fn run_bootstrap(
 
 /// Retry connecting to the gateway gRPC endpoint until it succeeds or a
 /// timeout is reached. Uses exponential backoff starting at 500 ms, doubling
-/// up to 4 s, with a total deadline of 30 s.
-async fn wait_for_grpc_ready(server: &str, tls: &TlsOptions) -> Result<()> {
-    const MAX_WAIT: Duration = Duration::from_secs(30);
+/// up to 4 s, with a total deadline of 90 s.
+///
+/// The generous timeout accounts for gateway resume scenarios where stale k3s
+/// nodes must be cleaned up and workload pods rescheduled before the gRPC
+/// endpoint becomes available.
+pub(crate) async fn wait_for_grpc_ready(server: &str, tls: &TlsOptions) -> Result<()> {
+    const MAX_WAIT: Duration = Duration::from_secs(90);
     const INITIAL_BACKOFF: Duration = Duration::from_millis(500);
 
     let start = std::time::Instant::now();
@@ -232,7 +264,7 @@ async fn wait_for_grpc_ready(server: &str, tls: &TlsOptions) -> Result<()> {
 
     Err(last_err
         .unwrap_or_else(|| miette::miette!("timed out waiting for gateway"))
-        .wrap_err("gateway deployed but not accepting connections after 30 s"))
+        .wrap_err("gateway deployed but not accepting connections after 90 s"))
 }
 
 #[cfg(test)]

@@ -435,13 +435,23 @@ impl openshell_core::proto::open_shell_server::OpenShell for TestOpenShell {
         ))
     }
 
-    async fn get_sandbox_policy(
+    async fn get_sandbox_config(
         &self,
-        _: tonic::Request<openshell_core::proto::GetSandboxPolicyRequest>,
-    ) -> Result<tonic::Response<openshell_core::proto::GetSandboxPolicyResponse>, tonic::Status>
+        _: tonic::Request<openshell_core::proto::GetSandboxConfigRequest>,
+    ) -> Result<tonic::Response<openshell_core::proto::GetSandboxConfigResponse>, tonic::Status>
     {
         Ok(tonic::Response::new(
-            openshell_core::proto::GetSandboxPolicyResponse::default(),
+            openshell_core::proto::GetSandboxConfigResponse::default(),
+        ))
+    }
+
+    async fn get_gateway_config(
+        &self,
+        _: tonic::Request<openshell_core::proto::GetGatewayConfigRequest>,
+    ) -> Result<tonic::Response<openshell_core::proto::GetGatewayConfigResponse>, tonic::Status>
+    {
+        Ok(tonic::Response::new(
+            openshell_core::proto::GetGatewayConfigResponse::default(),
         ))
     }
 
@@ -498,6 +508,22 @@ impl openshell_core::proto::open_shell_server::OpenShell for TestOpenShell {
         Err(tonic::Status::unimplemented("test"))
     }
 
+    async fn list_provider_profiles(
+        &self,
+        _: tonic::Request<openshell_core::proto::ListProviderProfilesRequest>,
+    ) -> Result<tonic::Response<openshell_core::proto::ListProviderProfilesResponse>, tonic::Status>
+    {
+        Err(tonic::Status::unimplemented("test"))
+    }
+
+    async fn get_provider_profile(
+        &self,
+        _: tonic::Request<openshell_core::proto::GetProviderProfileRequest>,
+    ) -> Result<tonic::Response<openshell_core::proto::ProviderProfileResponse>, tonic::Status>
+    {
+        Err(tonic::Status::unimplemented("test"))
+    }
+
     async fn update_provider(
         &self,
         _: tonic::Request<openshell_core::proto::UpdateProviderRequest>,
@@ -517,6 +543,9 @@ impl openshell_core::proto::open_shell_server::OpenShell for TestOpenShell {
     >;
     type ExecSandboxStream = tokio_stream::wrappers::ReceiverStream<
         Result<openshell_core::proto::ExecSandboxEvent, tonic::Status>,
+    >;
+    type ConnectSupervisorStream = tokio_stream::wrappers::ReceiverStream<
+        Result<openshell_core::proto::GatewayMessage, tonic::Status>,
     >;
 
     async fn watch_sandbox(
@@ -539,11 +568,10 @@ impl openshell_core::proto::open_shell_server::OpenShell for TestOpenShell {
         ))
     }
 
-    async fn update_sandbox_policy(
+    async fn update_config(
         &self,
-        _: tonic::Request<openshell_core::proto::UpdateSandboxPolicyRequest>,
-    ) -> Result<tonic::Response<openshell_core::proto::UpdateSandboxPolicyResponse>, tonic::Status>
-    {
+        _: tonic::Request<openshell_core::proto::UpdateConfigRequest>,
+    ) -> Result<tonic::Response<openshell_core::proto::UpdateConfigResponse>, tonic::Status> {
         Err(tonic::Status::unimplemented("test"))
     }
 
@@ -652,6 +680,24 @@ impl openshell_core::proto::open_shell_server::OpenShell for TestOpenShell {
         _request: tonic::Request<openshell_core::proto::GetDraftHistoryRequest>,
     ) -> Result<tonic::Response<openshell_core::proto::GetDraftHistoryResponse>, tonic::Status>
     {
+        Err(tonic::Status::unimplemented("not implemented in test"))
+    }
+
+    async fn connect_supervisor(
+        &self,
+        _request: tonic::Request<tonic::Streaming<openshell_core::proto::SupervisorMessage>>,
+    ) -> Result<tonic::Response<Self::ConnectSupervisorStream>, tonic::Status> {
+        Err(tonic::Status::unimplemented("not implemented in test"))
+    }
+
+    type RelayStreamStream = tokio_stream::wrappers::ReceiverStream<
+        Result<openshell_core::proto::RelayFrame, tonic::Status>,
+    >;
+
+    async fn relay_stream(
+        &self,
+        _request: tonic::Request<tonic::Streaming<openshell_core::proto::RelayFrame>>,
+    ) -> Result<tonic::Response<Self::RelayStreamStream>, tonic::Status> {
         Err(tonic::Status::unimplemented("not implemented in test"))
     }
 }

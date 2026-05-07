@@ -85,19 +85,7 @@ Check whether the issue body contains a substantive agent diagnostic section. Lo
    ```bash
    gh issue edit <id> --add-label "state:triage-needed"
    ```
-2. Post a comment with the triage marker:
-   ```
-   > **📋 triage-agent**
-   >
-   > This issue was opened without an agent investigation.
-   >
-   > OpenShell is an agent-first project - before we triage this, please point your coding agent at the repo and have it investigate. Your agent can load skills like `debug-openshell-cluster` (for cluster issues), `debug-inference` (for inference setup issues), `openshell-cli` (for usage questions), or `generate-sandbox-policy` (for policy help).
-   >
-   > See [CONTRIBUTING.md](https://github.com/NVIDIA/OpenShell/blob/main/CONTRIBUTING.md#before-you-open-an-issue) for the full workflow.
-   >
-   > **Classification:** needs-more-info (agent diagnostic required)
-   ```
-3. Stop. Do not proceed with diagnosis until the reporter provides diagnostics.
+2. Do not post a standalone redirect comment. Report the missing diagnostic to the operator and stop unless a human explicitly asks you to continue triage anyway.
 
 **If the diagnostic section is substantive**, proceed to Step 4.
 
@@ -122,7 +110,7 @@ Based on the sub-agent's analysis, also attempt to validate the report directly:
 
 - For bug reports: check the relevant code paths, look for the described failure mode
 - For feature requests: assess feasibility against the existing architecture
-- For cluster/infrastructure issues: reference the `debug-openshell-cluster` skill's known failure patterns
+- For gateway deployment or infrastructure issues: reference the `debug-openshell-cluster` skill's known failure patterns
 - For inference and provider-topology issues: reference the `debug-inference` skill's known failure patterns
 - For CLI/usage issues: reference the `openshell-cli` skill's command reference
 

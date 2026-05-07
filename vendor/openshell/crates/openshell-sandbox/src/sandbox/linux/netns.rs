@@ -10,14 +10,22 @@
 use miette::{IntoDiagnostic, Result};
 use std::net::IpAddr;
 use std::os::unix::io::RawFd;
+use std::path::Path;
 use std::process::Command;
-use tracing::{debug, info, warn};
+use tracing::{debug, warn};
 use uuid::Uuid;
 
 /// Default subnet for sandbox networking.
 const SUBNET_PREFIX: &str = "10.200.0";
 const HOST_IP_SUFFIX: u8 = 1;
 const SANDBOX_IP_SUFFIX: u8 = 2;
+const IP_SEARCH_PATHS: &[&str] = &["/usr/sbin/ip", "/sbin/ip", "/usr/bin/ip", "/bin/ip"];
+const NSENTER_SEARCH_PATHS: &[&str] = &[
+    "/usr/bin/nsenter",
+    "/bin/nsenter",
+    "/usr/sbin/nsenter",
+    "/sbin/nsenter",
+];
 
 /// Handle to a network namespace with veth pair.
 ///
@@ -62,11 +70,15 @@ impl NetworkNamespace {
             .parse()
             .unwrap();
 
-        info!(
-            namespace = %name,
-            host_veth = %veth_host,
-            sandbox_veth = %veth_sandbox,
-            "Creating network namespace"
+        openshell_ocsf::ocsf_emit!(
+            openshell_ocsf::ConfigStateChangeBuilder::new(crate::ocsf_ctx())
+                .severity(openshell_ocsf::SeverityId::Informational)
+                .status(openshell_ocsf::StatusId::Success)
+                .state(openshell_ocsf::StateId::Enabled, "creating")
+                .message(format!(
+                    "Creating network namespace [ns:{name} host_veth:{veth_host} sandbox_veth:{veth_sandbox}]"
+                ))
+                .build()
         );
 
         // Create the namespace
@@ -152,11 +164,15 @@ impl NetworkNamespace {
             }
         };
 
-        info!(
-            namespace = %name,
-            host_ip = %host_ip,
-            sandbox_ip = %sandbox_ip,
-            "Network namespace created"
+        openshell_ocsf::ocsf_emit!(
+            openshell_ocsf::ConfigStateChangeBuilder::new(crate::ocsf_ctx())
+                .severity(openshell_ocsf::SeverityId::Informational)
+                .status(openshell_ocsf::StatusId::Success)
+                .state(openshell_ocsf::StateId::Enabled, "created")
+                .message(format!(
+                    "Network namespace created [ns:{name} host_ip:{host_ip} sandbox_ip:{sandbox_ip}]"
+                ))
+                .build()
         );
 
         Ok(Self {
@@ -203,6 +219,8 @@ impl NetworkNamespace {
         if let Some(fd) = self.ns_fd {
             debug!(namespace = %self.name, "Entering network namespace via setns");
             // SAFETY: setns is safe to call after fork, before exec
+            // libc/syscall FFI requires unsafe
+            #[allow(unsafe_code)]
             let result = unsafe { libc::setns(fd, libc::CLONE_NEWNET) };
             if result != 0 {
                 return Err(miette::miette!(
@@ -227,7 +245,7 @@ impl NetworkNamespace {
     /// Install iptables rules for bypass detection inside the namespace.
     ///
     /// Sets up OUTPUT chain rules that:
-    /// 1. ACCEPT traffic destined for the proxy (host_ip:proxy_port)
+    /// 1. ACCEPT traffic destined for the proxy (`host_ip:proxy_port`)
     /// 2. ACCEPT loopback traffic
     /// 3. ACCEPT established/related connections (response packets)
     /// 4. LOG + REJECT all other TCP/UDP traffic (bypass attempts)
@@ -243,57 +261,77 @@ impl NetworkNamespace {
     /// diagnostic logging.
     pub fn install_bypass_rules(&self, proxy_port: u16) -> Result<()> {
         // Check if iptables is available before attempting to install rules.
-        let iptables_path = match find_iptables() {
-            Some(path) => path,
-            None => {
-                warn!(
-                    namespace = %self.name,
-                    search_paths = ?IPTABLES_SEARCH_PATHS,
-                    "iptables not found; bypass detection rules will not be installed. \
-                     Install the iptables package for proxy bypass diagnostics."
-                );
-                return Ok(());
-            }
+        let Some(iptables_path) = find_iptables() else {
+            openshell_ocsf::ocsf_emit!(
+                openshell_ocsf::ConfigStateChangeBuilder::new(crate::ocsf_ctx())
+                    .severity(openshell_ocsf::SeverityId::Medium)
+                    .status(openshell_ocsf::StatusId::Failure)
+                    .state(openshell_ocsf::StateId::Disabled, "degraded")
+                    .message(format!(
+                        "iptables not found; bypass detection rules will not be installed [ns:{}]",
+                        self.name
+                    ))
+                    .build()
+            );
+            return Ok(());
         };
 
         let host_ip_str = self.host_ip.to_string();
         let proxy_port_str = proxy_port.to_string();
         let log_prefix = format!("openshell:bypass:{}:", &self.name);
 
-        info!(
-            namespace = %self.name,
-            iptables = iptables_path,
-            proxy_addr = %format!("{}:{}", host_ip_str, proxy_port),
-            "Installing bypass detection rules"
-        );
+        // "Installing bypass detection rules" is a transient step — skip OCSF.
+        // The completion event below covers the outcome.
 
         // Install IPv4 rules
-        if let Err(e) =
-            self.install_bypass_rules_for(iptables_path, &host_ip_str, &proxy_port_str, &log_prefix)
-        {
-            warn!(
-                namespace = %self.name,
-                error = %e,
-                "Failed to install IPv4 bypass detection rules"
+        if let Err(e) = self.install_bypass_rules_for(
+            &iptables_path,
+            &host_ip_str,
+            &proxy_port_str,
+            &log_prefix,
+        ) {
+            openshell_ocsf::ocsf_emit!(
+                openshell_ocsf::ConfigStateChangeBuilder::new(crate::ocsf_ctx())
+                    .severity(openshell_ocsf::SeverityId::Medium)
+                    .status(openshell_ocsf::StatusId::Failure)
+                    .state(openshell_ocsf::StateId::Disabled, "failed")
+                    .message(format!(
+                        "Failed to install IPv4 bypass detection rules [ns:{}]: {e}",
+                        self.name
+                    ))
+                    .build()
             );
             return Err(e);
         }
 
         // Install IPv6 rules — best-effort.
         // Skip the proxy ACCEPT rule for IPv6 since the proxy address is IPv4.
-        if let Some(ip6_path) = find_ip6tables(iptables_path) {
-            if let Err(e) = self.install_bypass_rules_for_v6(&ip6_path, &log_prefix) {
-                warn!(
-                    namespace = %self.name,
-                    error = %e,
-                    "Failed to install IPv6 bypass detection rules (non-fatal)"
-                );
-            }
+        if let Some(ip6_path) = find_ip6tables(&iptables_path)
+            && let Err(e) = self.install_bypass_rules_for_v6(&ip6_path, &log_prefix)
+        {
+            openshell_ocsf::ocsf_emit!(
+                openshell_ocsf::ConfigStateChangeBuilder::new(crate::ocsf_ctx())
+                    .severity(openshell_ocsf::SeverityId::Low)
+                    .status(openshell_ocsf::StatusId::Failure)
+                    .state(openshell_ocsf::StateId::Other, "degraded")
+                    .message(format!(
+                        "Failed to install IPv6 bypass detection rules (non-fatal) [ns:{}]: {e}",
+                        self.name
+                    ))
+                    .build()
+            );
         }
 
-        info!(
-            namespace = %self.name,
-            "Bypass detection rules installed"
+        openshell_ocsf::ocsf_emit!(
+            openshell_ocsf::ConfigStateChangeBuilder::new(crate::ocsf_ctx())
+                .severity(openshell_ocsf::SeverityId::Informational)
+                .status(openshell_ocsf::StatusId::Success)
+                .state(openshell_ocsf::StateId::Enabled, "installed")
+                .message(format!(
+                    "Bypass detection rules installed [ns:{}]",
+                    self.name
+                ))
+                .build()
         );
 
         Ok(())
@@ -372,11 +410,17 @@ impl NetworkNamespace {
                 "--log-uid",
             ],
         ) {
-            warn!(
-                error = %e,
-                "Failed to install LOG rule for TCP (xt_LOG module may not be loaded); \
-                 bypass REJECT rules will still be installed"
-            );
+            openshell_ocsf::ocsf_emit!(openshell_ocsf::ConfigStateChangeBuilder::new(
+                crate::ocsf_ctx()
+            )
+            .severity(openshell_ocsf::SeverityId::Low)
+            .status(openshell_ocsf::StatusId::Failure)
+            .state(openshell_ocsf::StateId::Other, "degraded")
+            .message(format!(
+                "Failed to install LOG rule for TCP (xt_LOG module may not be loaded) [ns:{}]: {e}",
+                self.name
+            ))
+            .build());
         }
 
         // Rule 5: REJECT TCP bypass attempts (fast-fail)
@@ -417,9 +461,16 @@ impl NetworkNamespace {
                 "--log-uid",
             ],
         ) {
-            warn!(
-                error = %e,
-                "Failed to install LOG rule for UDP; bypass REJECT rules will still be installed"
+            openshell_ocsf::ocsf_emit!(
+                openshell_ocsf::ConfigStateChangeBuilder::new(crate::ocsf_ctx())
+                    .severity(openshell_ocsf::SeverityId::Low)
+                    .status(openshell_ocsf::StatusId::Failure)
+                    .state(openshell_ocsf::StateId::Other, "degraded")
+                    .message(format!(
+                        "Failed to install LOG rule for UDP [ns:{}]: {e}",
+                        self.name
+                    ))
+                    .build()
             );
         }
 
@@ -494,7 +545,17 @@ impl NetworkNamespace {
                 "--log-uid",
             ],
         ) {
-            warn!(error = %e, "Failed to install IPv6 LOG rule for TCP");
+            openshell_ocsf::ocsf_emit!(
+                openshell_ocsf::ConfigStateChangeBuilder::new(crate::ocsf_ctx())
+                    .severity(openshell_ocsf::SeverityId::Low)
+                    .status(openshell_ocsf::StatusId::Failure)
+                    .state(openshell_ocsf::StateId::Other, "degraded")
+                    .message(format!(
+                        "Failed to install IPv6 LOG rule for TCP [ns:{}]: {e}",
+                        self.name
+                    ))
+                    .build()
+            );
         }
 
         // REJECT TCP bypass attempts
@@ -535,7 +596,17 @@ impl NetworkNamespace {
                 "--log-uid",
             ],
         ) {
-            warn!(error = %e, "Failed to install IPv6 LOG rule for UDP");
+            openshell_ocsf::ocsf_emit!(
+                openshell_ocsf::ConfigStateChangeBuilder::new(crate::ocsf_ctx())
+                    .severity(openshell_ocsf::SeverityId::Low)
+                    .status(openshell_ocsf::StatusId::Failure)
+                    .state(openshell_ocsf::StateId::Other, "degraded")
+                    .message(format!(
+                        "Failed to install IPv6 LOG rule for UDP [ns:{}]: {e}",
+                        self.name
+                    ))
+                    .build()
+            );
         }
 
         // REJECT UDP bypass attempts
@@ -585,45 +656,32 @@ impl Drop for NetworkNamespace {
             );
         }
 
-        info!(namespace = %self.name, "Network namespace cleaned up");
+        openshell_ocsf::ocsf_emit!(
+            openshell_ocsf::ConfigStateChangeBuilder::new(crate::ocsf_ctx())
+                .severity(openshell_ocsf::SeverityId::Informational)
+                .status(openshell_ocsf::StatusId::Success)
+                .state(openshell_ocsf::StateId::Disabled, "cleaned_up")
+                .message(format!("Network namespace cleaned up [ns:{}]", self.name))
+                .build()
+        );
     }
 }
 
 /// Run an `ip` command on the host.
 fn run_ip(args: &[&str]) -> Result<()> {
-    debug!(command = %format!("ip {}", args.join(" ")), "Running ip command");
+    let ip_path = find_trusted_binary("ip", IP_SEARCH_PATHS)?;
 
-    let output = Command::new("ip").args(args).output().into_diagnostic()?;
+    debug!(command = %format!("{ip_path} {}", args.join(" ")), "Running ip command");
 
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        return Err(miette::miette!(
-            "ip {} failed: {}",
-            args.join(" "),
-            stderr.trim()
-        ));
-    }
-
-    Ok(())
-}
-
-/// Run an `ip netns exec` command inside a namespace.
-fn run_ip_netns(netns: &str, args: &[&str]) -> Result<()> {
-    let mut full_args = vec!["netns", "exec", netns, "ip"];
-    full_args.extend(args);
-
-    debug!(command = %format!("ip {}", full_args.join(" ")), "Running ip netns exec command");
-
-    let output = Command::new("ip")
-        .args(&full_args)
+    let output = Command::new(ip_path)
+        .args(args)
         .output()
         .into_diagnostic()?;
 
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
         return Err(miette::miette!(
-            "ip netns exec {} ip {} failed: {}",
-            netns,
+            "{ip_path} {} failed: {}",
             args.join(" "),
             stderr.trim()
         ));
@@ -632,17 +690,31 @@ fn run_ip_netns(netns: &str, args: &[&str]) -> Result<()> {
     Ok(())
 }
 
-/// Run an iptables command inside a network namespace.
-fn run_iptables_netns(netns: &str, iptables_cmd: &str, args: &[&str]) -> Result<()> {
-    let mut full_args = vec!["netns", "exec", netns, iptables_cmd];
+/// Run an `ip` command inside a network namespace via `nsenter --net=`.
+///
+/// We use `nsenter` instead of `ip netns exec` because `ip netns exec`
+/// remounts `/sys` to reflect the target namespace's sysfs entries. That
+/// sysfs remount requires real `CAP_SYS_ADMIN` in the host user namespace,
+/// which is unavailable in rootless container runtimes (e.g. rootless
+/// Podman). `nsenter --net=` enters only the network namespace without
+/// changing the mount namespace, avoiding the sysfs remount entirely.
+/// The supervisor's operations (addr add, link set, route add) are all
+/// netlink-based and do not need sysfs access.
+fn run_ip_netns(netns: &str, args: &[&str]) -> Result<()> {
+    let ip_path = find_trusted_binary("ip", IP_SEARCH_PATHS)?;
+    let nsenter_path = find_trusted_binary("nsenter", NSENTER_SEARCH_PATHS)?;
+    let ns_path = format!("/var/run/netns/{netns}");
+    let net_flag = format!("--net={ns_path}");
+
+    let mut full_args = vec![net_flag.as_str(), "--", ip_path];
     full_args.extend(args);
 
     debug!(
-        command = %format!("ip {}", full_args.join(" ")),
-        "Running iptables in namespace"
+        command = %format!("{nsenter_path} {}", full_args.join(" ")),
+        "Running ip in namespace via nsenter"
     );
 
-    let output = Command::new("ip")
+    let output = Command::new(nsenter_path)
         .args(&full_args)
         .output()
         .into_diagnostic()?;
@@ -650,8 +722,43 @@ fn run_iptables_netns(netns: &str, iptables_cmd: &str, args: &[&str]) -> Result<
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
         return Err(miette::miette!(
-            "ip netns exec {} {} failed: {}",
-            netns,
+            "{nsenter_path} --net={} {ip_path} {} failed: {}",
+            ns_path,
+            args.join(" "),
+            stderr.trim()
+        ));
+    }
+
+    Ok(())
+}
+
+/// Run an iptables command inside a network namespace via `nsenter --net=`.
+///
+/// Uses `nsenter` instead of `ip netns exec` to avoid the sysfs remount
+/// that fails in rootless container runtimes. See `run_ip_netns` for details.
+fn run_iptables_netns(netns: &str, iptables_cmd: &str, args: &[&str]) -> Result<()> {
+    let nsenter_path = find_trusted_binary("nsenter", NSENTER_SEARCH_PATHS)?;
+    let ns_path = format!("/var/run/netns/{netns}");
+    let net_flag = format!("--net={ns_path}");
+
+    let mut full_args = vec![net_flag.as_str(), "--", iptables_cmd];
+    full_args.extend(args);
+
+    debug!(
+        command = %format!("{nsenter_path} {}", full_args.join(" ")),
+        "Running iptables in namespace via nsenter"
+    );
+
+    let output = Command::new(nsenter_path)
+        .args(&full_args)
+        .output()
+        .into_diagnostic()?;
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        return Err(miette::miette!(
+            "{nsenter_path} --net={} {} failed: {}",
+            ns_path,
             iptables_cmd,
             stderr.trim()
         ));
@@ -666,18 +773,112 @@ fn run_iptables_netns(netns: &str, iptables_cmd: &str, args: &[&str]) -> Result<
 const IPTABLES_SEARCH_PATHS: &[&str] =
     &["/usr/sbin/iptables", "/sbin/iptables", "/usr/bin/iptables"];
 
-/// Find the iptables binary path, checking well-known locations.
-fn find_iptables() -> Option<&'static str> {
-    IPTABLES_SEARCH_PATHS
+fn find_trusted_binary<'a>(name: &str, paths: &'a [&str]) -> Result<&'a str> {
+    paths
         .iter()
-        .find(|path| std::path::Path::new(path).exists())
         .copied()
+        .find(|path| {
+            let path = Path::new(path);
+            path.is_absolute() && path.is_file()
+        })
+        .ok_or_else(|| {
+            miette::miette!(
+                "trusted {name} helper not found; checked {}",
+                paths.join(", ")
+            )
+        })
+}
+
+/// Returns true if xt extension modules (e.g. `xt_comment`) cannot be used
+/// via the given iptables binary.
+///
+/// Some kernels have `nf_tables` but lack the `nft_compat` bridge that allows
+/// xt extension modules to be used through the `nf_tables` path (e.g. Jetson
+/// Linux 5.15-tegra). This probe detects that condition by attempting to
+/// insert a rule using the `xt_comment` extension. If it fails, xt extensions
+/// are unavailable and the caller should fall back to iptables-legacy.
+fn xt_extensions_unavailable(iptables_path: &str) -> bool {
+    // Create a temporary probe chain. If this fails (e.g. no CAP_NET_ADMIN),
+    // we can't determine availability — assume extensions are available.
+    let created = Command::new(iptables_path)
+        .args(["-t", "filter", "-N", "_xt_probe"])
+        .output()
+        .is_ok_and(|o| o.status.success());
+
+    if !created {
+        return false;
+    }
+
+    // Attempt to insert a rule using xt_comment. Failure means nft_compat
+    // cannot bridge xt extension modules on this kernel.
+    let probe_ok = Command::new(iptables_path)
+        .args([
+            "-t",
+            "filter",
+            "-A",
+            "_xt_probe",
+            "-m",
+            "comment",
+            "--comment",
+            "probe",
+            "-j",
+            "ACCEPT",
+        ])
+        .output()
+        .is_ok_and(|o| o.status.success());
+
+    // Clean up — best-effort, ignore failures.
+    let _ = Command::new(iptables_path)
+        .args([
+            "-t",
+            "filter",
+            "-D",
+            "_xt_probe",
+            "-m",
+            "comment",
+            "--comment",
+            "probe",
+            "-j",
+            "ACCEPT",
+        ])
+        .output();
+    let _ = Command::new(iptables_path)
+        .args(["-t", "filter", "-X", "_xt_probe"])
+        .output();
+
+    !probe_ok
+}
+
+/// Find the iptables binary path, checking well-known locations.
+///
+/// If xt extension modules are unavailable via the standard binary and
+/// `iptables-legacy` is available alongside it, the legacy binary is returned
+/// instead. This ensures bypass-detection rules can be installed on kernels
+/// where `nft_compat` is unavailable (e.g. Jetson Linux 5.15-tegra).
+fn find_iptables() -> Option<String> {
+    let standard_path = IPTABLES_SEARCH_PATHS
+        .iter()
+        .find(|path| Path::new(path).exists())
+        .copied()?;
+
+    if xt_extensions_unavailable(standard_path) {
+        let legacy_path = standard_path.replace("iptables", "iptables-legacy");
+        if Path::new(&legacy_path).exists() {
+            debug!(
+                legacy = legacy_path,
+                "xt extensions unavailable; using iptables-legacy"
+            );
+            return Some(legacy_path);
+        }
+    }
+
+    Some(standard_path.to_string())
 }
 
 /// Find the ip6tables binary path, deriving it from the iptables location.
 fn find_ip6tables(iptables_path: &str) -> Option<String> {
     let ip6_path = iptables_path.replace("iptables", "ip6tables");
-    if std::path::Path::new(&ip6_path).exists() {
+    if Path::new(&ip6_path).exists() {
         Some(ip6_path)
     } else {
         None
@@ -687,9 +888,31 @@ fn find_ip6tables(iptables_path: &str) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::fs;
 
     // These tests require root and network namespace support
     // Run with: sudo cargo test -- --ignored
+
+    #[test]
+    fn find_trusted_binary_uses_absolute_existing_file() {
+        let tempdir = tempfile::tempdir().unwrap();
+        let helper = tempdir.path().join("ip");
+        fs::write(&helper, b"test helper").unwrap();
+        let helper = helper.to_str().unwrap();
+
+        assert_eq!(
+            find_trusted_binary("ip", &["relative-ip", "/missing/ip", helper]).unwrap(),
+            helper
+        );
+    }
+
+    #[test]
+    fn find_trusted_binary_rejects_missing_helpers() {
+        let err =
+            find_trusted_binary("nsenter", &["relative-nsenter", "/missing/nsenter"]).unwrap_err();
+
+        assert!(err.to_string().contains("trusted nsenter helper not found"));
+    }
 
     #[test]
     #[ignore = "requires root privileges"]
@@ -699,10 +922,7 @@ mod tests {
 
         // Verify namespace exists
         let ns_path = format!("/var/run/netns/{name}");
-        assert!(
-            std::path::Path::new(&ns_path).exists(),
-            "Namespace file should exist"
-        );
+        assert!(Path::new(&ns_path).exists(), "Namespace file should exist");
 
         // Verify IPs are set correctly
         assert_eq!(
@@ -719,7 +939,7 @@ mod tests {
 
         // Verify namespace is gone
         assert!(
-            !std::path::Path::new(&ns_path).exists(),
+            !Path::new(&ns_path).exists(),
             "Namespace should be cleaned up"
         );
     }

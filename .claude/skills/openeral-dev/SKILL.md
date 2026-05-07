@@ -1,6 +1,6 @@
 ---
 name: openeral-dev
-description: Develop and verify the openeral OpenShell flow whose goal is a working Claude Code with persistent /home/agent
+description: Develop and verify the openeral OpenShell Docker-driver flow whose goal is a working Claude Code with persistent /home/agent
 disable-model-invocation: false
 user-invocable: true
 allowed-tools: Read, Grep, Glob, Bash
@@ -9,180 +9,93 @@ argument-hint: [task description]
 
 # OpenEral Development
 
-The product goal is not “generic database browsing.”
+Optimize for one product result:
 
-The product goal is:
-
-- OpenShell starts a sandbox
-- `openeral` mounts `/home/agent` and `/db`
+- upstream OpenShell CLI drives the session
+- openeral Docker-driver gateway starts sandboxes
+- `/dev/fuse` is mapped by the Docker compute driver
+- the patched supervisor mounts `/db` and `/home/agent` from `/etc/fstab`
 - Claude Code runs with `HOME=/home/agent`
 - `.claude` persists to PostgreSQL
 
-When developing this repo, optimize for that end-to-end flow first.
+## Runtime Contract
 
-The supported runtime is a coupled 3-image set:
+The supported runtime image set is:
 
-- `cluster`
-  - owns the patched supervisor and bundled manifests
 - `gateway`
-  - owns sandbox pod spec generation and FUSE device requests
+- `supervisor`
 - `sandbox`
-  - owns `openeral`, `fuse3`, and `/etc/fstab`
 
-Do not assume any mixed upstream/openeral image combination is valid.
+The supported OpenShell runtime path is the Docker compute driver. Keep gateway,
+supervisor, and sandbox images version-locked.
 
-The supported CLI is still the upstream released `openshell` binary. The vendored OpenShell tree is kept to build the custom `cluster` and `gateway` images, not to provide a separate CLI path.
-
-When validating the fresh-machine path with upstream `openshell 0.0.12`, include `IMAGE_REPO_BASE=<openeral repo base>` alongside `OPENSHELL_CLUSTER_IMAGE`. Without that override, the CLI still points the internal gateway pull at upstream OpenShell.
+The user-facing CLI remains the upstream released `openshell` binary.
+CLI/gateway protobuf compatibility is part of the product contract. If the
+upstream CLI cannot create providers or sandboxes against the openeral gateway,
+fix the version pairing or gateway source; do not hide the problem behind a
+repo-local wrapper or vendored CLI in the user flow.
 
 ## Files That Matter Most
 
-- `crates/openeral-core/src/fs/workspace.rs`
-  - writable workspace persistence
-- `crates/openeral-core/src/db/queries/workspace.rs`
-  - database storage for workspace files
-- `sandboxes/openeral/Dockerfile`
-  - published sandbox image
-- `sandboxes/openeral/policy.yaml`
-  - authoritative sandbox policy copied to `/etc/openshell/policy.yaml`
-- `vendor/openshell/crates/openshell-sandbox/src/fuse.rs`
-  - supervisor-side FUSE startup from `/etc/fstab`
-- `vendor/openshell/crates/openshell-server/src/sandbox/mod.rs`
-  - sandbox pod generation and resource requests
-- `vendor/openshell/crates/openshell-sandbox/src/proxy.rs`
-  - package-proxy routing inside the built-in OpenShell sandbox proxy
-- `vendor/openshell/crates/openshell-sandbox/src/secrets.rs`
-  - endpoint-scoped placeholder rewriting and post-rewrite leak detection
-- `vendor/openshell/crates/openshell-sandbox/src/l7/relay.rs`
-  - per-request routing for REST endpoints with secret injection
-- `vendor/openshell/crates/openshell-sandbox/src/child_env.rs`
-  - child process proxy and CA trust environment
-- `vendor/openshell/deploy/helm/openshell/templates/statefulset.yaml`
-  - gateway deployment wiring
+- `crates/openeral-core/src/fs/workspace.rs` — writable workspace persistence
+- `crates/openeral-core/src/db/queries/workspace.rs` — workspace file storage
+- `sandboxes/openeral/Dockerfile` — published sandbox image
+- `sandboxes/openeral/policy.yaml` — image-owned sandbox policy
+- `vendor/openshell/crates/openshell-driver-docker/src/lib.rs` — Docker sandbox container spec and `/dev/fuse` device mapping
+- `vendor/openshell/crates/openshell-sandbox/src/fuse.rs` — supervisor FUSE startup from `/etc/fstab`
+- `vendor/openshell/crates/openshell-sandbox/src/l7/relay.rs` — REST proxy logging and placeholder rewrite path
+- `.github/scripts/smoke_openshell.sh` — product smoke test
+- `tests/test_live_secret_injection.sh` — live Claude and boundary secret-injection test
+- `.github/workflows/publish-images.yml` — build, smoke, publish
 
-## Primary Verification Loop
+## Verification Order
 
-The most important validation is an end-to-end OpenShell run where:
-
-1. a fresh host starts a gateway with the custom cluster image
-2. a generic OpenShell provider is created for the live PostgreSQL database
-3. the sandbox uses the published openeral image
-4. the sandbox starts with `/db` and `/home/agent`
-5. `HOME=/home/agent claude -p 'Reply with READY and nothing else.'` succeeds
-6. PostgreSQL contains the resulting `/.claude*` rows in `_openeral.workspace_files`
-7. the child env still shows `ANTHROPIC_API_KEY` as the placeholder value
-8. a separate `curl` request to `GET /v1/models` succeeds using that same
-   placeholder env through the secret-injection path
-
-If a change affects the OpenShell path, rerun the full flow from scratch.
-
-In CI and release smoke, use the upstream OpenShell installer/release path for the CLI. Do not add vendored `openshell-cli` builds just to run smoke.
-
-If a change affects package-proxy routing, validate both:
-
-1. positive path:
-   - allowed package-manager traffic reaches the upstream proxy
-2. negative path:
-   - non-allowed binaries are still denied by normal OpenShell policy
-   - stopping the upstream proxy makes package-manager traffic fail closed
-
-If a change affects secret injection, validate all of these:
-
-1. the sandbox child only sees `openshell:resolve:env:*` placeholders
-2. an allowed REST endpoint with `protocol: rest`, `tls: terminate`, and
-   `secret_injection` rewrites placeholders successfully
-3. the upstream sees real credentials, not placeholders
-4. unauthorized placeholders are denied
-5. a request on the same endpoint without placeholders still uses the normal
-   route, including `package_proxy` when configured
-6. for the Anthropic Claude path specifically, the sandbox policy copied to
-   `/etc/openshell/policy.yaml` still contains the expected `secret_injection`
-   rule on the `claude_code` endpoint
-
-Current live-proven Anthropic checks:
-
-1. `HOME=/home/agent claude -p 'Reply with READY and nothing else.'`
-2. `curl -fsS https://api.anthropic.com/v1/models -H "x-api-key: $ANTHROPIC_API_KEY" -H 'anthropic-version: 2023-06-01'`
-
-Both should run while the child-visible env still shows
-`openshell:resolve:env:ANTHROPIC_API_KEY`.
-
-For real Socket validation, remember the upstream service itself is entitlement
-gated. Even with a valid API token, `socketdev/socket-firewall --service` will
-exit until the account has Firewall Enterprise enabled. Socket also requires its
-CA to be mounted into the sandbox trust path via
-`OPENERAL_PACKAGE_PROXY_CA_SECRET_NAME`.
-
-When the Socket account is not entitled yet, use a generic HTTP proxy to
-validate the OpenShell side of the feature. That is enough to prove:
-
-- the sandbox proxy routes allowed package-manager traffic upstream
-- non-package binaries are still governed by normal OpenShell policy
-- the package-manager path fails closed when the upstream proxy is unavailable
-
-The most useful live check pair is:
-
-1. `npm view is-number version`
-   - should succeed
-   - should appear in the upstream proxy logs
-2. `curl -I https://registry.npmjs.org/is-number`
-   - should still be denied if the policy only allows npm/node
-
-## Migration Contract
-
-`openeral` owns its PostgreSQL schema migrations.
-
-- binary or image upgrades are expected to auto-run pending migrations on first mount
-- mounts must fail closed if migrations cannot be applied
-- `openeral migrate` is the explicit admin/preflight command when you have direct binary access
-
-Do not introduce a separate external migration tool for the supported product flow.
-
-## Local Validation
-
-Do not treat a repo-local docker compose stack as the primary development
-surface.
-
-The preferred validation order is:
-
-1. **OpenShell-first live validation**
+Primary product check:
 
 ```bash
-tests/test_live_secret_injection.sh
+bash .github/scripts/smoke_openshell.sh
 ```
 
-2. **Direct lower-level checks when needed**
+This is verification automation, not the user interface. README and skill
+instructions must remain composed `docker` and `openshell` commands.
+
+GitHub Actions local check:
+
+```bash
+act push -W .github/workflows/publish-images.yml
+```
+
+Lower-level checks:
 
 ```bash
 cargo test -p openeral-core
 bash tests/test_fuse_mount.sh
+bash tests/test_live_secret_injection.sh
+cargo test --manifest-path vendor/openshell/Cargo.toml \
+  -p openshell-driver-docker \
+  -p openshell-policy \
+  -p openshell-sandbox
 ```
 
-These lower-level checks are secondary. The product-level truth is still the
-OpenShell path.
+If OpenShell runtime code changes, rebuild images and restart the whole stack
+from scratch before claiming success.
 
-## Development Heuristics
+## Live Success Criteria
 
-- prefer fixes that preserve `HOME=/home/agent` semantics
-- treat workspace ownership bugs as high severity
-- treat `/dev/fuse` or `/etc/fstab` regressions as product blockers
-- treat sandbox-policy regressions in `sandboxes/openeral/policy.yaml` as
-  product blockers when they break the stock Claude path
-- keep the supported user flow to stock `openshell` commands, not wrapper scripts
-- keep CI aligned with that same path: upstream `openshell` CLI driving openeral images
-- treat cluster, gateway, and sandbox as one version-locked release set
-- plain `HTTP_PROXY` forward-proxy rewriting is no longer a supported secret
-  injection path; use REST + TLS-terminate policy instead
+The end-to-end run must prove:
 
-## Failure Triage
+- `/dev/fuse` exists inside the sandbox
+- `/db` is mounted
+- `/home/agent` is mounted and writable
+- Claude runs with `HOME=/home/agent`
+- `.claude` or a workspace test file appears in `_openeral.workspace_files`
+- child-visible `ANTHROPIC_API_KEY` remains a placeholder when secret injection is under test
 
-- Claude auth failure:
-  - credential/billing problem, or a sandbox-policy regression on the Anthropic path
-- `/home/agent` missing or not writable:
-  - workspace mount failure
-- `/db` missing:
-  - database mount failure
-- Claude runs but state disappears:
-  - wrong `HOME` or workspace persistence bug
+## Hard Rules
 
-Always debug from the end-user product flow backward.
+- Keep the supported user flow command-composed, not wrapper-script based.
+- Provider secrets use `--credential NAME` with host env values, never
+  `--credential NAME=value` in documentation.
+- Never delete, move, or overwrite user files without explicit permission.
+- Do not treat `/sandbox` as durable state.
+- Do not validate FUSE by bypassing the OpenShell supervisor path.

@@ -41,7 +41,7 @@ All open issues are actionable — if it's in the issue tracker, it's ready to b
 This project ships with [agent skills](#agent-skills-for-contributors) that can diagnose problems, explore the codebase, generate policies, and walk you through common workflows. Before filing an issue:
 
 1. Clone the repo and point your coding agent at it.
-2. Load the relevant skill - `debug-openshell-cluster` for cluster problems, `debug-inference` for inference setup problems, `openshell-cli` for usage questions, `generate-sandbox-policy` for policy help.
+2. Load the relevant skill - `debug-openshell-cluster` for gateway or deployment problems, `debug-inference` for inference setup problems, `openshell-cli` for usage questions, `generate-sandbox-policy` for policy help.
 3. Have your agent investigate. Let it run diagnostics, read the architecture docs, and attempt a fix.
 4. If the agent cannot resolve it, open an issue **with the agent's diagnostic output attached**. The issue template requires this.
 
@@ -49,7 +49,7 @@ This project ships with [agent skills](#agent-skills-for-contributors) that can 
 
 - A real bug that your agent confirmed and could not fix.
 - A feature proposal with a design — not a "please build this" request.
-- An infrastructure problem that the `debug-openshell-cluster` skill could not resolve.
+- An infrastructure problem that the gateway deployment troubleshooting skill could not resolve.
 - An inference setup problem that the `debug-inference` skill could not resolve.
 - Security vulnerabilities must follow [SECURITY.md](SECURITY.md) — **not** GitHub issues.
 
@@ -66,7 +66,7 @@ Skills live in `.agents/skills/`. Your agent's harness can discover and load the
 | Category        | Skill                     | Purpose                                                                                             |
 | --------------- | ------------------------- | --------------------------------------------------------------------------------------------------- |
 | Getting Started | `openshell-cli`           | CLI usage, sandbox lifecycle, provider management, BYOC workflows                                   |
-| Getting Started | `debug-openshell-cluster` | Diagnose cluster startup failures and health issues                                                 |
+| Getting Started | `debug-openshell-cluster` | Diagnose gateway deployment and health issues                                                       |
 | Getting Started | `debug-inference`         | Diagnose `inference.local`, host-backed local inference, and direct external inference setup issues |
 | Contributing    | `create-spike`            | Investigate a problem, produce a structured GitHub issue                                            |
 | Contributing    | `build-from-issue`        | Plan and implement work from a GitHub issue (maintainer workflow)                                   |
@@ -92,6 +92,7 @@ Skills connect into pipelines. Individual skill files don't describe these relat
 - **Policy iteration:** `openshell-cli` → `generate-sandbox-policy`
 
 Workflow state labels use the `state:*` prefix, and security work uses `topic:security`. GitHub issue templates assign built-in issue types where applicable, and agent-created issues should use issue types or manual follow-up rather than type labels.
+New issues opened by users without `write`, `maintain`, or `admin` repository permission are automatically labeled `state:triage-needed` by the issue triage workflow.
 
 ## Prerequisites
 
@@ -107,6 +108,9 @@ After installing `mise`, activate it with `mise activate` or [add it to your she
 Shell setup examples:
 
 ```bash
+# Bash
+echo 'eval "$(~/.local/bin/mise activate bash)"' >> ~/.bashrc
+
 # Fish
 echo '~/.local/bin/mise activate fish | source' >> ~/.config/fish/config.fish
 
@@ -119,6 +123,28 @@ Project requirements:
 - Rust 1.88+
 - Python 3.12+
 - Docker (running)
+- Z3 solver library (for the policy prover crate)
+
+### Z3 installation
+
+The `openshell-prover` crate links against the system Z3 library via pkg-config.
+
+```bash
+# macOS
+brew install z3
+
+# Ubuntu / Debian
+sudo apt install libz3-dev
+
+# Fedora
+sudo dnf install z3-devel
+```
+
+If you prefer not to install Z3 system-wide, you can compile it from source as a one-time step:
+
+```bash
+cargo build -p openshell-prover --features bundled-z3
+```
 
 ## Getting Started
 
@@ -126,8 +152,8 @@ Project requirements:
 # One-time trust
 mise trust
 
-# Launch a sandbox (deploys a cluster if one isn't running)
-mise run sandbox
+# Run a standalone gateway for local development
+mise run gateway
 ```
 
 ## Building the `openshell` CLI
@@ -144,36 +170,18 @@ openshell --help
 openshell sandbox create -- codex
 ```
 
-### Cluster debugging helpers
-
-Two additional scripts in `scripts/bin/` provide gateway-aware wrappers for cluster debugging:
-
-| Script    | What it does                                                                         |
-| --------- | ------------------------------------------------------------------------------------ |
-| `kubectl` | Runs `kubectl` inside the active gateway's k3s container via `openshell doctor exec` |
-| `k9s`     | Runs `k9s` inside the active gateway's k3s container via `openshell doctor exec`     |
-
-These work for both local and remote gateways (SSH is handled automatically). Examples:
-
-```bash
-kubectl get pods -A
-kubectl logs -n openshell statefulset/openshell
-k9s
-k9s -n openshell
-```
-
 ## Main Tasks
 
 These are the primary `mise` tasks for day-to-day development:
 
 | Task               | Purpose                                                 |
 | ------------------ | ------------------------------------------------------- |
-| `mise run cluster` | Bootstrap or incremental deploy                         |
-| `mise run sandbox` | Create a sandbox on the running cluster                 |
+| `mise run gateway` | Run a standalone gateway for local development          |
+| `mise run sandbox` | Create or reconnect to the dev sandbox                  |
 | `mise run test`    | Default test suite                                      |
 | `mise run e2e`     | Default end-to-end test lane                            |
 | `mise run ci`      | Full local CI checks (lint, compile/type checks, tests) |
-| `mise run docs`    | Build and serve documentation locally                   |
+| `mise run docs`    | Validate Fern docs locally                              |
 | `mise run clean`   | Clean build artifacts                                   |
 
 ## Project Structure
@@ -185,25 +193,42 @@ These are the primary `mise` tasks for day-to-day development:
 | `proto/`        | Protocol buffer definitions                   |
 | `tasks/`        | `mise` task definitions and build scripts     |
 | `deploy/`       | Dockerfiles, Helm chart, Kubernetes manifests |
+| `docs/`         | Published Fern docs source, navigation, and content assets |
+| `fern/`         | Fern site config, components, and theme assets |
 | `architecture/` | Architecture docs and plans                   |
-| `docs/`         | User-facing documentation (Sphinx/MyST)       |
+| `rfc/`          | Request for Comments proposals                |
 | `.agents/`      | Agent skills and persona definitions          |
+
+## RFCs
+
+For cross-cutting architectural decisions, API contract changes, or process proposals that need broad consensus, use the RFC process. RFCs live in `rfc/` — copy the template, fill it in, and open a PR for discussion. See [rfc/README.md](rfc/README.md) for the full lifecycle and guidelines on when to write an RFC versus a spike issue or architecture doc.
 
 ## Documentation
 
-If your change affects user-facing behavior (new flags, changed defaults, new features, bug fixes that contradict existing docs), update the relevant pages under `docs/` in the same PR.
+If your change affects user-facing behavior (new flags, changed defaults, new features, bug fixes that contradict existing docs), update the relevant pages under `docs/` in the same PR and adjust `docs/index.yml` if navigation changes. For explicit navigation entries, keep `page:` aligned with `sidebar-title` when present and put relative `slug:` values in `docs/index.yml`. Reserve frontmatter `slug` for folder-discovered pages or absolute URL overrides.
 
 To ensure your doc changes follow NVIDIA documentation style, use the `update-docs` skill.
-It scans commits, identifies doc pages that need updates, and drafts content that follows the style guide in `docs/CONTRIBUTING.md`.
+It scans commits, identifies doc pages that need updates, and drafts content that follows the style guide in `docs/CONTRIBUTING.mdx`.
 
-To build and preview docs locally:
+To preview Fern docs locally:
 
 ```bash
-mise run docs # to build the docs locally
-mise run docs:serve # to serve locally and automatically rebuild on changes
+mise run docs:serve
 ```
 
-See [docs/CONTRIBUTING.md](docs/CONTRIBUTING.md) for more details.
+To run non-interactive validation:
+
+```bash
+mise run docs
+```
+
+PRs that touch `docs/**` or `fern/**` are validated by `.github/workflows/branch-docs.yml`, and they get a preview when `FERN_TOKEN` is available to the workflow.
+
+Fern docs publishing is handled by the `publish-fern-docs` job in `.github/workflows/release-tag.yml` when a release tag is created.
+
+`docs/` is the source-of-truth docs tree. `fern/` contains the site config, components, and theme assets that publish those pages.
+
+See [docs/CONTRIBUTING.mdx](docs/CONTRIBUTING.mdx) for the current docs authoring guide.
 
 ## Pull Requests
 
@@ -216,7 +241,7 @@ See [docs/CONTRIBUTING.md](docs/CONTRIBUTING.md) for more details.
 
 This project uses [Conventional Commits](https://www.conventionalcommits.org/). All commit messages must follow the format:
 
-```
+```text
 <type>(<scope>): <description>
 
 [optional body]
@@ -237,7 +262,7 @@ This project uses [Conventional Commits](https://www.conventionalcommits.org/). 
 
 **Examples:**
 
-```
+```text
 feat(cli): add --verbose flag to openshell run
 fix(sandbox): handle timeout errors gracefully
 docs: update installation instructions
@@ -246,8 +271,14 @@ chore(deps): bump tokio to 1.40
 
 ### DCO
 
-All contributions must include a `Signed-off-by` line in each commit message. This certifies you have the right to submit the work under the project license. See the [Developer Certificate of Origin](https://developercertificate.org/).
+All human contributions must include a `Signed-off-by` line in each commit message. This certifies you have the right to submit the work under the project license. See the [Developer Certificate of Origin](https://developercertificate.org/). Dependabot-authored dependency update PRs are allowlisted because the bot cannot sign commits.
 
 ```bash
 git commit -s -m "feat(sandbox): add new capability"
 ```
+
+DCO sign-off is separate from cryptographic commit signing. CI requires signing for org members so that copy-pr-bot can mirror your PR automatically; see [CI.md](CI.md#commit-signing) for setup.
+
+## CI
+
+How E2E runs in CI, the `test:e2e` / `test:e2e-gpu` labels, copy-pr-bot, and commit-signing setup are documented in [CI.md](CI.md).

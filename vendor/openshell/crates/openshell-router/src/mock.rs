@@ -131,6 +131,8 @@ mod tests {
             protocols: protocols.iter().map(ToString::to_string).collect(),
             auth: crate::config::AuthHeader::Bearer,
             default_headers: Vec::new(),
+            passthrough_headers: Vec::new(),
+            timeout: crate::config::DEFAULT_ROUTE_TIMEOUT,
         }
     }
 

@@ -2,6 +2,7 @@
 agent-task.txt
 openeral-shell/.env
 target/
+.worktrees/
 .omx/
 .codex/*
 !.codex/skills

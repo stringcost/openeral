@@ -36,7 +36,7 @@ def _default_policy() -> sandbox_pb2.SandboxPolicy:
         version=1,
         filesystem=sandbox_pb2.FilesystemPolicy(
             include_workdir=True,
-            read_only=["/usr", "/lib", "/etc", "/app"],
+            read_only=["/usr", "/lib", "/etc", "/app", "/dev/urandom"],
             read_write=["/sandbox", "/tmp"],
         ),
         landlock=sandbox_pb2.LandlockPolicy(compatibility="best_effort"),
@@ -64,7 +64,7 @@ def provider(
     stub.CreateProvider(
         openshell_pb2.CreateProviderRequest(
             provider=datamodel_pb2.Provider(
-                name=name,
+                metadata=datamodel_pb2.ObjectMeta(name=name),
                 type=provider_type,
                 credentials=credentials,
             )
@@ -260,7 +260,7 @@ def test_update_provider_preserves_unset_credentials_and_config(
         stub.CreateProvider(
             openshell_pb2.CreateProviderRequest(
                 provider=datamodel_pb2.Provider(
-                    name=name,
+                    metadata=datamodel_pb2.ObjectMeta(name=name),
                     type="generic",
                     credentials={"KEY_A": "val-a", "KEY_B": "val-b"},
                     config={"BASE_URL": "https://example.com"},
@@ -271,7 +271,7 @@ def test_update_provider_preserves_unset_credentials_and_config(
         stub.UpdateProvider(
             openshell_pb2.UpdateProviderRequest(
                 provider=datamodel_pb2.Provider(
-                    name=name,
+                    metadata=datamodel_pb2.ObjectMeta(name=name),
                     type="",
                     credentials={"KEY_A": "rotated-a"},
                 )
@@ -280,8 +280,12 @@ def test_update_provider_preserves_unset_credentials_and_config(
 
         got = stub.GetProvider(openshell_pb2.GetProviderRequest(name=name))
         p = got.provider
-        # Credentials are redacted in gRPC responses (security hardening).
-        assert len(p.credentials) == 0, "credentials must be redacted in gRPC responses"
+        # Credential keys are preserved but values are redacted.
+        assert len(p.credentials) > 0, "credential keys should be preserved"
+        for key, val in p.credentials.items():
+            assert val == "REDACTED", (
+                f"credential '{key}' should be REDACTED, got '{val}'"
+            )
         assert p.config["BASE_URL"] == "https://example.com", (
             "config should be preserved"
         )
@@ -301,7 +305,7 @@ def test_update_provider_empty_maps_preserves_all(
         stub.CreateProvider(
             openshell_pb2.CreateProviderRequest(
                 provider=datamodel_pb2.Provider(
-                    name=name,
+                    metadata=datamodel_pb2.ObjectMeta(name=name),
                     type="generic",
                     credentials={"TOKEN": "secret"},
                     config={"URL": "https://api.example.com"},
@@ -312,7 +316,7 @@ def test_update_provider_empty_maps_preserves_all(
         stub.UpdateProvider(
             openshell_pb2.UpdateProviderRequest(
                 provider=datamodel_pb2.Provider(
-                    name=name,
+                    metadata=datamodel_pb2.ObjectMeta(name=name),
                     type="",
                 )
             )
@@ -320,8 +324,12 @@ def test_update_provider_empty_maps_preserves_all(
 
         got = stub.GetProvider(openshell_pb2.GetProviderRequest(name=name))
         p = got.provider
-        # Credentials are redacted in gRPC responses (security hardening).
-        assert len(p.credentials) == 0, "credentials must be redacted in gRPC responses"
+        # Credential keys are preserved but values are redacted.
+        assert len(p.credentials) > 0, "credential keys should be preserved"
+        for key, val in p.credentials.items():
+            assert val == "REDACTED", (
+                f"credential '{key}' should be REDACTED, got '{val}'"
+            )
         assert p.config["URL"] == "https://api.example.com"
     finally:
         _delete_provider(stub, name)
@@ -339,7 +347,7 @@ def test_update_provider_merges_config_preserves_credentials(
         stub.CreateProvider(
             openshell_pb2.CreateProviderRequest(
                 provider=datamodel_pb2.Provider(
-                    name=name,
+                    metadata=datamodel_pb2.ObjectMeta(name=name),
                     type="generic",
                     credentials={"API_KEY": "original-key"},
                     config={"ENDPOINT": "https://old.example.com"},
@@ -350,7 +358,7 @@ def test_update_provider_merges_config_preserves_credentials(
         stub.UpdateProvider(
             openshell_pb2.UpdateProviderRequest(
                 provider=datamodel_pb2.Provider(
-                    name=name,
+                    metadata=datamodel_pb2.ObjectMeta(name=name),
                     type="",
                     config={"ENDPOINT": "https://new.example.com"},
                 )
@@ -359,8 +367,12 @@ def test_update_provider_merges_config_preserves_credentials(
 
         got = stub.GetProvider(openshell_pb2.GetProviderRequest(name=name))
         p = got.provider
-        # Credentials are redacted in gRPC responses (security hardening).
-        assert len(p.credentials) == 0, "credentials must be redacted in gRPC responses"
+        # Credential keys are preserved but values are redacted.
+        assert len(p.credentials) > 0, "credential keys should be preserved"
+        for key, val in p.credentials.items():
+            assert val == "REDACTED", (
+                f"credential '{key}' should be REDACTED, got '{val}'"
+            )
         assert p.config["ENDPOINT"] == "https://new.example.com"
     finally:
         _delete_provider(stub, name)
@@ -378,7 +390,7 @@ def test_update_provider_rejects_type_change(
         stub.CreateProvider(
             openshell_pb2.CreateProviderRequest(
                 provider=datamodel_pb2.Provider(
-                    name=name,
+                    metadata=datamodel_pb2.ObjectMeta(name=name),
                     type="generic",
                     credentials={"KEY": "val"},
                 )
@@ -389,7 +401,7 @@ def test_update_provider_rejects_type_change(
             stub.UpdateProvider(
                 openshell_pb2.UpdateProviderRequest(
                     provider=datamodel_pb2.Provider(
-                        name=name,
+                        metadata=datamodel_pb2.ObjectMeta(name=name),
                         type="nvidia",
                     )
                 )

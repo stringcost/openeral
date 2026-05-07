@@ -1,0 +1,89 @@
+name: Branch Docs Preview
+
+on:
+  pull_request:
+    paths:
+      - "docs/**"
+      - "fern/**"
+      - "mise.toml"
+      - "tasks/docs.toml"
+      - ".github/workflows/branch-docs.yml"
+      - ".github/workflows/release-tag.yml"
+
+permissions:
+  contents: read
+  pull-requests: write
+
+jobs:
+  preview:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v6
+
+      - name: Check Fern preview availability
+        id: fern-preview
+        env:
+          FERN_TOKEN: ${{ secrets.FERN_TOKEN }}
+        run: |
+          if [ -n "$FERN_TOKEN" ]; then
+            echo "enabled=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "enabled=false" >> "$GITHUB_OUTPUT"
+            echo "::notice::Skipping Fern docs preview because FERN_TOKEN is unavailable. This is expected for fork PRs and repos without Fern preview credentials configured."
+          fi
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v6
+        with:
+          node-version: "24"
+
+      - name: Install Fern CLI
+        run: |
+          FERN_VERSION=$(node -p "require('./fern/fern.config.json').version")
+          npm install -g "fern-api@${FERN_VERSION}"
+
+      - name: Validate docs
+        working-directory: ./fern
+        run: fern check
+
+      - name: Generate preview URL
+        if: ${{ steps.fern-preview.outputs.enabled == 'true' }}
+        id: generate-docs
+        env:
+          FERN_TOKEN: ${{ secrets.FERN_TOKEN }}
+          PREVIEW_ID: pr-${{ github.event.pull_request.number }}
+        working-directory: ./fern
+        run: |
+          OUTPUT=$(fern generate --docs --preview --id "$PREVIEW_ID" 2>&1)
+          echo "$OUTPUT"
+          URL=$(echo "$OUTPUT" | grep -oP 'Published docs to \K.*(?= \()')
+          if [ -z "$URL" ]; then
+            echo "::error::Failed to generate preview URL. See fern output above."
+            exit 1
+          fi
+          echo "preview_url=$URL" >> "$GITHUB_OUTPUT"
+
+      - name: Post or update PR comment
+        if: ${{ steps.fern-preview.outputs.enabled == 'true' }}
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          PREVIEW_URL: ${{ steps.generate-docs.outputs.preview_url }}
+        run: |
+          BODY=":herb: **Preview your docs:** <${PREVIEW_URL}>"
+          MARKER="<!-- preview-docs -->"
+          BODY="${BODY}
+
+          ${MARKER}"
+
+          COMMENT_ID=$(gh api "repos/${{ github.repository }}/issues/${PR_NUMBER}/comments" \
+            --jq ".[] | select(.body | contains(\"${MARKER}\")) | .id" | head -1)
+
+          if [ -n "$COMMENT_ID" ]; then
+            gh api "repos/${{ github.repository }}/issues/comments/${COMMENT_ID}" \
+              -X PATCH -f body="$BODY"
+          else
+            gh api "repos/${{ github.repository }}/issues/${PR_NUMBER}/comments" \
+              -f body="$BODY"
+          fi

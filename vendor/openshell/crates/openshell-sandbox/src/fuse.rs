@@ -1,14 +1,11 @@
 // SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
-//! FUSE filesystem support via /etc/fstab inspection.
+//! FUSE filesystem support via `/etc/fstab` inspection.
 //!
-//! The supervisor reads /etc/fstab from the container image at startup.
-//! Any `fuse.*` entries with the `noauto` flag are set up as
-//! supervisor-managed FUSE mounts before the child process is spawned.
-//!
-//! This enables container images to declare FUSE mounts using standard
-//! Linux conventions, without requiring elevated privileges in user code.
+//! The supervisor reads `/etc/fstab` from the container image at startup. Any
+//! `fuse.*` entries with the `noauto` flag are mounted before the child
+//! process is spawned.
 
 use miette::{IntoDiagnostic, Result};
 use std::collections::HashMap;
@@ -19,7 +16,7 @@ use tracing::{debug, info, warn};
 
 use crate::policy::SandboxPolicy;
 
-/// A FUSE mount discovered from /etc/fstab.
+/// A FUSE mount discovered from `/etc/fstab`.
 #[derive(Debug)]
 pub struct FuseMount {
     pub source: String,
@@ -29,12 +26,12 @@ pub struct FuseMount {
     pub read_only: bool,
 }
 
-/// Parse /etc/fstab for FUSE mount entries.
+/// Parse `/etc/fstab` for supervisor-managed FUSE mount entries.
 pub fn discover_fuse_mounts() -> Vec<FuseMount> {
     let content = match std::fs::read_to_string("/etc/fstab") {
-        Ok(c) => c,
-        Err(e) => {
-            debug!(error = %e, "No /etc/fstab, skipping FUSE discovery");
+        Ok(content) => content,
+        Err(error) => {
+            debug!(error = %error, "No /etc/fstab, skipping FUSE discovery");
             return Vec::new();
         }
     };
@@ -58,11 +55,11 @@ pub fn discover_fuse_mounts() -> Vec<FuseMount> {
         let options = fields[3];
 
         let binary = match fs_type.strip_prefix("fuse.") {
-            Some(b) if !b.is_empty() => b,
+            Some(binary) if !binary.is_empty() => binary,
             _ => continue,
         };
 
-        if !options.split(',').any(|o| o == "noauto") {
+        if !options.split(',').any(|option| option == "noauto") {
             continue;
         }
 
@@ -76,7 +73,7 @@ pub fn discover_fuse_mounts() -> Vec<FuseMount> {
         }
 
         let source = source.trim_matches('"').trim_matches('\'');
-        let read_only = options.split(',').any(|o| o == "ro");
+        let read_only = options.split(',').any(|option| option == "ro");
 
         info!(
             fs_type = fs_type,
@@ -97,10 +94,7 @@ pub fn discover_fuse_mounts() -> Vec<FuseMount> {
     mounts
 }
 
-/// Verify /dev/fuse is available.
-///
-/// In the OpenEral/OpenShell deployment, `/dev/fuse` is injected by kubelet
-/// when sandbox pods request the configured FUSE device-plugin resource.
+/// Verify `/dev/fuse` is available.
 pub fn ensure_fuse_device() -> Result<()> {
     let path = Path::new("/dev/fuse");
     if path.exists() {
@@ -108,14 +102,13 @@ pub fn ensure_fuse_device() -> Result<()> {
         Ok(())
     } else {
         Err(miette::miette!(
-            "/dev/fuse not found. The cluster must have the FUSE device plugin \
-             deployed and the sandbox pod must request the configured FUSE \
-             device resource."
+            "/dev/fuse not found. For the Docker compute driver, start the \
+             openeral gateway with OPENSHELL_DOCKER_FUSE_DEVICE=/dev/fuse so \
+             sandbox containers receive the host FUSE device."
         ))
     }
 }
 
-/// Find mount.fuse3 in standard locations.
 fn find_mount_fuse3() -> Option<PathBuf> {
     for path in &[
         "/sbin/mount.fuse3",
@@ -123,9 +116,9 @@ fn find_mount_fuse3() -> Option<PathBuf> {
         "/bin/mount.fuse3",
         "/usr/bin/mount.fuse3",
     ] {
-        let p = PathBuf::from(path);
-        if p.exists() {
-            return Some(p);
+        let path = PathBuf::from(path);
+        if path.exists() {
+            return Some(path);
         }
     }
     which_binary("mount.fuse3")
@@ -164,7 +157,7 @@ fn expand_source_placeholders(source: &str, env: &HashMap<String, String>) -> Re
     Ok(expanded)
 }
 
-/// Spawn a FUSE daemon via mount.fuse3.
+/// Spawn a FUSE daemon via `mount.fuse3`.
 pub fn spawn_fuse_mount(mount: &FuseMount, env: &HashMap<String, String>) -> Result<Child> {
     let mount_fuse3 = find_mount_fuse3().ok_or_else(|| miette::miette!("mount.fuse3 not found"))?;
     let source = expand_source_placeholders(&mount.source, env)?;
@@ -184,14 +177,13 @@ pub fn spawn_fuse_mount(mount: &FuseMount, env: &HashMap<String, String>) -> Res
     cmd.arg("-o");
     cmd.arg(&mount.options);
 
-    for (k, v) in env {
-        cmd.env(k, v);
+    for (key, value) in env {
+        cmd.env(key, value);
     }
 
     cmd.spawn().into_diagnostic()
 }
 
-/// Wait for a mountpoint to become ready.
 pub fn wait_for_mount(path: &Path, timeout: Duration) -> Result<()> {
     let start = std::time::Instant::now();
     while start.elapsed() < timeout {
@@ -212,9 +204,10 @@ fn is_mountpoint(path: &Path) -> bool {
     let path_str = path.to_string_lossy();
     std::fs::read_to_string("/proc/mounts")
         .ok()
-        .map(|c| {
-            c.lines()
-                .any(|l| l.split_whitespace().nth(1) == Some(path_str.as_ref()))
+        .map(|content| {
+            content
+                .lines()
+                .any(|line| line.split_whitespace().nth(1) == Some(path_str.as_ref()))
         })
         .unwrap_or(false)
 }
@@ -228,7 +221,6 @@ fn which_binary(name: &str) -> Option<PathBuf> {
     })
 }
 
-/// Search common binary locations that may not be in PATH.
 fn find_binary_in_common_paths(name: &str) -> Option<PathBuf> {
     for dir in &[
         "/usr/local/bin",
@@ -246,7 +238,7 @@ fn find_binary_in_common_paths(name: &str) -> Option<PathBuf> {
     None
 }
 
-/// Top-level: discover, create device, spawn daemons, wait, update policy.
+/// Discover, spawn, wait, and update the sandbox filesystem policy.
 pub fn setup_fuse_mounts(
     policy: &mut SandboxPolicy,
     env: &HashMap<String, String>,
@@ -262,13 +254,7 @@ pub fn setup_fuse_mounts(
     );
     ensure_fuse_device()?;
 
-    // Build FUSE daemon environment from:
-    // 1. Provider env (injected by OpenShell as pod env vars)
-    // 2. Process env (inherits pod env vars set by providers)
     let mut fuse_env = env.clone();
-
-    // Inherit relevant env vars from the process environment.
-    // Provider credentials are injected as pod env vars and available here.
     for key in &[
         "DATABASE_URL",
         "OPENERAL_DATABASE_URL",
@@ -276,30 +262,25 @@ pub fn setup_fuse_mounts(
         "OPENSHELL_SANDBOX_ID",
         "OPENSHELL_SANDBOX",
     ] {
-        if !fuse_env.contains_key(*key) {
-            if let Ok(val) = std::env::var(key) {
-                fuse_env.insert(key.to_string(), val);
-            }
+        if !fuse_env.contains_key(*key)
+            && let Ok(value) = std::env::var(key)
+        {
+            fuse_env.insert((*key).to_string(), value);
         }
     }
 
-    // Map DATABASE_URL → OPENERAL_DATABASE_URL if the latter isn't set.
-    if !fuse_env.contains_key("OPENERAL_DATABASE_URL") {
-        if let Some(db_url) = fuse_env.get("DATABASE_URL") {
-            info!("Mapping DATABASE_URL → OPENERAL_DATABASE_URL");
-            fuse_env.insert("OPENERAL_DATABASE_URL".to_string(), db_url.clone());
-        }
-    }
-
-    if let Some(db_url) = fuse_env.get("OPENERAL_DATABASE_URL") {
-        info!(db_url_len = db_url.len(), db_url_prefix = %&db_url[..db_url.len().min(30)], "OPENERAL_DATABASE_URL resolved");
+    if !fuse_env.contains_key("OPENERAL_DATABASE_URL")
+        && let Some(db_url) = fuse_env.get("DATABASE_URL")
+    {
+        info!("Mapping DATABASE_URL to OPENERAL_DATABASE_URL");
+        fuse_env.insert("OPENERAL_DATABASE_URL".to_string(), db_url.clone());
     }
 
     if !fuse_env.contains_key("OPENERAL_DATABASE_URL") {
         return Err(miette::miette!(
-            "FUSE mounts declared in /etc/fstab but no DATABASE_URL or OPENERAL_DATABASE_URL available. \
-             Create an OpenShell provider: openshell provider create --name db --type generic \
-             --credential DATABASE_URL=\"host=... user=... dbname=...\""
+            "FUSE mounts declared in /etc/fstab but no DATABASE_URL or \
+             OPENERAL_DATABASE_URL is available. Create an OpenShell generic \
+             provider containing DATABASE_URL."
         ));
     }
 

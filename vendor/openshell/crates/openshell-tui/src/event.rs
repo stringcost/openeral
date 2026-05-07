@@ -32,12 +32,31 @@ pub enum Event {
     ProviderDeleteResult(Result<bool, String>),
     /// Draft action result: `Ok(status_message)` or `Err(error_message)`.
     DraftActionResult(Result<String, String>),
+    /// Global settings fetched: `Ok((settings, revision))` or `Err(message)`.
+    #[allow(dead_code)]
+    GlobalSettingsFetched(
+        Result<
+            (
+                std::collections::HashMap<String, openshell_core::proto::SettingValue>,
+                u64,
+            ),
+            String,
+        >,
+    ),
+    /// Global setting set result: `Ok(revision)` or `Err(message)`.
+    GlobalSettingSetResult(Result<u64, String>),
+    /// Global setting delete result: `Ok(revision)` or `Err(message)`.
+    GlobalSettingDeleteResult(Result<u64, String>),
+    /// Sandbox setting set result: `Ok(revision)` or `Err(message)`.
+    SandboxSettingSetResult(Result<u64, String>),
+    /// Sandbox setting delete result: `Ok(revision)` or `Err(message)`.
+    SandboxSettingDeleteResult(Result<u64, String>),
 }
 
 pub struct EventHandler {
     rx: mpsc::UnboundedReceiver<Event>,
     // Kept alive so the spawned task's `tx` doesn't see a closed channel.
-    _keepalive: mpsc::UnboundedSender<Event>,
+    keepalive: mpsc::UnboundedSender<Event>,
     /// When true, the background reader stops polling stdin.
     paused: Arc<AtomicBool>,
 }
@@ -66,20 +85,14 @@ impl EventHandler {
 
                 if event::poll(poll_interval).unwrap_or(false) {
                     match event::read() {
-                        Ok(TermEvent::Key(key)) => {
-                            if tx.send(Event::Key(key)).is_err() {
-                                return;
-                            }
+                        Ok(TermEvent::Key(key)) if tx.send(Event::Key(key)).is_err() => {
+                            return;
                         }
-                        Ok(TermEvent::Mouse(mouse)) => {
-                            if tx.send(Event::Mouse(mouse)).is_err() {
-                                return;
-                            }
+                        Ok(TermEvent::Mouse(mouse)) if tx.send(Event::Mouse(mouse)).is_err() => {
+                            return;
                         }
-                        Ok(TermEvent::Resize(w, h)) => {
-                            if tx.send(Event::Resize(w, h)).is_err() {
-                                return;
-                            }
+                        Ok(TermEvent::Resize(w, h)) if tx.send(Event::Resize(w, h)).is_err() => {
+                            return;
                         }
                         _ => {}
                     }
@@ -94,7 +107,7 @@ impl EventHandler {
 
         Self {
             rx,
-            _keepalive: keepalive,
+            keepalive,
             paused,
         }
     }
@@ -105,7 +118,7 @@ impl EventHandler {
 
     /// Get a sender handle for dispatching events from background tasks.
     pub fn sender(&self) -> mpsc::UnboundedSender<Event> {
-        self._keepalive.clone()
+        self.keepalive.clone()
     }
 
     /// Pause stdin polling (call before suspending TUI for a child process).

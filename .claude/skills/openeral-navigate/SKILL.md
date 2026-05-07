@@ -12,6 +12,10 @@ The priority order is:
 1. keep Claude running with `HOME=/home/agent`
 2. use `/db` only when Claude needs live database context
 
+`/db` and `/home/agent` must both be mounted by the OpenShell supervisor before
+database navigation starts. Do not compensate for missing mounts with direct
+database clients unless the task is explicitly a lower-level diagnostic.
+
 ## First Checks
 
 ```bash
@@ -49,6 +53,10 @@ If a tool stores state under `$HOME`, run it with:
 ```bash
 HOME=/home/agent <tool>
 ```
+
+Claude-visible secrets should remain provider placeholders. Real provider
+values are injected by the OpenShell proxy at egress, not written into
+`/home/agent`.
 
 ## What Not To Do
 

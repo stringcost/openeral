@@ -1,0 +1,260 @@
+name: Release VM Kernel
+
+# Build custom libkrunfw (kernel firmware) + libkrun (VMM) + gvproxy for all
+# supported openshell-driver-vm platforms. Artifacts are uploaded to the
+# rolling "vm-runtime" GitHub Release and consumed by normal dev/tag release
+# workflows when building the openshell-driver-vm binary.
+#
+# The Linux kernel is compiled once on aarch64 Linux.  The resulting kernel.c
+# (a C source file containing the kernel as a byte array) is shared with the
+# macOS job, which only needs to compile it into a .dylib — no krunvm, no
+# Fedora VM, no kernel rebuild.  This cuts macOS CI from ~45 min to ~5 min.
+#
+# This workflow runs on demand when kernel config or pins change. It is
+# intentionally decoupled from the per-commit VM binary build because the
+# kernel rarely changes and takes 15-45 minutes to compile.
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: write
+  packages: read
+
+# Serialize runtime release updates.
+concurrency:
+  group: vm-runtime-release
+  cancel-in-progress: false
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  # ---------------------------------------------------------------------------
+  # Linux ARM64 — native kernel + libkrun build (also exports kernel.c)
+  # ---------------------------------------------------------------------------
+  build-runtime-linux-arm64:
+    name: Build Runtime (Linux ARM64)
+    runs-on: linux-arm64-cpu8
+    timeout-minutes: 60
+    container:
+      image: ghcr.io/nvidia/openshell/ci:latest
+      credentials:
+        username: ${{ github.actor }}
+        password: ${{ secrets.GITHUB_TOKEN }}
+      options: --privileged
+    env:
+      MISE_GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Mark workspace safe for git
+        run: git config --global --add safe.directory "$GITHUB_WORKSPACE"
+
+      - name: Build libkrunfw + libkrun from source
+        run: tasks/scripts/vm/build-libkrun.sh
+
+      - name: Package runtime tarball
+        run: |
+          tasks/scripts/vm/package-vm-runtime.sh \
+            --platform linux-aarch64 \
+            --build-dir target/libkrun-build \
+            --output artifacts/vm-runtime-linux-aarch64.tar.zst
+
+      - name: Upload runtime artifact
+        uses: actions/upload-artifact@v7
+        with:
+          name: vm-runtime-linux-arm64
+          path: artifacts/vm-runtime-linux-aarch64.tar.zst
+          retention-days: 5
+
+      # Export kernel.c + ABI_VERSION for the macOS job.  kernel.c contains
+      # the aarch64 Linux kernel as a byte array — it is OS-agnostic and can
+      # be compiled into a .dylib by Apple's cc without rebuilding the kernel.
+      - name: Upload kernel.c for macOS build
+        uses: actions/upload-artifact@v7
+        with:
+          name: kernel-c-arm64
+          path: |
+            target/libkrun-build/kernel.c
+            target/libkrun-build/ABI_VERSION
+          retention-days: 1
+
+  # ---------------------------------------------------------------------------
+  # Linux AMD64 — native kernel + libkrun build
+  # ---------------------------------------------------------------------------
+  build-runtime-linux-amd64:
+    name: Build Runtime (Linux AMD64)
+    runs-on: linux-amd64-cpu8
+    timeout-minutes: 60
+    container:
+      image: ghcr.io/nvidia/openshell/ci:latest
+      credentials:
+        username: ${{ github.actor }}
+        password: ${{ secrets.GITHUB_TOKEN }}
+      options: --privileged
+    env:
+      MISE_GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Mark workspace safe for git
+        run: git config --global --add safe.directory "$GITHUB_WORKSPACE"
+
+      - name: Build libkrunfw + libkrun from source
+        run: tasks/scripts/vm/build-libkrun.sh
+
+      - name: Package runtime tarball
+        run: |
+          tasks/scripts/vm/package-vm-runtime.sh \
+            --platform linux-x86_64 \
+            --build-dir target/libkrun-build \
+            --output artifacts/vm-runtime-linux-x86_64.tar.zst
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v7
+        with:
+          name: vm-runtime-linux-amd64
+          path: artifacts/vm-runtime-linux-x86_64.tar.zst
+          retention-days: 5
+
+  # ---------------------------------------------------------------------------
+  # macOS ARM64 — uses pre-built kernel.c from Linux ARM64 job
+  # ---------------------------------------------------------------------------
+  build-runtime-macos-arm64:
+    name: Build Runtime (macOS ARM64)
+    needs: [build-runtime-linux-arm64]
+    runs-on: macos-latest-xlarge
+    timeout-minutes: 30
+    env:
+      RUSTC_WRAPPER: ""
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Install dependencies
+        run: |
+          set -euo pipefail
+          curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --default-toolchain 1.95.0
+          echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
+          brew install lld dtc xz
+
+      - name: Download pre-built kernel.c
+        uses: actions/download-artifact@v4
+        with:
+          name: kernel-c-arm64
+          path: target/kernel-artifact
+
+      - name: Build libkrunfw + libkrun from pre-built kernel
+        run: tasks/scripts/vm/build-libkrun-macos.sh --kernel-dir target/kernel-artifact
+
+      - name: Package runtime tarball
+        run: |
+          tasks/scripts/vm/package-vm-runtime.sh \
+            --platform darwin-aarch64 \
+            --build-dir target/libkrun-build \
+            --output artifacts/vm-runtime-darwin-aarch64.tar.zst
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v7
+        with:
+          name: vm-runtime-macos-arm64
+          path: artifacts/vm-runtime-darwin-aarch64.tar.zst
+          retention-days: 5
+
+  # ---------------------------------------------------------------------------
+  # Upload all runtime tarballs to the vm-runtime rolling release
+  # ---------------------------------------------------------------------------
+  release-kernel:
+    name: Release Kernel Runtime
+    needs: [build-runtime-linux-arm64, build-runtime-linux-amd64, build-runtime-macos-arm64]
+    runs-on: linux-amd64-cpu8
+    timeout-minutes: 10
+    permissions:
+      contents: write
+      id-token: write
+      attestations: write
+      artifact-metadata: write
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Download all runtime artifacts
+        uses: actions/download-artifact@v4
+        with:
+          pattern: vm-runtime-*
+          path: release/
+          merge-multiple: true
+
+      - name: Attest VM runtime artifacts
+        uses: actions/attest@v4
+        with:
+          subject-path: |
+            release/vm-runtime-linux-aarch64.tar.zst
+            release/vm-runtime-linux-x86_64.tar.zst
+            release/vm-runtime-darwin-aarch64.tar.zst
+
+      - name: Ensure vm-runtime tag exists
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git tag -fa vm-runtime -m "VM Runtime Development Build" "${GITHUB_SHA}"
+          git push --force origin vm-runtime
+
+      - name: Prune stale runtime assets from vm-runtime release
+        uses: actions/github-script@v9
+        with:
+          script: |
+            const [owner, repo] = process.env.GITHUB_REPOSITORY.split('/');
+            let release;
+            try {
+              release = await github.rest.repos.getReleaseByTag({ owner, repo, tag: 'vm-runtime' });
+            } catch (err) {
+              if (err.status === 404) {
+                core.info('No existing vm-runtime release; will create fresh.');
+                return;
+              }
+              throw err;
+            }
+            // Delete old runtime assets, including removed checksum files.
+            for (const asset of release.data.assets) {
+              if (asset.name.startsWith('vm-runtime-')) {
+                core.info(`Deleting stale asset: ${asset.name}`);
+                await github.rest.repos.deleteReleaseAsset({ owner, repo, asset_id: asset.id });
+              }
+            }
+
+      - name: Create / update vm-runtime GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          name: OpenShell VM Runtime
+          prerelease: true
+          tag_name: vm-runtime
+          target_commitish: ${{ github.sha }}
+          body: |
+            Build of the OpenShell VM runtime artifacts used by `openshell-driver-vm`.
+
+            > **NOTE**: This is a development build.
+
+            ### Kernel Runtime Artifacts
+
+            Pre-built kernel runtime (libkrunfw + libkrun + gvproxy) for embedding into
+            the `openshell-driver-vm` binary. These are rebuilt on demand when the kernel
+            config or pinned dependency versions change.
+
+            | Platform | Artifact |
+            |----------|----------|
+            | Linux ARM64 | `vm-runtime-linux-aarch64.tar.zst` |
+            | Linux x86_64 | `vm-runtime-linux-x86_64.tar.zst` |
+            | macOS ARM64 | `vm-runtime-darwin-aarch64.tar.zst` |
+
+            ### Verify
+
+            ```bash
+            gh release download vm-runtime -R NVIDIA/OpenShell -p vm-runtime-linux-x86_64.tar.zst
+            gh attestation verify vm-runtime-linux-x86_64.tar.zst -R NVIDIA/OpenShell
+            ```
+
+          files: |
+            release/vm-runtime-linux-aarch64.tar.zst
+            release/vm-runtime-linux-x86_64.tar.zst
+            release/vm-runtime-darwin-aarch64.tar.zst

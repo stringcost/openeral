@@ -5,6 +5,9 @@
 
 set -euo pipefail
 
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+source "${SCRIPT_DIR}/container-engine.sh"
+
 # Normalize cluster name: lowercase, replace invalid chars with hyphens
 normalize_name() {
   echo "$1" | tr '[:upper:]' '[:lower:]' | sed 's/[^a-z0-9-]/-/g' | sed 's/--*/-/g' | sed 's/^-//;s/-$//'
@@ -30,7 +33,7 @@ log_duration() {
   echo "${label} took $((end - start))s"
 }
 
-if ! docker ps -q --filter "name=^${CONTAINER_NAME}$" --filter "health=healthy" | grep -q .; then
+if ! ce ps -q --filter "name=^${CONTAINER_NAME}$" --filter "health=healthy" | grep -q .; then
   echo "Error: Cluster container '${CONTAINER_NAME}' is not running or not healthy."
   echo "Start the cluster first with: mise run cluster"
   exit 1
@@ -38,7 +41,7 @@ fi
 
 # Run a command inside the cluster container with KUBECONFIG pre-configured.
 cluster_exec() {
-  docker exec "${CONTAINER_NAME}" sh -c "KUBECONFIG=/etc/rancher/k3s/k3s.yaml $*"
+  ce exec "${CONTAINER_NAME}" sh -c "KUBECONFIG=/etc/rancher/k3s/k3s.yaml $*"
 }
 
 # Path inside the container where the chart is copied for helm upgrades.
@@ -102,7 +105,7 @@ log_duration "Change detection" "${detect_start}" "${detect_end}"
 # recreated (e.g. via bootstrap).  A new container means the k3s state is
 # fresh and all images must be rebuilt and pushed regardless of source
 # fingerprints.
-current_container_id=$(docker inspect --format '{{.Id}}' "${CONTAINER_NAME}" 2>/dev/null || true)
+current_container_id=$(ce inspect --format '{{.Id}}' "${CONTAINER_NAME}" 2>/dev/null || true)
 
 if [[ -f "${DEPLOY_FAST_STATE_FILE}" ]]; then
   while IFS='=' read -r key value; do
@@ -146,13 +149,13 @@ fi
 matches_gateway() {
   local path=$1
   case "${path}" in
-    Cargo.toml|Cargo.lock|proto/*|deploy/docker/cross-build.sh)
+    Cargo.toml|Cargo.lock|proto/*|tasks/scripts/stage-prebuilt-binaries.sh)
       return 0
       ;;
     deploy/docker/Dockerfile.images|tasks/scripts/docker-build-image.sh)
       return 0
       ;;
-    crates/openshell-core/*|crates/openshell-policy/*|crates/openshell-providers/*)
+    crates/openshell-core/*|crates/openshell-driver-kubernetes/*|crates/openshell-ocsf/*|crates/openshell-policy/*|crates/openshell-providers/*)
       return 0
       ;;
     crates/openshell-router/*|crates/openshell-server/*)
@@ -167,7 +170,7 @@ matches_gateway() {
 matches_supervisor() {
   local path=$1
   case "${path}" in
-    Cargo.toml|Cargo.lock|proto/*|deploy/docker/cross-build.sh)
+    Cargo.toml|Cargo.lock|proto/*|tasks/scripts/stage-prebuilt-binaries.sh)
       return 0
       ;;
     deploy/docker/Dockerfile.images|tasks/scripts/docker-build-image.sh)
@@ -207,13 +210,13 @@ compute_fingerprint() {
   # hashes.  This ensures that committed changes (e.g. after `git pull`
   # or amend) are detected even when there are no uncommitted edits.
   local committed_trees=""
-  case "${component}" in
-    gateway)
-      committed_trees=$(git ls-tree HEAD Cargo.toml Cargo.lock proto/ deploy/docker/cross-build.sh deploy/docker/Dockerfile.images tasks/scripts/docker-build-image.sh crates/openshell-core/ crates/openshell-policy/ crates/openshell-providers/ crates/openshell-router/ crates/openshell-server/ 2>/dev/null || true)
-      ;;
-    supervisor)
-      committed_trees=$(git ls-tree HEAD Cargo.toml Cargo.lock proto/ deploy/docker/cross-build.sh deploy/docker/Dockerfile.images tasks/scripts/docker-build-image.sh crates/openshell-core/ crates/openshell-policy/ crates/openshell-router/ crates/openshell-sandbox/ 2>/dev/null || true)
-      ;;
+	case "${component}" in
+	    gateway)
+	      committed_trees=$(git ls-tree HEAD Cargo.toml Cargo.lock proto/ deploy/docker/Dockerfile.images tasks/scripts/docker-build-image.sh tasks/scripts/stage-prebuilt-binaries.sh crates/openshell-core/ crates/openshell-driver-kubernetes/ crates/openshell-ocsf/ crates/openshell-policy/ crates/openshell-providers/ crates/openshell-router/ crates/openshell-server/ 2>/dev/null || true)
+	      ;;
+	    supervisor)
+	      committed_trees=$(git ls-tree HEAD Cargo.toml Cargo.lock proto/ deploy/docker/Dockerfile.images tasks/scripts/docker-build-image.sh tasks/scripts/stage-prebuilt-binaries.sh crates/openshell-core/ crates/openshell-policy/ crates/openshell-router/ crates/openshell-sandbox/ 2>/dev/null || true)
+	      ;;
     helm)
       committed_trees=$(git ls-tree HEAD deploy/helm/openshell/ 2>/dev/null || true)
       ;;
@@ -315,19 +318,19 @@ if [[ "${build_supervisor}" == "1" ]]; then
   # Detect the cluster container's architecture so we cross-compile correctly.
   # Container objects lack an Architecture field (the Go template emits a
   # stray newline before erroring), so inspect the container's *image* instead.
-  _cluster_image=$(docker inspect --format '{{.Config.Image}}' "${CONTAINER_NAME}" 2>/dev/null)
-  CLUSTER_ARCH=$(docker image inspect --format '{{.Architecture}}' "${_cluster_image}" 2>/dev/null || echo "amd64")
+  _cluster_image=$(ce inspect --format '{{.Config.Image}}' "${CONTAINER_NAME}" 2>/dev/null)
+  CLUSTER_ARCH=$(ce image inspect --format '{{.Architecture}}' "${_cluster_image}" 2>/dev/null || echo "amd64")
 
-  # Detect the host (build) architecture in Docker's naming convention.
-  HOST_ARCH=$(docker info --format '{{.Architecture}}' 2>/dev/null || echo "amd64")
+  # Detect the host (build) architecture in the container engine's naming convention.
+  HOST_ARCH=$(ce_info_arch)
   # Normalize: Docker reports "aarch64" on ARM hosts but uses "arm64" elsewhere.
   case "${HOST_ARCH}" in
     aarch64) HOST_ARCH=arm64 ;;
     x86_64)  HOST_ARCH=amd64 ;;
   esac
 
-  # Build the supervisor binary from the shared image build graph, then
-  # extract it via --output so fast deploys reuse the same Rust cache.
+	  # Stage the supervisor binary through the prebuilt path, then extract it
+	  # via --output from the minimal Docker target.
   SUPERVISOR_BUILD_DIR=$(mktemp -d)
   trap 'rm -rf "${SUPERVISOR_BUILD_DIR}"' EXIT
 
@@ -337,10 +340,9 @@ if [[ "${build_supervisor}" == "1" ]]; then
     _cargo_version=$(uv run python tasks/scripts/release.py get-version --cargo 2>/dev/null || true)
   fi
 
-  # Only set DOCKER_PLATFORM when actually cross-compiling.  Omitting it
-  # for native builds lets docker-build-image.sh pick the fast "docker"
-  # driver (same as gateway), which shares BuildKit cache mounts (sccache,
-  # cargo registry/target) and avoids docker-container IPC overhead.
+	  # Only set DOCKER_PLATFORM when the cluster architecture differs from the
+	  # local container engine architecture. Omitting it for native builds lets
+	  # docker-build-image.sh pick the fast default builder.
   _platform_env=()
   if [[ "${CLUSTER_ARCH}" != "${HOST_ARCH}" ]]; then
     _platform_env=(DOCKER_PLATFORM="linux/${CLUSTER_ARCH}")
@@ -353,10 +355,10 @@ if [[ "${build_supervisor}" == "1" ]]; then
     tasks/scripts/docker-build-image.sh supervisor-output
 
   # Copy the built binary into the running k3s container
-  docker exec "${CONTAINER_NAME}" mkdir -p /opt/openshell/bin
-  docker cp "${SUPERVISOR_BUILD_DIR}/openshell-sandbox" \
+  ce exec "${CONTAINER_NAME}" mkdir -p /opt/openshell/bin
+  ce cp "${SUPERVISOR_BUILD_DIR}/openshell-sandbox" \
     "${CONTAINER_NAME}:/opt/openshell/bin/openshell-sandbox"
-  docker exec "${CONTAINER_NAME}" chmod 755 /opt/openshell/bin/openshell-sandbox
+  ce exec "${CONTAINER_NAME}" chmod 755 /opt/openshell/bin/openshell-sandbox
 
   built_components+=("supervisor")
   supervisor_end=$(date +%s)
@@ -370,7 +372,7 @@ log_duration "Builds" "${build_start}" "${build_end}"
 declare -a pushed_images=()
 
 if [[ "${build_gateway}" == "1" ]]; then
-  docker tag "openshell/gateway:${IMAGE_TAG}" "${IMAGE_REPO_BASE}/gateway:${IMAGE_TAG}" 2>/dev/null || true
+  ce tag "openshell/gateway:${IMAGE_TAG}" "${IMAGE_REPO_BASE}/gateway:${IMAGE_TAG}" 2>/dev/null || true
   pushed_images+=("${IMAGE_REPO_BASE}/gateway:${IMAGE_TAG}")
   built_components+=("gateway")
 fi
@@ -379,7 +381,7 @@ if [[ "${#pushed_images[@]}" -gt 0 ]]; then
   push_start=$(date +%s)
   echo "Pushing updated images to local registry..."
   for image_ref in "${pushed_images[@]}"; do
-    docker push "${image_ref}"
+    ce push "${image_ref}"
   done
   push_end=$(date +%s)
   log_duration "Image push" "${push_start}" "${push_end}"
@@ -389,7 +391,7 @@ fi
 # the updated image from the registry.
 if [[ "${build_gateway}" == "1" ]]; then
   echo "Evicting stale gateway image from k3s..."
-  docker exec "${CONTAINER_NAME}" crictl rmi "${IMAGE_REPO_BASE}/gateway:${IMAGE_TAG}" >/dev/null 2>&1 || true
+  ce exec "${CONTAINER_NAME}" crictl rmi "${IMAGE_REPO_BASE}/gateway:${IMAGE_TAG}" >/dev/null 2>&1 || true
 fi
 
 if [[ "${needs_helm_upgrade}" == "1" ]]; then
@@ -401,19 +403,20 @@ if [[ "${needs_helm_upgrade}" == "1" ]]; then
   fi
 
   # Copy the local chart source into the container so helm can read it.
-  docker exec "${CONTAINER_NAME}" rm -rf "${CONTAINER_CHART_DIR}"
-  docker cp deploy/helm/openshell "${CONTAINER_NAME}:${CONTAINER_CHART_DIR}"
+  ce exec "${CONTAINER_NAME}" rm -rf "${CONTAINER_CHART_DIR}"
+  ce cp deploy/helm/openshell "${CONTAINER_NAME}:${CONTAINER_CHART_DIR}"
 
   # grpcEndpoint must be explicitly set to https:// because the chart always
   # terminates mTLS (there is no server.tls.enabled toggle). Without this,
   # a prior Helm override or chart default change could silently regress
   # sandbox callbacks to plaintext.
-  # Retrieve the existing handshake secret from the running release, or generate
-  # a new one if this is the first deploy with the mandatory secret.
-  EXISTING_SECRET=$(cluster_exec "helm get values openshell -n openshell -o json 2>/dev/null \
-    | grep -o '\"sshHandshakeSecret\":\"[^\"]*\"' \
-    | cut -d'\"' -f4") || true
-  SSH_HANDSHAKE_SECRET="${EXISTING_SECRET:-$(openssl rand -hex 32)}"
+  # Ensure the SSH handshake K8s secret exists. The bootstrap process normally
+  # creates it, but fast-deploy may run before bootstrap on a fresh cluster.
+  EXISTING_SECRET=$(cluster_exec "kubectl -n openshell get secret openshell-ssh-handshake -o jsonpath='{.data.secret}' 2>/dev/null | base64 -d" 2>/dev/null) || true
+  if [ -z "${EXISTING_SECRET}" ]; then
+    SSH_HANDSHAKE_SECRET="$(openssl rand -hex 32)"
+    cluster_exec "kubectl -n openshell create secret generic openshell-ssh-handshake --from-literal=secret='${SSH_HANDSHAKE_SECRET}' --dry-run=client -o yaml | kubectl apply -f -"
+  fi
 
   # Retrieve the host gateway IP from the entrypoint-rendered HelmChart CR so
   # that hostAliases for host.openshell.internal are preserved across fast deploys.
@@ -422,6 +425,24 @@ if [[ "${needs_helm_upgrade}" == "1" ]]; then
   HOST_GATEWAY_ARGS=""
   if [[ -n "${HOST_GATEWAY_IP}" ]]; then
     HOST_GATEWAY_ARGS="--set server.hostGatewayIP=${HOST_GATEWAY_IP}"
+  fi
+
+  OIDC_HELM_ARGS=""
+  if [[ -n "${OPENSHELL_OIDC_ISSUER:-}" ]]; then
+    OIDC_HELM_ARGS="--set server.oidc.issuer=${OPENSHELL_OIDC_ISSUER}"
+    OIDC_HELM_ARGS="${OIDC_HELM_ARGS} --set server.oidc.audience=${OPENSHELL_OIDC_AUDIENCE:-openshell-cli}"
+    if [[ -n "${OPENSHELL_OIDC_ROLES_CLAIM:-}" ]]; then
+      OIDC_HELM_ARGS="${OIDC_HELM_ARGS} --set server.oidc.rolesClaim=${OPENSHELL_OIDC_ROLES_CLAIM}"
+    fi
+    if [[ -n "${OPENSHELL_OIDC_ADMIN_ROLE:-}" ]]; then
+      OIDC_HELM_ARGS="${OIDC_HELM_ARGS} --set server.oidc.adminRole=${OPENSHELL_OIDC_ADMIN_ROLE}"
+    fi
+    if [[ -n "${OPENSHELL_OIDC_USER_ROLE:-}" ]]; then
+      OIDC_HELM_ARGS="${OIDC_HELM_ARGS} --set server.oidc.userRole=${OPENSHELL_OIDC_USER_ROLE}"
+    fi
+    if [[ -n "${OPENSHELL_OIDC_SCOPES_CLAIM:-}" ]]; then
+      OIDC_HELM_ARGS="${OIDC_HELM_ARGS} --set server.oidc.scopesClaim=${OPENSHELL_OIDC_SCOPES_CLAIM}"
+    fi
   fi
 
   cluster_exec "helm upgrade openshell ${CONTAINER_CHART_DIR} \
@@ -433,8 +454,8 @@ if [[ "${needs_helm_upgrade}" == "1" ]]; then
     --set server.tls.certSecretName=openshell-server-tls \
     --set server.tls.clientCaSecretName=openshell-server-client-ca \
     --set server.tls.clientTlsSecretName=openshell-client-tls \
-    --set server.sshHandshakeSecret=${SSH_HANDSHAKE_SECRET} \
     ${HOST_GATEWAY_ARGS} \
+    ${OIDC_HELM_ARGS} \
     ${helm_wait_args}"
   helm_end=$(date +%s)
   log_duration "Helm upgrade" "${helm_start}" "${helm_end}"

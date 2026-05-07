@@ -12,42 +12,36 @@ use crate::{register_managed_child, unregister_managed_child};
 use miette::{IntoDiagnostic, Result};
 use nix::pty::{Winsize, openpty};
 use nix::unistd::setsid;
+use openshell_ocsf::{
+    ActionId, ActivityId, DispositionId, SeverityId, SshActivityBuilder, StatusId, ocsf_emit,
+};
 use rand_core::OsRng;
 use russh::keys::{Algorithm, PrivateKey};
 use russh::server::{Auth, Handle, Session};
 use russh::{ChannelId, CryptoVec};
 use std::collections::HashMap;
 use std::io::{Read, Write};
-use std::net::SocketAddr;
 use std::os::fd::{AsRawFd, RawFd};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
-use std::sync::{Arc, Mutex, mpsc};
-use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::net::TcpListener;
-use tracing::{info, warn};
-
-const PREFACE_MAGIC: &str = "NSSH1";
-#[cfg(test)]
-const SSH_HANDSHAKE_SECRET_ENV: &str = "OPENSHELL_SSH_HANDSHAKE_SECRET";
-
-/// A time-bounded set of nonces used to detect replayed NSSH1 handshakes.
-/// Each entry records the `Instant` it was inserted; a background reaper task
-/// periodically evicts entries older than the handshake skew window.
-type NonceCache = Arc<Mutex<HashMap<String, Instant>>>;
+use std::sync::{Arc, mpsc};
+use std::time::Duration;
+use tokio::net::UnixListener;
+use tracing::warn;
 
 /// Perform SSH server initialization: generate a host key, build the config,
-/// and bind the TCP listener. Extracted so that startup errors can be forwarded
-/// through the readiness channel rather than being silently logged.
-async fn ssh_server_init(
-    listen_addr: SocketAddr,
-    ca_file_paths: &Option<(PathBuf, PathBuf)>,
-) -> Result<(
-    TcpListener,
+/// and bind the Unix socket listener. Extracted so that startup errors can be
+/// forwarded through the readiness channel rather than being silently logged.
+type SshServerInit = (
+    UnixListener,
     Arc<russh::server::Config>,
     Option<Arc<(PathBuf, PathBuf)>>,
-)> {
+);
+
+fn ssh_server_init(
+    listen_path: &Path,
+    ca_file_paths: &Option<(PathBuf, PathBuf)>,
+) -> Result<SshServerInit> {
     let mut rng = OsRng;
     let host_key = PrivateKey::random(&mut rng, Algorithm::Ed25519).into_diagnostic()?;
 
@@ -59,26 +53,61 @@ async fn ssh_server_init(
 
     let config = Arc::new(config);
     let ca_paths = ca_file_paths.as_ref().map(|p| Arc::new(p.clone()));
-    let listener = TcpListener::bind(listen_addr).await.into_diagnostic()?;
-    info!(addr = %listen_addr, "SSH server listening");
+
+    // Ensure the parent directory exists and is root-owned with 0700
+    // permissions. The sandbox entrypoint runs as an unprivileged user; it
+    // must not be able to enter this directory and connect to the socket.
+    if let Some(parent) = listen_path.parent() {
+        std::fs::create_dir_all(parent).into_diagnostic()?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let perms = std::fs::Permissions::from_mode(0o700);
+            std::fs::set_permissions(parent, perms).into_diagnostic()?;
+        }
+    }
+
+    // Remove any stale socket from a previous run before binding.
+    if listen_path.exists() {
+        std::fs::remove_file(listen_path).into_diagnostic()?;
+    }
+    let listener = UnixListener::bind(listen_path).into_diagnostic()?;
+
+    // Tighten permissions so only the supervisor (root) can connect. The
+    // sandbox entrypoint runs as an unprivileged user and must not be able to
+    // dial the SSH daemon directly — all access goes through the relay from
+    // the gateway.
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let perms = std::fs::Permissions::from_mode(0o600);
+        std::fs::set_permissions(listen_path, perms).into_diagnostic()?;
+    }
+
+    ocsf_emit!(
+        SshActivityBuilder::new(crate::ocsf_ctx())
+            .activity(ActivityId::Listen)
+            .severity(SeverityId::Informational)
+            .status(StatusId::Success)
+            .message(format!("SSH server listening on {}", listen_path.display()))
+            .build()
+    );
 
     Ok((listener, config, ca_paths))
 }
 
 #[allow(clippy::too_many_arguments)]
 pub async fn run_ssh_server(
-    listen_addr: SocketAddr,
+    listen_path: PathBuf,
     ready_tx: tokio::sync::oneshot::Sender<Result<()>>,
     policy: SandboxPolicy,
     workdir: Option<String>,
-    handshake_secret: String,
-    handshake_skew_secs: u64,
     netns_fd: Option<RawFd>,
     proxy_url: Option<String>,
     ca_file_paths: Option<(PathBuf, PathBuf)>,
     provider_env: HashMap<String, String>,
 ) -> Result<()> {
-    let (listener, config, ca_paths) = match ssh_server_init(listen_addr, &ca_file_paths).await {
+    let (listener, config, ca_paths) = match ssh_server_init(&listen_path, &ca_file_paths) {
         Ok(v) => {
             // Signal that the SSH server has bound the socket and is ready to
             // accept connections. The parent task awaits this before spawning
@@ -93,53 +122,36 @@ pub async fn run_ssh_server(
         }
     };
 
-    // Nonce cache for replay detection. Entries are evicted by a background
-    // reaper once they exceed the handshake skew window.
-    let nonce_cache: NonceCache = Arc::new(Mutex::new(HashMap::new()));
-
-    // Background task that periodically purges expired nonces.
-    let reaper_cache = nonce_cache.clone();
-    let ttl = Duration::from_secs(handshake_skew_secs);
-    tokio::spawn(async move {
-        let mut interval = tokio::time::interval(Duration::from_secs(60));
-        loop {
-            interval.tick().await;
-            if let Ok(mut cache) = reaper_cache.lock() {
-                cache.retain(|_, inserted| inserted.elapsed() < ttl);
-            }
-        }
-    });
-
     loop {
-        let (stream, peer) = listener.accept().await.into_diagnostic()?;
-        stream.set_nodelay(true).into_diagnostic()?;
+        let (stream, _peer) = listener.accept().await.into_diagnostic()?;
         let config = config.clone();
         let policy = policy.clone();
         let workdir = workdir.clone();
-        let secret = handshake_secret.clone();
         let proxy_url = proxy_url.clone();
         let ca_paths = ca_paths.clone();
         let provider_env = provider_env.clone();
-        let nonce_cache = nonce_cache.clone();
 
         tokio::spawn(async move {
             if let Err(err) = handle_connection(
                 stream,
-                peer,
                 config,
                 policy,
                 workdir,
-                &secret,
-                handshake_skew_secs,
                 netns_fd,
                 proxy_url,
                 ca_paths,
                 provider_env,
-                &nonce_cache,
             )
             .await
             {
-                warn!(error = %err, "SSH connection failed");
+                ocsf_emit!(
+                    SshActivityBuilder::new(crate::ocsf_ctx())
+                        .activity(ActivityId::Fail)
+                        .severity(SeverityId::Low)
+                        .status(StatusId::Failure)
+                        .message(format!("SSH connection failed: {err}"))
+                        .build()
+                );
             }
         });
     }
@@ -147,30 +159,28 @@ pub async fn run_ssh_server(
 
 #[allow(clippy::too_many_arguments)]
 async fn handle_connection(
-    mut stream: tokio::net::TcpStream,
-    peer: SocketAddr,
+    stream: tokio::net::UnixStream,
     config: Arc<russh::server::Config>,
     policy: SandboxPolicy,
     workdir: Option<String>,
-    secret: &str,
-    handshake_skew_secs: u64,
     netns_fd: Option<RawFd>,
     proxy_url: Option<String>,
     ca_file_paths: Option<Arc<(PathBuf, PathBuf)>>,
     provider_env: HashMap<String, String>,
-    nonce_cache: &NonceCache,
 ) -> Result<()> {
-    info!(peer = %peer, "SSH connection: reading handshake preface");
-    let mut line = String::new();
-    read_line(&mut stream, &mut line).await?;
-    info!(peer = %peer, preface_len = line.len(), "SSH connection: preface received, verifying");
-    if !verify_preface(&line, secret, handshake_skew_secs, nonce_cache)? {
-        warn!(peer = %peer, "SSH connection: handshake verification failed");
-        let _ = stream.write_all(b"ERR\n").await;
-        return Ok(());
-    }
-    stream.write_all(b"OK\n").await.into_diagnostic()?;
-    info!(peer = %peer, "SSH handshake accepted");
+    // Access is gated by the Unix-socket filesystem permissions (root-only),
+    // not by an application-level preface. The supervisor bridges the
+    // gateway's RelayStream directly into this socket.
+    ocsf_emit!(
+        SshActivityBuilder::new(crate::ocsf_ctx())
+            .activity(ActivityId::Open)
+            .action(ActionId::Allowed)
+            .disposition(DispositionId::Allowed)
+            .severity(SeverityId::Informational)
+            .status(StatusId::Success)
+            .message("SSH connection accepted on supervisor Unix socket")
+            .build()
+    );
 
     let handler = SshHandler::new(
         policy,
@@ -186,81 +196,17 @@ async fn handle_connection(
     Ok(())
 }
 
-async fn read_line(stream: &mut tokio::net::TcpStream, buf: &mut String) -> Result<()> {
-    let mut bytes = Vec::new();
-    loop {
-        let mut byte = [0u8; 1];
-        let n = stream.read(&mut byte).await.into_diagnostic()?;
-        if n == 0 {
-            break;
-        }
-        if byte[0] == b'\n' {
-            break;
-        }
-        bytes.push(byte[0]);
-        if bytes.len() > 1024 {
-            break;
-        }
-    }
-    *buf = String::from_utf8_lossy(&bytes).to_string();
-    Ok(())
-}
-
-fn verify_preface(
-    line: &str,
-    secret: &str,
-    handshake_skew_secs: u64,
-    nonce_cache: &NonceCache,
-) -> Result<bool> {
-    let parts: Vec<&str> = line.split_whitespace().collect();
-    if parts.len() != 5 || parts[0] != PREFACE_MAGIC {
-        return Ok(false);
-    }
-    let token = parts[1];
-    let timestamp: i64 = parts[2].parse().unwrap_or(0);
-    let nonce = parts[3];
-    let signature = parts[4];
-
-    let now = i64::try_from(
-        SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .into_diagnostic()?
-            .as_secs(),
-    )
-    .into_diagnostic()?;
-    let skew = (now - timestamp).unsigned_abs();
-    if skew > handshake_skew_secs {
-        return Ok(false);
-    }
-
-    let payload = format!("{token}|{timestamp}|{nonce}");
-    let expected = hmac_sha256(secret.as_bytes(), payload.as_bytes());
-    if signature != expected {
-        return Ok(false);
-    }
-
-    // Reject replayed nonces. The cache is bounded by the reaper task which
-    // evicts entries older than `handshake_skew_secs`.
-    let mut cache = nonce_cache
-        .lock()
-        .map_err(|_| miette::miette!("nonce cache lock poisoned"))?;
-    if cache.contains_key(nonce) {
-        warn!(nonce = nonce, "NSSH1 nonce replay detected");
-        return Ok(false);
-    }
-    cache.insert(nonce.to_string(), Instant::now());
-
-    Ok(true)
-}
-
-fn hmac_sha256(key: &[u8], data: &[u8]) -> String {
-    use hmac::{Hmac, Mac};
-    use sha2::Sha256;
-
-    let mut mac = Hmac::<Sha256>::new_from_slice(key).expect("hmac key");
-    mac.update(data);
-    let result = mac.finalize().into_bytes();
-    hex::encode(result)
+/// Per-channel state for tracking PTY resources and I/O senders.
+///
+/// Each SSH channel gets its own PTY master (if a PTY was requested) and input
+/// sender.  This allows `window_change_request` to resize the correct PTY when
+/// multiple channels are open simultaneously (e.g. parallel shells, shell +
+/// sftp, etc.).
+#[derive(Default)]
+struct ChannelState {
+    input_sender: Option<mpsc::Sender<Vec<u8>>>,
+    pty_master: Option<std::fs::File>,
+    pty_request: Option<PtyRequest>,
 }
 
 struct SshHandler {
@@ -270,9 +216,7 @@ struct SshHandler {
     proxy_url: Option<String>,
     ca_file_paths: Option<Arc<(PathBuf, PathBuf)>>,
     provider_env: HashMap<String, String>,
-    input_sender: Option<mpsc::Sender<Vec<u8>>>,
-    pty_master: Option<std::fs::File>,
-    pty_request: Option<PtyRequest>,
+    channels: HashMap<ChannelId, ChannelState>,
 }
 
 impl SshHandler {
@@ -291,9 +235,7 @@ impl SshHandler {
             proxy_url,
             ca_file_paths,
             provider_env,
-            input_sender: None,
-            pty_master: None,
-            pty_request: None,
+            channels: HashMap::new(),
         }
     }
 }
@@ -315,10 +257,25 @@ impl russh::server::Handler for SshHandler {
 
     async fn channel_open_session(
         &mut self,
-        _channel: russh::Channel<russh::server::Msg>,
+        channel: russh::Channel<russh::server::Msg>,
         _session: &mut Session,
     ) -> Result<bool, Self::Error> {
+        self.channels.insert(channel.id(), ChannelState::default());
         Ok(true)
+    }
+
+    /// Clean up per-channel state when the channel is closed.
+    ///
+    /// This is the final cleanup and subsumes `channel_eof` — if `channel_close`
+    /// fires without a preceding `channel_eof`, all resources (`pty_master` File,
+    /// `input_sender`) are dropped here.
+    async fn channel_close(
+        &mut self,
+        channel: ChannelId,
+        _session: &mut Session,
+    ) -> Result<(), Self::Error> {
+        self.channels.remove(&channel);
+        Ok(())
     }
 
     async fn channel_open_direct_tcpip(
@@ -330,23 +287,41 @@ impl russh::server::Handler for SshHandler {
         _originator_port: u32,
         _session: &mut Session,
     ) -> Result<bool, Self::Error> {
+        // Validate port range before truncating u32 -> u16.  The SSH protocol
+        // uses u32 for ports, but valid TCP ports are 0-65535.  Without this
+        // check, port 65537 truncates to port 1 (privileged).
+        if port_to_connect > u32::from(u16::MAX) {
+            ocsf_emit!(SshActivityBuilder::new(crate::ocsf_ctx())
+                .activity(ActivityId::Refuse)
+                .action(ActionId::Denied)
+                .disposition(DispositionId::Blocked)
+                .severity(SeverityId::Medium)
+                .message(format!(
+                    "direct-tcpip rejected: port {port_to_connect} exceeds valid TCP range for host {host_to_connect}"
+                ))
+                .build());
+            return Ok(false);
+        }
+
         // Only allow forwarding to loopback destinations to prevent the
         // sandbox SSH server from being used as a generic proxy.
-        let is_loopback = host_to_connect == "127.0.0.1"
-            || host_to_connect == "localhost"
-            || host_to_connect == "::1";
-        if !is_loopback {
-            warn!(
-                host = host_to_connect,
-                port = port_to_connect,
-                "direct-tcpip rejected: non-loopback destination"
-            );
+        if !is_loopback_host(host_to_connect) {
+            ocsf_emit!(SshActivityBuilder::new(crate::ocsf_ctx())
+                .activity(ActivityId::Refuse)
+                .action(ActionId::Denied)
+                .disposition(DispositionId::Blocked)
+                .severity(SeverityId::Medium)
+                .message(format!(
+                    "direct-tcpip rejected: non-loopback destination {host_to_connect}:{port_to_connect}"
+                ))
+                .build());
             return Ok(false);
         }
 
         let host = host_to_connect.to_string();
-        #[allow(clippy::cast_possible_truncation)]
-        let port = port_to_connect as u16;
+        // SSH protocol port is bounded by u32 but only u16 is meaningful;
+        // saturate as a guard for malformed clients.
+        let port = u16::try_from(port_to_connect).unwrap_or(u16::MAX);
         let netns_fd = self.netns_fd;
 
         tokio::spawn(async move {
@@ -354,7 +329,14 @@ impl russh::server::Handler for SshHandler {
             let tcp = match connect_in_netns(&addr, netns_fd).await {
                 Ok(stream) => stream,
                 Err(err) => {
-                    warn!(addr = %addr, error = %err, "direct-tcpip: failed to connect");
+                    ocsf_emit!(
+                        SshActivityBuilder::new(crate::ocsf_ctx())
+                            .activity(ActivityId::Fail)
+                            .severity(SeverityId::Low)
+                            .status(StatusId::Failure)
+                            .message(format!("direct-tcpip: failed to connect to {addr}: {err}"))
+                            .build()
+                    );
                     let _ = channel.close().await;
                     return;
                 }
@@ -380,7 +362,11 @@ impl russh::server::Handler for SshHandler {
         _modes: &[(russh::Pty, u32)],
         session: &mut Session,
     ) -> Result<(), Self::Error> {
-        self.pty_request = Some(PtyRequest {
+        let state = self
+            .channels
+            .get_mut(&channel)
+            .ok_or_else(|| anyhow::anyhow!("pty_request on unknown channel {channel:?}"))?;
+        state.pty_request = Some(PtyRequest {
             term: term.to_string(),
             col_width,
             row_height,
@@ -393,21 +379,27 @@ impl russh::server::Handler for SshHandler {
 
     async fn window_change_request(
         &mut self,
-        _channel: ChannelId,
+        channel: ChannelId,
         col_width: u32,
         row_height: u32,
         pixel_width: u32,
         pixel_height: u32,
         _session: &mut Session,
     ) -> Result<(), Self::Error> {
-        if let Some(master) = self.pty_master.as_ref() {
+        let Some(state) = self.channels.get(&channel) else {
+            warn!("window_change_request on unknown channel {channel:?}");
+            return Ok(());
+        };
+        if let Some(master) = state.pty_master.as_ref() {
             let winsize = Winsize {
                 ws_row: to_u16(row_height.max(1)),
                 ws_col: to_u16(col_width.max(1)),
                 ws_xpixel: to_u16(pixel_width),
                 ws_ypixel: to_u16(pixel_height),
             };
-            let _ = unsafe_pty::set_winsize(master.as_raw_fd(), winsize);
+            if let Err(e) = unsafe_pty::set_winsize(master.as_raw_fd(), winsize) {
+                warn!("failed to resize PTY for channel {channel:?}: {e}");
+            }
         }
         Ok(())
     }
@@ -466,9 +458,20 @@ impl russh::server::Handler for SshHandler {
                 self.ca_file_paths.clone(),
                 &self.provider_env,
             )?;
-            self.input_sender = Some(input_sender);
+            let state = self.channels.get_mut(&channel).ok_or_else(|| {
+                anyhow::anyhow!("subsystem_request on unknown channel {channel:?}")
+            })?;
+            state.input_sender = Some(input_sender);
         } else {
-            warn!(subsystem = name, "unsupported subsystem requested");
+            ocsf_emit!(
+                SshActivityBuilder::new(crate::ocsf_ctx())
+                    .activity(ActivityId::Refuse)
+                    .action(ActionId::Denied)
+                    .disposition(DispositionId::Rejected)
+                    .severity(SeverityId::Medium)
+                    .message(format!("unsupported subsystem requested: {name}"))
+                    .build()
+            );
             session.channel_failure(channel)?;
         }
         Ok(())
@@ -491,11 +494,15 @@ impl russh::server::Handler for SshHandler {
 
     async fn data(
         &mut self,
-        _channel: ChannelId,
+        channel: ChannelId,
         data: &[u8],
         _session: &mut Session,
     ) -> Result<(), Self::Error> {
-        if let Some(sender) = self.input_sender.as_ref() {
+        let Some(state) = self.channels.get(&channel) else {
+            warn!("data on unknown channel {channel:?}");
+            return Ok(());
+        };
+        if let Some(sender) = state.input_sender.as_ref() {
             let _ = sender.send(data.to_vec());
         }
         Ok(())
@@ -503,14 +510,18 @@ impl russh::server::Handler for SshHandler {
 
     async fn channel_eof(
         &mut self,
-        _channel: ChannelId,
+        channel: ChannelId,
         _session: &mut Session,
     ) -> Result<(), Self::Error> {
         // Drop the input sender so the stdin writer thread sees a
         // disconnected channel and closes the child's stdin pipe.  This
         // is essential for commands like `cat | tar xf -` which need
         // stdin EOF to know the input stream is complete.
-        self.input_sender.take();
+        if let Some(state) = self.channels.get_mut(&channel) {
+            state.input_sender.take();
+        } else {
+            warn!("channel_eof on unknown channel {channel:?}");
+        }
         Ok(())
     }
 }
@@ -522,7 +533,11 @@ impl SshHandler {
         handle: Handle,
         command: Option<String>,
     ) -> anyhow::Result<()> {
-        if let Some(pty) = self.pty_request.take() {
+        let state = self
+            .channels
+            .get_mut(&channel)
+            .ok_or_else(|| anyhow::anyhow!("start_shell on unknown channel {channel:?}"))?;
+        if let Some(pty) = state.pty_request.take() {
             // PTY was requested — allocate a real PTY (interactive shell or
             // exec that explicitly asked for a terminal).
             let (pty_master, input_sender) = spawn_pty_shell(
@@ -537,8 +552,8 @@ impl SshHandler {
                 self.ca_file_paths.clone(),
                 &self.provider_env,
             )?;
-            self.pty_master = Some(pty_master);
-            self.input_sender = Some(input_sender);
+            state.pty_master = Some(pty_master);
+            state.input_sender = Some(input_sender);
         } else {
             // No PTY requested — use plain pipes so stdout/stderr are
             // separate and output has clean LF line endings.  This is the
@@ -554,7 +569,7 @@ impl SshHandler {
                 self.ca_file_paths.clone(),
                 &self.provider_env,
             )?;
-            self.input_sender = Some(input_sender);
+            state.input_sender = Some(input_sender);
         }
         Ok(())
     }
@@ -641,8 +656,10 @@ fn session_user_and_home(policy: &SandboxPolicy) -> (String, String) {
             let home = nix::unistd::User::from_name(user)
                 .ok()
                 .flatten()
-                .map(|u| u.dir.to_string_lossy().into_owned())
-                .unwrap_or_else(|| format!("/home/{user}"));
+                .map_or_else(
+                    || format!("/home/{user}"),
+                    |u| u.dir.to_string_lossy().into_owned(),
+                );
             (user.to_string(), home)
         }
         _ => ("sandbox".to_string(), "/sandbox".to_string()),
@@ -752,6 +769,15 @@ fn spawn_pty_shell(
         cmd.current_dir(dir);
     }
 
+    // Probe Landlock availability from the parent process where tracing works.
+    #[cfg(target_os = "linux")]
+    sandbox::linux::log_sandbox_readiness(policy, workdir.as_deref());
+
+    // Phase 1 (as root): Prepare Landlock ruleset before drop_privileges.
+    #[cfg(target_os = "linux")]
+    let prepared_sandbox = sandbox::linux::prepare(policy, workdir.as_deref())
+        .map_err(|err| anyhow::anyhow!("Failed to prepare sandbox: {err}"))?;
+
     #[cfg(unix)]
     {
         unsafe_pty::install_pre_exec(
@@ -760,6 +786,8 @@ fn spawn_pty_shell(
             workdir.clone(),
             slave_fd,
             netns_fd,
+            #[cfg(target_os = "linux")]
+            prepared_sandbox,
         );
     }
 
@@ -888,9 +916,25 @@ fn spawn_pipe_exec(
         cmd.current_dir(dir);
     }
 
+    // Probe Landlock availability from the parent process where tracing works.
+    #[cfg(target_os = "linux")]
+    sandbox::linux::log_sandbox_readiness(policy, workdir.as_deref());
+
+    // Phase 1 (as root): Prepare Landlock ruleset before drop_privileges.
+    #[cfg(target_os = "linux")]
+    let prepared_sandbox = sandbox::linux::prepare(policy, workdir.as_deref())
+        .map_err(|err| anyhow::anyhow!("Failed to prepare sandbox: {err}"))?;
+
     #[cfg(unix)]
     {
-        unsafe_pty::install_pre_exec_no_pty(&mut cmd, policy.clone(), workdir.clone(), netns_fd);
+        unsafe_pty::install_pre_exec_no_pty(
+            &mut cmd,
+            policy.clone(),
+            workdir.clone(),
+            netns_fd,
+            #[cfg(target_os = "linux")]
+            prepared_sandbox,
+        );
     }
 
     let mut child = cmd.spawn()?;
@@ -985,13 +1029,15 @@ fn spawn_pipe_exec(
 }
 
 mod unsafe_pty {
-    use super::{Command, RawFd, SandboxPolicy, Winsize, drop_privileges, sandbox, setsid};
+    #[cfg(not(target_os = "linux"))]
+    use super::sandbox;
+    use super::{Command, RawFd, SandboxPolicy, Winsize, drop_privileges, setsid};
     #[cfg(unix)]
     use std::os::unix::process::CommandExt;
 
     #[allow(unsafe_code)]
     pub fn set_winsize(fd: RawFd, winsize: Winsize) -> std::io::Result<()> {
-        let rc = unsafe { libc::ioctl(fd, libc::TIOCSWINSZ, winsize) };
+        let rc = unsafe { libc::ioctl(fd, libc::TIOCSWINSZ, &winsize) };
         if rc != 0 {
             return Err(std::io::Error::last_os_error());
         }
@@ -999,6 +1045,9 @@ mod unsafe_pty {
     }
 
     #[allow(unsafe_code)]
+    // `libc::TIOCSCTTY` is `u32` on macOS/BSD and `u64` on Linux; allow the
+    // cross-platform conversion so the same expression compiles everywhere.
+    #[allow(clippy::useless_conversion)]
     fn set_controlling_tty(fd: RawFd) -> std::io::Result<()> {
         let rc = unsafe { libc::ioctl(fd, libc::TIOCSCTTY.into(), 0) };
         if rc != 0 {
@@ -1011,16 +1060,26 @@ mod unsafe_pty {
     pub fn install_pre_exec(
         cmd: &mut Command,
         policy: SandboxPolicy,
-        workdir: Option<String>,
+        _workdir: Option<String>,
         slave_fd: RawFd,
         netns_fd: Option<RawFd>,
+        #[cfg(target_os = "linux")] prepared: crate::sandbox::linux::PreparedSandbox,
     ) {
+        // Wrap in Option so we can .take() it out of the FnMut closure.
+        // pre_exec is only called once (after fork, before exec).
+        #[cfg(target_os = "linux")]
+        let mut prepared = Some(prepared);
         unsafe {
             cmd.pre_exec(move || {
                 setsid().map_err(|err| std::io::Error::other(err.to_string()))?;
                 set_controlling_tty(slave_fd)?;
 
-                enter_netns_and_sandbox(netns_fd, &policy, workdir.as_deref())
+                enter_netns_and_sandbox(
+                    netns_fd,
+                    &policy,
+                    #[cfg(target_os = "linux")]
+                    prepared.take(),
+                )
             });
         }
     }
@@ -1032,18 +1091,28 @@ mod unsafe_pty {
     pub fn install_pre_exec_no_pty(
         cmd: &mut Command,
         policy: SandboxPolicy,
-        workdir: Option<String>,
+        _workdir: Option<String>,
         netns_fd: Option<RawFd>,
+        #[cfg(target_os = "linux")] prepared: crate::sandbox::linux::PreparedSandbox,
     ) {
+        #[cfg(target_os = "linux")]
+        let mut prepared = Some(prepared);
         unsafe {
-            cmd.pre_exec(move || enter_netns_and_sandbox(netns_fd, &policy, workdir.as_deref()));
+            cmd.pre_exec(move || {
+                enter_netns_and_sandbox(
+                    netns_fd,
+                    &policy,
+                    #[cfg(target_os = "linux")]
+                    prepared.take(),
+                )
+            });
         }
     }
 
     fn enter_netns_and_sandbox(
         netns_fd: Option<RawFd>,
         policy: &SandboxPolicy,
-        workdir: Option<&str>,
+        #[cfg(target_os = "linux")] prepared: Option<crate::sandbox::linux::PreparedSandbox>,
     ) -> std::io::Result<()> {
         // Enter network namespace before dropping privileges.
         // This ensures SSH shell processes are isolated to the same
@@ -1061,11 +1130,23 @@ mod unsafe_pty {
         #[cfg(not(target_os = "linux"))]
         let _ = netns_fd;
 
-        // Drop privileges before applying sandbox restrictions.
-        // initgroups/setgid/setuid need access to /etc/group and /etc/passwd
-        // which may be blocked by Landlock.
+        // Drop privileges. initgroups/setgid/setuid need /etc/group and
+        // /etc/passwd which would be blocked if Landlock were already enforced.
         drop_privileges(policy).map_err(|err| std::io::Error::other(err.to_string()))?;
-        sandbox::apply(policy, workdir).map_err(|err| std::io::Error::other(err.to_string()))?;
+        crate::process::harden_child_process()
+            .map_err(|err| std::io::Error::other(err.to_string()))?;
+
+        // Phase 2: Enforce the prepared Landlock ruleset + seccomp.
+        // restrict_self() does not require root.
+        #[cfg(target_os = "linux")]
+        if let Some(prepared) = prepared {
+            crate::sandbox::linux::enforce(prepared)
+                .map_err(|err| std::io::Error::other(err.to_string()))?;
+        }
+
+        #[cfg(not(target_os = "linux"))]
+        sandbox::apply(policy, None).map_err(|err| std::io::Error::other(err.to_string()))?;
+
         Ok(())
     }
 }
@@ -1074,7 +1155,47 @@ fn to_u16(value: u32) -> u16 {
     u16::try_from(value.min(u32::from(u16::MAX))).unwrap_or(u16::MAX)
 }
 
+/// Check whether a host string refers to a loopback address.
+///
+/// Covers all representations that resolve to loopback:
+/// - `127.0.0.0/8` (the entire IPv4 loopback range, not just `127.0.0.1`)
+/// - `localhost`
+/// - `::1` and long-form IPv6 loopback (`0:0:0:0:0:0:0:1`)
+/// - `::ffff:127.x.x.x` (IPv4-mapped IPv6 loopback)
+/// - Bracketed forms like `[::1]`
+fn is_loopback_host(host: &str) -> bool {
+    // Strip brackets for IPv6 addresses like [::1]
+    let host = host
+        .strip_prefix('[')
+        .and_then(|h| h.strip_suffix(']'))
+        .unwrap_or(host);
+
+    if host.eq_ignore_ascii_case("localhost") {
+        return true;
+    }
+
+    match host.parse::<std::net::IpAddr>() {
+        Ok(std::net::IpAddr::V4(v4)) => v4.is_loopback(), // covers all 127.x.x.x
+        Ok(std::net::IpAddr::V6(v6)) => {
+            if v6.is_loopback() {
+                return true; // covers ::1 and long form
+            }
+            // Check IPv4-mapped IPv6 addresses like ::ffff:127.0.0.1
+            if let Some(v4) = v6.to_ipv4_mapped() {
+                return v4.is_loopback();
+            }
+            false
+        }
+        Err(_) => false,
+    }
+}
+
 #[cfg(test)]
+#[allow(
+    clippy::doc_markdown,
+    unsafe_code,
+    reason = "Test code: doc text references identifiers and uses libc::winsize zero-init."
+)]
 mod tests {
     use super::*;
     use std::process::Stdio;
@@ -1183,132 +1304,228 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
-    // verify_preface tests
+    // SEC-007: is_loopback_host tests
     // -----------------------------------------------------------------------
 
-    /// Build a valid NSSH1 preface line with the given parameters.
-    fn build_preface(token: &str, secret: &str, nonce: &str, timestamp: i64) -> String {
-        let payload = format!("{token}|{timestamp}|{nonce}");
-        let signature = hmac_sha256(secret.as_bytes(), payload.as_bytes());
-        format!("{PREFACE_MAGIC} {token} {timestamp} {nonce} {signature}")
-    }
-
-    fn fresh_nonce_cache() -> NonceCache {
-        Arc::new(Mutex::new(HashMap::new()))
-    }
-
-    fn current_timestamp() -> i64 {
-        i64::try_from(
-            SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .unwrap()
-                .as_secs(),
-        )
-        .unwrap()
+    #[test]
+    fn loopback_host_accepts_standard_ipv4() {
+        assert!(is_loopback_host("127.0.0.1"));
     }
 
     #[test]
-    fn verify_preface_accepts_valid_preface() {
-        let secret = "test-secret-key";
-        let nonce = "unique-nonce-1";
-        let ts = current_timestamp();
-        let line = build_preface("tok1", secret, nonce, ts);
-        let cache = fresh_nonce_cache();
-
-        assert!(verify_preface(&line, secret, 300, &cache).unwrap());
+    fn loopback_host_accepts_full_ipv4_range() {
+        assert!(is_loopback_host("127.0.0.2"));
+        assert!(is_loopback_host("127.255.255.255"));
     }
 
     #[test]
-    fn verify_preface_rejects_replayed_nonce() {
-        let secret = "test-secret-key";
-        let nonce = "replay-nonce";
-        let ts = current_timestamp();
-        let line = build_preface("tok1", secret, nonce, ts);
-        let cache = fresh_nonce_cache();
-
-        // First attempt should succeed.
-        assert!(verify_preface(&line, secret, 300, &cache).unwrap());
-        // Second attempt with the same nonce should be rejected.
-        assert!(!verify_preface(&line, secret, 300, &cache).unwrap());
+    fn loopback_host_accepts_localhost() {
+        assert!(is_loopback_host("localhost"));
+        assert!(is_loopback_host("LOCALHOST"));
+        assert!(is_loopback_host("Localhost"));
     }
 
     #[test]
-    fn verify_preface_rejects_expired_timestamp() {
-        let secret = "test-secret-key";
-        let nonce = "expired-nonce";
-        // Timestamp 600 seconds in the past, with a 300-second skew window.
-        let ts = current_timestamp() - 600;
-        let line = build_preface("tok1", secret, nonce, ts);
-        let cache = fresh_nonce_cache();
-
-        assert!(!verify_preface(&line, secret, 300, &cache).unwrap());
+    fn loopback_host_accepts_ipv6_loopback() {
+        assert!(is_loopback_host("::1"));
+        assert!(is_loopback_host("[::1]"));
+        assert!(is_loopback_host("0:0:0:0:0:0:0:1"));
     }
 
     #[test]
-    fn verify_preface_rejects_invalid_hmac() {
-        let secret = "test-secret-key";
-        let nonce = "hmac-nonce";
-        let ts = current_timestamp();
-        // Build with the correct secret, then verify with the wrong one.
-        let line = build_preface("tok1", secret, nonce, ts);
-        let cache = fresh_nonce_cache();
-
-        assert!(!verify_preface(&line, "wrong-secret", 300, &cache).unwrap());
+    fn loopback_host_accepts_ipv4_mapped_ipv6() {
+        assert!(is_loopback_host("::ffff:127.0.0.1"));
     }
 
     #[test]
-    fn verify_preface_rejects_malformed_input() {
-        let cache = fresh_nonce_cache();
-
-        // Too few parts.
-        assert!(!verify_preface("NSSH1 tok1 123", "s", 300, &cache).unwrap());
-        // Wrong magic.
-        assert!(!verify_preface("NSSH2 tok1 123 nonce sig", "s", 300, &cache).unwrap());
-        // Empty string.
-        assert!(!verify_preface("", "s", 300, &cache).unwrap());
+    fn loopback_host_rejects_non_loopback() {
+        assert!(!is_loopback_host("10.0.0.1"));
+        assert!(!is_loopback_host("192.168.1.1"));
+        assert!(!is_loopback_host("8.8.8.8"));
+        assert!(!is_loopback_host("example.com"));
+        assert!(!is_loopback_host("::ffff:10.0.0.1"));
     }
 
     #[test]
-    fn verify_preface_distinct_nonces_both_accepted() {
-        let secret = "test-secret-key";
-        let ts = current_timestamp();
-        let cache = fresh_nonce_cache();
+    fn loopback_host_rejects_empty_and_garbage() {
+        assert!(!is_loopback_host(""));
+        assert!(!is_loopback_host("not-an-ip"));
+        assert!(!is_loopback_host("[]"));
+    }
 
-        let line1 = build_preface("tok1", secret, "nonce-a", ts);
-        let line2 = build_preface("tok1", secret, "nonce-b", ts);
+    // -----------------------------------------------------------------------
+    // Per-channel PTY state tests (#543)
+    // -----------------------------------------------------------------------
 
-        assert!(verify_preface(&line1, secret, 300, &cache).unwrap());
-        assert!(verify_preface(&line2, secret, 300, &cache).unwrap());
+    #[test]
+    fn set_winsize_applies_to_correct_pty() {
+        // Verify that set_winsize applies to a specific PTY master FD,
+        // which is the mechanism that per-channel tracking relies on.
+        // With the old single-pty_master design, a window_change_request
+        // for channel N would resize whatever PTY was stored last —
+        // potentially belonging to a different channel.
+        let pty_a = openpty(None, None).expect("openpty a");
+        let pty_b = openpty(None, None).expect("openpty b");
+        let master_a = std::fs::File::from(pty_a.master);
+        let master_b = std::fs::File::from(pty_b.master);
+        let fd_a = master_a.as_raw_fd();
+        let fd_b = master_b.as_raw_fd();
+        assert_ne!(fd_a, fd_b, "two PTYs must have distinct FDs");
+
+        // Close the slave ends to avoid leaking FDs in the test.
+        drop(std::fs::File::from(pty_a.slave));
+        drop(std::fs::File::from(pty_b.slave));
+
+        // Resize only PTY B.
+        let winsize_b = Winsize {
+            ws_row: 50,
+            ws_col: 120,
+            ws_xpixel: 0,
+            ws_ypixel: 0,
+        };
+        unsafe_pty::set_winsize(fd_b, winsize_b).expect("set_winsize on PTY B");
+
+        // Resize PTY A to a different size.
+        let winsize_a = Winsize {
+            ws_row: 24,
+            ws_col: 80,
+            ws_xpixel: 0,
+            ws_ypixel: 0,
+        };
+        unsafe_pty::set_winsize(fd_a, winsize_a).expect("set_winsize on PTY A");
+
+        // Read back sizes via ioctl to verify independence.
+        let mut actual_a: libc::winsize = unsafe { std::mem::zeroed() };
+        let mut actual_b: libc::winsize = unsafe { std::mem::zeroed() };
+        #[allow(unsafe_code)]
+        unsafe {
+            libc::ioctl(fd_a, libc::TIOCGWINSZ, &mut actual_a);
+            libc::ioctl(fd_b, libc::TIOCGWINSZ, &mut actual_b);
+        }
+
+        assert_eq!(actual_a.ws_row, 24, "PTY A should be 24 rows");
+        assert_eq!(actual_a.ws_col, 80, "PTY A should be 80 cols");
+        assert_eq!(actual_b.ws_row, 50, "PTY B should be 50 rows");
+        assert_eq!(actual_b.ws_col, 120, "PTY B should be 120 cols");
     }
 
     #[test]
-    fn apply_child_env_keeps_handshake_secret_out_of_ssh_children() {
-        let mut cmd = Command::new("/usr/bin/env");
-        cmd.env(SSH_HANDSHAKE_SECRET_ENV, "should-not-leak")
-            .stdin(Stdio::null())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::null());
+    fn channel_state_independent_input_senders() {
+        // Verify that each channel gets its own input sender so that
+        // data() and channel_eof() affect only the targeted channel.
+        let (tx_a, rx_a) = mpsc::channel::<Vec<u8>>();
+        let (tx_b, rx_b) = mpsc::channel::<Vec<u8>>();
 
-        let provider_env = std::iter::once((
-            "ANTHROPIC_API_KEY".to_string(),
-            "openshell:resolve:env:ANTHROPIC_API_KEY".to_string(),
-        ))
-        .collect();
+        let mut state_a = ChannelState {
+            input_sender: Some(tx_a),
+            ..Default::default()
+        };
+        let state_b = ChannelState {
+            input_sender: Some(tx_b),
+            ..Default::default()
+        };
 
-        apply_child_env(
-            &mut cmd,
-            "/sandbox",
-            "sandbox",
-            "dumb",
-            None,
-            None,
-            &provider_env,
+        // Send data to channel A only.
+        state_a
+            .input_sender
+            .as_ref()
+            .unwrap()
+            .send(b"hello-a".to_vec())
+            .unwrap();
+        // Send data to channel B only.
+        state_b
+            .input_sender
+            .as_ref()
+            .unwrap()
+            .send(b"hello-b".to_vec())
+            .unwrap();
+
+        assert_eq!(rx_a.recv().unwrap(), b"hello-a");
+        assert_eq!(rx_b.recv().unwrap(), b"hello-b");
+
+        // EOF on channel A (drop sender) should not affect channel B.
+        state_a.input_sender.take();
+        assert!(
+            rx_a.recv().is_err(),
+            "channel A sender dropped, recv should fail"
         );
 
-        let output = cmd.output().expect("spawn env");
-        let stdout = String::from_utf8(output.stdout).expect("utf8");
+        // Channel B should still be functional.
+        state_b
+            .input_sender
+            .as_ref()
+            .unwrap()
+            .send(b"still-alive".to_vec())
+            .unwrap();
+        assert_eq!(rx_b.recv().unwrap(), b"still-alive");
+    }
 
-        assert!(!stdout.contains(SSH_HANDSHAKE_SECRET_ENV));
-        assert!(stdout.contains("ANTHROPIC_API_KEY=openshell:resolve:env:ANTHROPIC_API_KEY"));
+    /// `install_pre_exec_no_pty` runs drop_privileges and succeeds when the
+    /// current user/group is already the configured one (no actual uid change).
+    ///
+    /// This exercises the pre_exec hook end-to-end without needing root: a policy
+    /// with no run_as_user/group is a no-op when the process is already unprivileged.
+    #[cfg(unix)]
+    #[test]
+    fn pre_exec_always_calls_drop_privileges() {
+        use crate::policy::{
+            FilesystemPolicy, LandlockPolicy, NetworkPolicy, ProcessPolicy, SandboxPolicy,
+        };
+
+        // No user/group configured and not running as root → drop_privileges is
+        // a no-op, so spawn succeeds regardless of the effective UID.
+        let policy = SandboxPolicy {
+            version: 0,
+            filesystem: FilesystemPolicy::default(),
+            network: NetworkPolicy::default(),
+            landlock: LandlockPolicy::default(),
+            process: ProcessPolicy {
+                run_as_user: None,
+                run_as_group: None,
+            },
+        };
+
+        // Skip if running as root: drop_privileges would try to switch to
+        // "sandbox" which may not exist in the test environment.
+        if nix::unistd::geteuid().is_root() {
+            return;
+        }
+
+        let mut cmd = Command::new("echo");
+        cmd.arg("drop-privileges-ok");
+        cmd.stdout(Stdio::piped());
+
+        unsafe_pty::install_pre_exec_no_pty(
+            &mut cmd,
+            policy,
+            None,
+            None, // no netns fd
+            #[cfg(target_os = "linux")]
+            sandbox::linux::prepare(
+                &SandboxPolicy {
+                    version: 0,
+                    filesystem: FilesystemPolicy::default(),
+                    network: NetworkPolicy::default(),
+                    landlock: LandlockPolicy::default(),
+                    process: ProcessPolicy {
+                        run_as_user: None,
+                        run_as_group: None,
+                    },
+                },
+                None,
+            )
+            .expect("prepare should succeed in test environment"),
+        );
+
+        let output = cmd
+            .spawn()
+            .expect("spawn must succeed")
+            .wait_with_output()
+            .expect("wait_with_output");
+        assert!(output.status.success(), "echo should exit 0");
+        assert!(
+            String::from_utf8_lossy(&output.stdout).contains("drop-privileges-ok"),
+            "echo output should contain 'drop-privileges-ok'"
+        );
     }
 }

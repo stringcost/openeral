@@ -21,6 +21,7 @@ async fn run_isolated(args: &[&str]) -> (String, i32) {
         .env("XDG_CONFIG_HOME", tmpdir.path())
         .env("HOME", tmpdir.path())
         .env_remove("OPENSHELL_GATEWAY")
+        .env_remove("OPENSHELL_GATEWAY_ENDPOINT")
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
 
@@ -122,17 +123,22 @@ async fn sandbox_connect_help_shows_editor_flag() {
     );
 }
 
-/// `openshell gateway start --help` must show `--recreate`.
+/// `openshell gateway start --help` must show key flags.
 #[tokio::test]
-async fn gateway_start_help_shows_recreate() {
+async fn gateway_start_help_shows_key_flags() {
     let (output, code) = run_isolated(&["gateway", "start", "--help"]).await;
     assert_eq!(code, 0, "openshell gateway start --help should exit 0");
 
     let clean = strip_ansi(&output);
-    assert!(
-        clean.contains("--recreate"),
-        "expected '--recreate' in gateway start --help:\n{clean}"
-    );
+    for flag in [
+        "--gpu",
+        "--recreate",
+    ] {
+        assert!(
+            clean.contains(flag),
+            "expected '{flag}' in gateway start --help:\n{clean}"
+        );
+    }
 }
 
 // -------------------------------------------------------------------

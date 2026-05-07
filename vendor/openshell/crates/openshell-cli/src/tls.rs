@@ -6,9 +6,11 @@ use openshell_core::proto::inference_client::InferenceClient;
 use openshell_core::proto::open_shell_client::OpenShellClient;
 use rustls::{
     RootCertStore,
-    pki_types::{CertificateDer, PrivateKeyDer},
+    client::danger::{HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier},
+    pki_types::{CertificateDer, PrivateKeyDer, ServerName, UnixTime},
 };
 use std::collections::HashMap;
+use std::future::Future;
 use std::io::Cursor;
 use std::net::SocketAddr;
 use std::path::PathBuf;
@@ -34,6 +36,11 @@ pub struct TlsOptions {
     /// Edge auth bearer token — when set, disables mTLS client certs and
     /// injects authentication headers on every gRPC request instead.
     pub edge_token: Option<String>,
+    /// OIDC bearer token — when set, injects `authorization: Bearer <token>`
+    /// on every gRPC request. Takes precedence over `edge_token`.
+    pub oidc_token: Option<String>,
+    /// Skip TLS certificate verification for gateway connections.
+    pub gateway_insecure: bool,
 }
 
 impl TlsOptions {
@@ -44,6 +51,8 @@ impl TlsOptions {
             key,
             gateway_name: None,
             edge_token: None,
+            oidc_token: None,
+            gateway_insecure: false,
         }
     }
 
@@ -90,9 +99,9 @@ impl TlsOptions {
         }
     }
 
-    /// Returns `true` when using edge token auth (no mTLS client certs).
+    /// Returns `true` when using bearer token auth (edge or OIDC).
     pub fn is_bearer_auth(&self) -> bool {
-        self.edge_token.is_some()
+        self.edge_token.is_some() || self.oidc_token.is_some()
     }
 }
 
@@ -220,6 +229,86 @@ pub fn build_tonic_tls_config(materials: &TlsMaterials) -> ClientTlsConfig {
         .identity(identity)
 }
 
+#[derive(Debug)]
+struct InsecureServerCertVerifier;
+
+impl ServerCertVerifier for InsecureServerCertVerifier {
+    fn verify_server_cert(
+        &self,
+        _end_entity: &CertificateDer<'_>,
+        _intermediates: &[CertificateDer<'_>],
+        _server_name: &ServerName<'_>,
+        _ocsp_response: &[u8],
+        _now: UnixTime,
+    ) -> Result<ServerCertVerified, rustls::Error> {
+        Ok(ServerCertVerified::assertion())
+    }
+
+    fn verify_tls12_signature(
+        &self,
+        _message: &[u8],
+        _cert: &CertificateDer<'_>,
+        _dss: &rustls::DigitallySignedStruct,
+    ) -> Result<HandshakeSignatureValid, rustls::Error> {
+        Ok(HandshakeSignatureValid::assertion())
+    }
+
+    fn verify_tls13_signature(
+        &self,
+        _message: &[u8],
+        _cert: &CertificateDer<'_>,
+        _dss: &rustls::DigitallySignedStruct,
+    ) -> Result<HandshakeSignatureValid, rustls::Error> {
+        Ok(HandshakeSignatureValid::assertion())
+    }
+
+    fn supported_verify_schemes(&self) -> Vec<rustls::SignatureScheme> {
+        rustls::crypto::ring::default_provider()
+            .signature_verification_algorithms
+            .supported_schemes()
+    }
+}
+
+#[derive(Clone)]
+struct InsecureTlsConnector {
+    tls_connector: tokio_rustls::TlsConnector,
+}
+
+impl tower::Service<hyper::Uri> for InsecureTlsConnector {
+    type Response = hyper_util::rt::TokioIo<tokio_rustls::client::TlsStream<tokio::net::TcpStream>>;
+    type Error = Box<dyn std::error::Error + Send + Sync>;
+    type Future =
+        std::pin::Pin<Box<dyn Future<Output = Result<Self::Response, Self::Error>> + Send>>;
+
+    fn poll_ready(
+        &mut self,
+        _cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Result<(), Self::Error>> {
+        std::task::Poll::Ready(Ok(()))
+    }
+
+    fn call(&mut self, uri: hyper::Uri) -> Self::Future {
+        let tls_connector = self.tls_connector.clone();
+        Box::pin(async move {
+            let host = uri.host().unwrap_or("localhost").to_string();
+            let port = uri.port_u16().unwrap_or(443);
+            let addr = format!("{host}:{port}");
+            let tcp = tokio::net::TcpStream::connect(addr).await?;
+            let server_name = ServerName::try_from(host)?;
+            let tls_stream = tls_connector.connect(server_name, tcp).await?;
+            Ok(hyper_util::rt::TokioIo::new(tls_stream))
+        })
+    }
+}
+
+pub fn build_insecure_rustls_config() -> Result<rustls::ClientConfig> {
+    let config = rustls::ClientConfig::builder()
+        .dangerous()
+        .with_custom_certificate_verifier(std::sync::Arc::new(InsecureServerCertVerifier))
+        .with_no_client_auth();
+    Ok(config)
+}
+
 /// Tunnel proxy addresses keyed by upstream endpoint + token.
 ///
 /// Each distinct edge-authenticated gateway gets its own local proxy instead of
@@ -249,9 +338,19 @@ async fn edge_tunnel_addr(server: &str, token: &str) -> Result<SocketAddr> {
 }
 
 pub async fn build_channel(server: &str, tls: &TlsOptions) -> Result<Channel> {
-    // When edge bearer auth is active and the server is HTTPS,
+    if server.starts_with("http://") {
+        let endpoint = Endpoint::from_shared(server.to_string())
+            .into_diagnostic()?
+            .connect_timeout(Duration::from_secs(10))
+            .http2_keep_alive_interval(Duration::from_secs(10))
+            .keep_alive_while_idle(true);
+        return endpoint.connect().await.into_diagnostic();
+    }
+
+    // When Cloudflare edge bearer auth is active and the server is HTTPS,
     // route traffic through a local WebSocket tunnel proxy instead.
-    if tls.is_bearer_auth() && server.starts_with("https://") {
+    // OIDC tokens bypass the tunnel — they connect directly.
+    if tls.edge_token.is_some() && server.starts_with("https://") {
         let token = tls
             .edge_token
             .as_deref()
@@ -268,16 +367,51 @@ pub async fn build_channel(server: &str, tls: &TlsOptions) -> Result<Channel> {
         return endpoint.connect().await.into_diagnostic();
     }
 
+    if tls.gateway_insecure && server.starts_with("https://") {
+        tracing::warn!("TLS certificate verification is disabled — do not use in production");
+        let rustls_config = build_insecure_rustls_config()?;
+        let tls_connector = tokio_rustls::TlsConnector::from(std::sync::Arc::new(rustls_config));
+        let connector = InsecureTlsConnector { tls_connector };
+        // Use http:// so tonic does not layer its own TLS on top — our
+        // connector performs TLS with the insecure config.
+        let http_uri = server.replacen("https://", "http://", 1);
+        let endpoint = Endpoint::from_shared(http_uri)
+            .into_diagnostic()?
+            .connect_timeout(Duration::from_secs(10))
+            .http2_keep_alive_interval(Duration::from_secs(10))
+            .keep_alive_while_idle(true);
+        return endpoint
+            .connect_with_connector(connector)
+            .await
+            .into_diagnostic();
+    }
+
     let mut endpoint = Endpoint::from_shared(server.to_string())
         .into_diagnostic()?
         .connect_timeout(Duration::from_secs(10))
         .http2_keep_alive_interval(Duration::from_secs(10))
         .keep_alive_while_idle(true);
 
-    let tls_config = if tls.is_bearer_auth() {
-        // Bearer mode without HTTPS (e.g. http:// direct) — no tunnel needed,
-        // but also no TLS config to set. This branch shouldn't normally happen
-        // (edge endpoints are always HTTPS) but handle gracefully.
+    let tls_config = if tls.oidc_token.is_some() {
+        // OIDC bearer auth over HTTPS: use mTLS certs for the transport layer
+        // when available (server may still require client certs), and layer
+        // the Bearer token on top via the interceptor.
+        require_tls_materials(server, tls).map_or_else(
+            |_| {
+                let resolved = tls.with_default_paths(server);
+                resolved
+                    .ca
+                    .as_ref()
+                    .and_then(|ca_path| std::fs::read(ca_path).ok())
+                    .map_or_else(ClientTlsConfig::new, |ca_pem| {
+                        ClientTlsConfig::new().ca_certificate(Certificate::from_pem(ca_pem))
+                    })
+            },
+            |materials| build_tonic_tls_config(&materials),
+        )
+    } else if tls.edge_token.is_some() {
+        // Edge bearer mode — routed through tunnel above; if we reach here
+        // the server is not HTTPS so connect plaintext.
         return endpoint.connect().await.into_diagnostic();
     } else {
         // Standard mTLS: private CA + client cert.
@@ -299,22 +433,39 @@ pub async fn grpc_client(server: &str, tls: &TlsOptions) -> Result<GrpcClient> {
     Ok(OpenShellClient::with_interceptor(channel, interceptor))
 }
 
-/// Interceptor that injects edge authentication headers into every outgoing
-/// gRPC request. When no token is set, acts as a no-op.
+/// Interceptor that injects authentication headers into every outgoing gRPC request.
 ///
-/// Currently sends Cloudflare Access headers for compatibility:
-/// - `Cf-Access-Jwt-Assertion` header
-/// - `CF_Authorization` cookie
+/// Supports OIDC Bearer tokens (standard `authorization` header) and
+/// Cloudflare Access tokens (custom headers). When no token is set, acts
+/// as a no-op. OIDC takes precedence over edge tokens.
 #[derive(Clone)]
+#[allow(clippy::struct_field_names)]
 pub struct EdgeAuthInterceptor {
+    /// Standard `authorization: Bearer <token>` for OIDC.
+    bearer_value: Option<tonic::metadata::MetadataValue<tonic::metadata::Ascii>>,
+    /// CF-specific `Cf-Access-Jwt-Assertion` header.
     header_value: Option<tonic::metadata::MetadataValue<tonic::metadata::Ascii>>,
+    /// CF-specific `Cookie: CF_Authorization=<token>` header.
     cookie_value: Option<tonic::metadata::MetadataValue<tonic::metadata::Ascii>>,
 }
 
 impl EdgeAuthInterceptor {
     /// Create an interceptor from [`TlsOptions`].  Returns a no-op interceptor
-    /// when no edge token is configured.
+    /// when no auth token is configured.
     pub fn maybe_from(tls: &TlsOptions) -> Result<Self> {
+        // OIDC bearer token takes precedence.
+        if let Some(ref token) = tls.oidc_token {
+            let bearer: tonic::metadata::MetadataValue<tonic::metadata::Ascii> =
+                format!("Bearer {token}")
+                    .parse()
+                    .map_err(|_| miette::miette!("invalid OIDC token value"))?;
+            return Ok(Self {
+                bearer_value: Some(bearer),
+                header_value: None,
+                cookie_value: None,
+            });
+        }
+
         let (header_value, cookie_value) = match tls.edge_token.as_deref() {
             Some(t) => {
                 let hv: tonic::metadata::MetadataValue<tonic::metadata::Ascii> = t
@@ -329,6 +480,7 @@ impl EdgeAuthInterceptor {
             None => (None, None),
         };
         Ok(Self {
+            bearer_value: None,
             header_value,
             cookie_value,
         })
@@ -340,6 +492,9 @@ impl tonic::service::Interceptor for EdgeAuthInterceptor {
         &mut self,
         mut req: tonic::Request<()>,
     ) -> std::result::Result<tonic::Request<()>, tonic::Status> {
+        if let Some(ref val) = self.bearer_value {
+            req.metadata_mut().insert("authorization", val.clone());
+        }
         if let Some(ref val) = self.header_value {
             req.metadata_mut()
                 .insert("cf-access-jwt-assertion", val.clone());

@@ -8,12 +8,13 @@ use openshell_core::proto::open_shell_server::{OpenShell, OpenShellServer};
 use openshell_core::proto::{
     CreateProviderRequest, CreateSandboxRequest, CreateSshSessionRequest, CreateSshSessionResponse,
     DeleteProviderRequest, DeleteProviderResponse, DeleteSandboxRequest, DeleteSandboxResponse,
-    ExecSandboxEvent, ExecSandboxRequest, GetProviderRequest, GetSandboxPolicyRequest,
-    GetSandboxPolicyResponse, GetSandboxProviderEnvironmentRequest,
+    ExecSandboxEvent, ExecSandboxRequest, GatewayMessage, GetGatewayConfigRequest,
+    GetGatewayConfigResponse, GetProviderRequest, GetSandboxConfigRequest,
+    GetSandboxConfigResponse, GetSandboxProviderEnvironmentRequest,
     GetSandboxProviderEnvironmentResponse, GetSandboxRequest, HealthRequest, HealthResponse,
     ListProvidersRequest, ListProvidersResponse, ListSandboxesRequest, ListSandboxesResponse,
-    ProviderResponse, Sandbox, SandboxResponse, SandboxStreamEvent, ServiceStatus,
-    UpdateProviderRequest, WatchSandboxRequest,
+    ProviderResponse, Sandbox, SandboxPolicy, SandboxResponse, SandboxStreamEvent, ServiceStatus,
+    SupervisorMessage, UpdateProviderRequest, WatchSandboxRequest,
 };
 use rcgen::{
     BasicConstraints, Certificate, CertificateParams, ExtendedKeyUsagePurpose, IsCa, KeyPair,
@@ -110,9 +111,12 @@ impl OpenShell for TestOpenShell {
         *self.state.last_get_name.lock().await = Some(name.clone());
         Ok(Response::new(SandboxResponse {
             sandbox: Some(Sandbox {
-                id: "test-id".to_string(),
-                name,
-                namespace: "default".to_string(),
+                metadata: Some(openshell_core::proto::datamodel::v1::ObjectMeta {
+                    id: "test-id".to_string(),
+                    name,
+                    created_at_ms: 0,
+                    labels: std::collections::HashMap::new(),
+                }),
                 ..Default::default()
             }),
         }))
@@ -132,11 +136,29 @@ impl OpenShell for TestOpenShell {
         Ok(Response::new(DeleteSandboxResponse { deleted: true }))
     }
 
-    async fn get_sandbox_policy(
+    async fn get_sandbox_config(
         &self,
-        _request: tonic::Request<GetSandboxPolicyRequest>,
-    ) -> Result<Response<GetSandboxPolicyResponse>, Status> {
-        Ok(Response::new(GetSandboxPolicyResponse::default()))
+        request: tonic::Request<GetSandboxConfigRequest>,
+    ) -> Result<Response<GetSandboxConfigResponse>, Status> {
+        let req = request.into_inner();
+        assert_eq!(
+            req.sandbox_id, "test-id",
+            "sandbox_get --policy-only should pass the id from GetSandbox"
+        );
+        Ok(Response::new(GetSandboxConfigResponse {
+            policy: Some(SandboxPolicy {
+                version: 1,
+                ..Default::default()
+            }),
+            ..Default::default()
+        }))
+    }
+
+    async fn get_gateway_config(
+        &self,
+        _request: tonic::Request<GetGatewayConfigRequest>,
+    ) -> Result<Response<GetGatewayConfigResponse>, Status> {
+        Ok(Response::new(GetGatewayConfigResponse::default()))
     }
 
     async fn get_sandbox_provider_environment(
@@ -185,6 +207,20 @@ impl OpenShell for TestOpenShell {
         Ok(Response::new(ListProvidersResponse::default()))
     }
 
+    async fn list_provider_profiles(
+        &self,
+        _request: tonic::Request<openshell_core::proto::ListProviderProfilesRequest>,
+    ) -> Result<Response<openshell_core::proto::ListProviderProfilesResponse>, Status> {
+        Err(Status::unimplemented("not implemented in test"))
+    }
+
+    async fn get_provider_profile(
+        &self,
+        _request: tonic::Request<openshell_core::proto::GetProviderProfileRequest>,
+    ) -> Result<Response<openshell_core::proto::ProviderProfileResponse>, Status> {
+        Err(Status::unimplemented("not implemented in test"))
+    }
+
     async fn update_provider(
         &self,
         _request: tonic::Request<UpdateProviderRequest>,
@@ -203,6 +239,8 @@ impl OpenShell for TestOpenShell {
         tokio_stream::wrappers::ReceiverStream<Result<SandboxStreamEvent, Status>>;
     type ExecSandboxStream =
         tokio_stream::wrappers::ReceiverStream<Result<ExecSandboxEvent, Status>>;
+    type ConnectSupervisorStream =
+        tokio_stream::wrappers::ReceiverStream<Result<GatewayMessage, Status>>;
 
     async fn watch_sandbox(
         &self,
@@ -224,10 +262,10 @@ impl OpenShell for TestOpenShell {
         )))
     }
 
-    async fn update_sandbox_policy(
+    async fn update_config(
         &self,
-        _request: tonic::Request<openshell_core::proto::UpdateSandboxPolicyRequest>,
-    ) -> Result<Response<openshell_core::proto::UpdateSandboxPolicyResponse>, Status> {
+        _request: tonic::Request<openshell_core::proto::UpdateConfigRequest>,
+    ) -> Result<Response<openshell_core::proto::UpdateConfigResponse>, Status> {
         Err(Status::unimplemented("not implemented in test"))
     }
 
@@ -328,6 +366,23 @@ impl OpenShell for TestOpenShell {
     ) -> Result<Response<openshell_core::proto::GetDraftHistoryResponse>, Status> {
         Err(Status::unimplemented("not implemented in test"))
     }
+
+    async fn connect_supervisor(
+        &self,
+        _request: tonic::Request<tonic::Streaming<SupervisorMessage>>,
+    ) -> Result<Response<Self::ConnectSupervisorStream>, Status> {
+        Err(Status::unimplemented("not implemented in test"))
+    }
+
+    type RelayStreamStream =
+        tokio_stream::wrappers::ReceiverStream<Result<openshell_core::proto::RelayFrame, Status>>;
+
+    async fn relay_stream(
+        &self,
+        _request: tonic::Request<tonic::Streaming<openshell_core::proto::RelayFrame>>,
+    ) -> Result<Response<Self::RelayStreamStream>, Status> {
+        Err(Status::unimplemented("not implemented in test"))
+    }
 }
 
 // ── helpers ───────────────────────────────────────────────────────────
@@ -425,7 +480,7 @@ async fn run_server() -> TestServer {
 async fn sandbox_get_sends_correct_name() {
     let ts = run_server().await;
 
-    run::sandbox_get(&ts.endpoint, "my-sandbox", &ts.tls)
+    run::sandbox_get(&ts.endpoint, "my-sandbox", false, &ts.tls)
         .await
         .expect("sandbox_get should succeed");
 
@@ -435,6 +490,19 @@ async fn sandbox_get_sends_correct_name() {
         Some("my-sandbox"),
         "mock should have recorded the requested sandbox name"
     );
+}
+
+/// `sandbox_get` with `policy_only` calls `GetSandboxConfig` and prints YAML from the response.
+#[tokio::test]
+async fn sandbox_get_policy_only_round_trip() {
+    let ts = run_server().await;
+
+    run::sandbox_get(&ts.endpoint, "my-sandbox", true, &ts.tls)
+        .await
+        .expect("sandbox_get with policy_only should succeed");
+
+    let recorded = ts.openshell.state.last_get_name.lock().await.clone();
+    assert_eq!(recorded.as_deref(), Some("my-sandbox"));
 }
 
 /// End-to-end: save a last-used sandbox, load it back, then call `sandbox_get`
@@ -455,7 +523,7 @@ async fn sandbox_get_with_persisted_last_sandbox() {
     assert_eq!(resolved, "persisted-sb");
 
     // Call sandbox_get with the resolved name.
-    run::sandbox_get(&ts.endpoint, &resolved, &ts.tls)
+    run::sandbox_get(&ts.endpoint, &resolved, false, &ts.tls)
         .await
         .expect("sandbox_get should succeed");
 
@@ -477,7 +545,7 @@ async fn explicit_name_takes_precedence_over_persisted() {
     // Persist one name, but supply a different one explicitly.
     save_last_sandbox("my-cluster", "old-sandbox").expect("save should succeed");
 
-    run::sandbox_get(&ts.endpoint, "explicit-sandbox", &ts.tls)
+    run::sandbox_get(&ts.endpoint, "explicit-sandbox", false, &ts.tls)
         .await
         .expect("sandbox_get should succeed");
 

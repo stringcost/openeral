@@ -549,8 +549,16 @@ fn seed_dir_recursive<'a>(
                 };
                 let _ = create_file(pool, &dir).await;
                 *count += 1;
-                seed_dir_recursive(pool, workspace_id, &entry.path(), &child_path, uid, gid, count)
-                    .await?;
+                seed_dir_recursive(
+                    pool,
+                    workspace_id,
+                    &entry.path(),
+                    &child_path,
+                    uid,
+                    gid,
+                    count,
+                )
+                .await?;
             } else if file_type.is_file() {
                 let content = tokio::fs::read(entry.path())
                     .await

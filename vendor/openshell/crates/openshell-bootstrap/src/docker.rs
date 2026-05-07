@@ -2,14 +2,15 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use crate::RemoteOptions;
-use crate::constants::{container_name, network_name, volume_name};
-use crate::image::{self, DEFAULT_REGISTRY, parse_image_ref};
+use crate::constants::{container_name, network_name, node_name, volume_name};
+use crate::image::{self, DEFAULT_IMAGE_REPO_BASE, DEFAULT_REGISTRY, parse_image_ref};
 use bollard::API_DEFAULT_VERSION;
 use bollard::Docker;
 use bollard::errors::Error as BollardError;
 use bollard::models::{
-    ContainerCreateBody, DeviceRequest, HostConfig, HostConfigCgroupnsModeEnum,
-    NetworkCreateRequest, NetworkDisconnectRequest, PortBinding, VolumeCreateRequest,
+    ContainerCreateBody, DeviceRequest, EndpointSettings, HostConfig, HostConfigCgroupnsModeEnum,
+    NetworkConnectRequest, NetworkCreateRequest, NetworkDisconnectRequest, PortBinding,
+    RestartPolicy, RestartPolicyNameEnum, VolumeCreateRequest,
 };
 use bollard::query_parameters::{
     CreateContainerOptions, CreateImageOptions, InspectContainerOptions, InspectNetworkOptions,
@@ -21,6 +22,47 @@ use miette::{IntoDiagnostic, Result, WrapErr};
 use std::collections::HashMap;
 
 const REGISTRY_NAMESPACE_DEFAULT: &str = "openshell";
+
+/// Default total HTTP timeout for Docker API calls that stream large payloads
+/// (e.g. `docker save` used by `sandbox create --from`). Bollard's own
+/// `connect_with_local_defaults()` ceiling is 120s, which is far too short for
+/// multi-GB image exports — a 7 GB image on a laptop SSD takes ~4–5 minutes.
+/// One hour is a safe upper bound; override with `OPENSHELL_DOCKER_TIMEOUT_SECS`.
+pub const DEFAULT_LARGE_TRANSFER_TIMEOUT_SECS: u64 = 3600;
+
+/// Build a local-Docker client suitable for large streaming transfers.
+/// Respects `OPENSHELL_DOCKER_TIMEOUT_SECS` (in seconds); falls back to
+/// [`DEFAULT_LARGE_TRANSFER_TIMEOUT_SECS`] when unset or unparseable.
+pub fn connect_local_for_large_transfers() -> std::result::Result<Docker, BollardError> {
+    let secs: u64 = std::env::var("OPENSHELL_DOCKER_TIMEOUT_SECS")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(DEFAULT_LARGE_TRANSFER_TIMEOUT_SECS);
+    Ok(Docker::connect_with_local_defaults()?.with_timeout(std::time::Duration::from_secs(secs)))
+}
+
+/// Resolve the raw GPU device-ID list, replacing the `"auto"` sentinel with a
+/// concrete device ID based on whether CDI is enabled on the daemon.
+///
+/// | Input        | Output                                                       |
+/// |--------------|--------------------------------------------------------------|
+/// | `[]`         | `[]`  — no GPU                                               |
+/// | `["legacy"]` | `["legacy"]`  — pass through to the non-CDI fallback path    |
+/// | `["auto"]`   | `["nvidia.com/gpu=all"]` if CDI enabled, else `["legacy"]`   |
+/// | `[cdi-ids…]` | unchanged                                                    |
+pub fn resolve_gpu_device_ids(gpu: &[String], cdi_enabled: bool) -> Vec<String> {
+    match gpu {
+        [] => vec![],
+        [v] if v == "auto" => {
+            if cdi_enabled {
+                vec!["nvidia.com/gpu=all".to_string()]
+            } else {
+                vec!["legacy".to_string()]
+            }
+        }
+        other => other.to_vec(),
+    }
+}
 
 const REGISTRY_MODE_EXTERNAL: &str = "external";
 
@@ -38,51 +80,6 @@ fn env_bool(key: &str) -> Option<bool> {
             "1" | "true" | "yes" | "on"
         )
     })
-}
-
-fn gateway_image_repo_base_override_from_context(
-    explicit_repo_base: Option<&str>,
-    image_ref: &str,
-    registry_host: &str,
-    registry_namespace: &str,
-) -> Option<String> {
-    if let Some(repo_base) = explicit_repo_base
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-    {
-        return Some(repo_base.to_string());
-    }
-
-    // When the cluster image itself encodes the OpenShell image family
-    // (`.../cluster:<tag>`), let the cluster entrypoint decide which sibling
-    // gateway repo to use. This preserves baked openeral defaults such as the
-    // in-cluster registry host used by local development.
-    if image::derive_image_repo_base_from_cluster_ref(image_ref).is_some() {
-        return None;
-    }
-
-    // Fallback for non-canonical image refs or alternate registries where the
-    // cluster cannot infer the repo base from its own image reference.
-    if registry_host != DEFAULT_REGISTRY || registry_namespace != REGISTRY_NAMESPACE_DEFAULT {
-        return Some(format!("{registry_host}/{registry_namespace}"));
-    }
-
-    None
-}
-
-fn gateway_image_repo_base_override(
-    image_ref: &str,
-    registry_host: &str,
-    registry_namespace: &str,
-) -> Option<String> {
-    let explicit_repo_base =
-        env_non_empty("IMAGE_REPO_BASE").or_else(|| env_non_empty("OPENSHELL_IMAGE_REPO_BASE"));
-    gateway_image_repo_base_override_from_context(
-        explicit_repo_base.as_deref(),
-        image_ref,
-        registry_host,
-        registry_namespace,
-    )
 }
 
 /// Platform information for a Docker daemon host.
@@ -349,22 +346,25 @@ pub async fn find_gateway_container(docker: &Docker, port: Option<u16>) -> Resul
 
     let matches: Vec<String> = containers
         .iter()
-        .filter(|c| is_gateway_image(c) && port.map_or(true, |p| has_port(c, p)))
+        .filter(|c| is_gateway_image(c) && port.is_none_or(|p| has_port(c, p)))
         .filter_map(container_name)
         .collect();
 
     match matches.len() {
         0 => {
-            let hint = if let Some(p) = port {
-                format!(
-                    "No openshell gateway container found listening on port {p}.\n\
+            let hint = port.map_or_else(
+                || {
+                    "No openshell gateway container found.\n\
                      Is the gateway running? Check with: docker ps"
-                )
-            } else {
-                "No openshell gateway container found.\n\
-                 Is the gateway running? Check with: docker ps"
-                    .to_string()
-            };
+                        .to_string()
+                },
+                |p| {
+                    format!(
+                        "No openshell gateway container found listening on port {p}.\n\
+                         Is the gateway running? Check with: docker ps"
+                    )
+                },
+            );
             Err(miette::miette!("{hint}"))
         }
         1 => Ok(matches.into_iter().next().unwrap()),
@@ -488,6 +488,11 @@ pub async fn ensure_image(
     Ok(())
 }
 
+/// Returns the actual host port the container is using.  When an existing
+/// container is reused (same image), this may differ from `gateway_port`
+/// because the container was originally created with a different port.
+// Refactoring this signature would touch many call sites across the workspace.
+#[allow(clippy::too_many_arguments)]
 pub async fn ensure_container(
     docker: &Docker,
     name: &str,
@@ -499,8 +504,15 @@ pub async fn ensure_container(
     disable_gateway_auth: bool,
     registry_username: Option<&str>,
     registry_token: Option<&str>,
-    gpu: bool,
-) -> Result<()> {
+    device_ids: &[String],
+    resume: bool,
+    oidc_issuer: Option<&str>,
+    oidc_audience: &str,
+    oidc_roles_claim: Option<&str>,
+    oidc_admin_role: Option<&str>,
+    oidc_user_role: Option<&str>,
+    oidc_scopes_claim: Option<&str>,
+) -> Result<u16> {
     let container_name = container_name(name);
 
     // Check if the container already exists
@@ -509,33 +521,69 @@ pub async fn ensure_container(
         .await
     {
         Ok(info) => {
-            // Container exists — verify it is using the expected image.
-            // Resolve the desired image ref to its content-addressable ID so we
-            // can compare against the container's image field (which Docker
-            // stores as an ID).
-            let desired_id = docker
-                .inspect_image(image_ref)
-                .await
-                .ok()
-                .and_then(|img| img.id);
+            // On resume we always reuse the existing container — the persistent
+            // volume holds k3s etcd state, and recreating the container with
+            // different env vars would cause the entrypoint to rewrite the
+            // HelmChart manifest, triggering a Helm upgrade that changes the
+            // StatefulSet image reference while the old pod still runs with the
+            // previous image.  Reusing the container avoids this entirely.
+            //
+            // On a non-resume path we check whether the image changed and
+            // recreate only when necessary.
+            let reuse = if resume {
+                true
+            } else {
+                let desired_id = docker
+                    .inspect_image(image_ref)
+                    .await
+                    .ok()
+                    .and_then(|img| img.id);
 
-            let container_image_id = info.image;
+                let container_image_id = info.image.clone();
 
-            let image_matches = match (&desired_id, &container_image_id) {
-                (Some(desired), Some(current)) => desired == current,
-                _ => false,
+                match (&desired_id, &container_image_id) {
+                    (Some(desired), Some(current)) => desired == current,
+                    _ => false,
+                }
             };
 
-            if image_matches {
-                return Ok(());
+            if reuse {
+                // The container exists and should be reused. Its network
+                // attachment may be stale. When the gateway is resumed after a
+                // container kill, `ensure_network` destroys and recreates the
+                // Docker network (giving it a new ID). The stopped container
+                // still references the old network ID, so `docker start` would
+                // fail with "network <old-id> not found".
+                //
+                // Fix: disconnect from any existing networks and reconnect to
+                // the current (just-created) network before returning.
+                let expected_net = network_name(name);
+                reconcile_container_network(docker, &container_name, &expected_net).await?;
+
+                // Read the actual host port from the container's port bindings
+                // as a cross-check.  The caller should already pass the correct
+                // port (from stored metadata), but this catches mismatches if
+                // the container was recreated with a different port externally.
+                let actual_port = info
+                    .host_config
+                    .as_ref()
+                    .and_then(|hc| hc.port_bindings.as_ref())
+                    .and_then(|pb| pb.get("30051/tcp"))
+                    .and_then(|bindings| bindings.as_ref())
+                    .and_then(|bindings| bindings.first())
+                    .and_then(|b| b.host_port.as_ref())
+                    .and_then(|p| p.parse::<u16>().ok())
+                    .unwrap_or(gateway_port);
+
+                return Ok(actual_port);
             }
 
-            // Image changed — remove the stale container so we can recreate it
+            // Image changed — remove the stale container so we can recreate it.
             tracing::info!(
                 "Container {} exists but uses a different image (container={}, desired={}), recreating",
                 container_name,
-                container_image_id.as_deref().map_or("unknown", truncate_id),
-                desired_id.as_deref().map_or("unknown", truncate_id),
+                info.image.as_deref().map_or("unknown", truncate_id),
+                image_ref,
             );
 
             let _ = docker.stop_container(&container_name, None).await;
@@ -577,6 +625,12 @@ pub async fn ensure_container(
         port_bindings: Some(port_bindings),
         binds: Some(vec![format!("{}:/var/lib/rancher/k3s", volume_name(name))]),
         network_mode: Some(network_name(name)),
+        // Automatically restart the container when Docker restarts, unless the
+        // user explicitly stopped it with `gateway stop`.
+        restart_policy: Some(RestartPolicy {
+            name: Some(RestartPolicyNameEnum::UNLESS_STOPPED),
+            maximum_retry_count: None,
+        }),
         // Add host gateway aliases for DNS resolution.
         // This allows both the entrypoint script and the running gateway
         // process to reach services on the Docker host.
@@ -587,21 +641,35 @@ pub async fn ensure_container(
         ..Default::default()
     };
 
-    // When GPU support is requested, add NVIDIA device requests.
-    // This is the programmatic equivalent of `docker run --gpus all`.
-    // The NVIDIA Container Toolkit runtime hook injects /dev/nvidia* devices
-    // and GPU driver libraries from the host into the container.
-    if gpu {
-        host_config.device_requests = Some(vec![DeviceRequest {
-            driver: Some("nvidia".to_string()),
-            count: Some(-1), // all GPUs
-            capabilities: Some(vec![vec![
-                "gpu".to_string(),
-                "utility".to_string(),
-                "compute".to_string(),
-            ]]),
-            ..Default::default()
-        }]);
+    // Inject GPU devices into the container based on the resolved device ID list.
+    //
+    // The list is pre-resolved by `resolve_gpu_device_ids` before reaching here:
+    //   []           — no GPU passthrough
+    //   ["legacy"]   — internal non-CDI fallback path: `driver="nvidia"`,
+    //                  `count=-1`; relies on the NVIDIA Container Runtime hook
+    //   [cdi-ids…]   — CDI DeviceRequest (driver="cdi") with the given device IDs;
+    //                  Docker resolves them against the host CDI spec at /etc/cdi/
+    match device_ids {
+        [] => {}
+        [id] if id == "legacy" => {
+            host_config.device_requests = Some(vec![DeviceRequest {
+                driver: Some("nvidia".to_string()),
+                count: Some(-1), // all GPUs
+                capabilities: Some(vec![vec![
+                    "gpu".to_string(),
+                    "utility".to_string(),
+                    "compute".to_string(),
+                ]]),
+                ..Default::default()
+            }]);
+        }
+        ids => {
+            host_config.device_requests = Some(vec![DeviceRequest {
+                driver: Some("cdi".to_string()),
+                device_ids: Some(ids.to_vec()),
+                ..Default::default()
+            }]);
+        }
     }
 
     let mut cmd = vec![
@@ -622,8 +690,16 @@ pub async fn ensure_container(
         env_non_empty("OPENSHELL_REGISTRY_HOST").unwrap_or_else(|| DEFAULT_REGISTRY.to_string());
     let registry_namespace = env_non_empty("OPENSHELL_REGISTRY_NAMESPACE")
         .unwrap_or_else(|| REGISTRY_NAMESPACE_DEFAULT.to_string());
-    let image_repo_base =
-        gateway_image_repo_base_override(image_ref, &registry_host, &registry_namespace);
+    let image_repo_base = env_non_empty("IMAGE_REPO_BASE")
+        .or_else(|| env_non_empty("OPENSHELL_IMAGE_REPO_BASE"))
+        .unwrap_or_else(|| {
+            if registry_host == DEFAULT_REGISTRY {
+                // For ghcr.io the default namespace is the full org path.
+                DEFAULT_IMAGE_REPO_BASE.to_string()
+            } else {
+                format!("{registry_host}/{registry_namespace}")
+            }
+        });
     let registry_insecure = env_bool("OPENSHELL_REGISTRY_INSECURE").unwrap_or(false);
     let registry_endpoint = env_non_empty("OPENSHELL_REGISTRY_ENDPOINT");
 
@@ -646,10 +722,13 @@ pub async fn ensure_container(
         format!("REGISTRY_MODE={REGISTRY_MODE_EXTERNAL}"),
         format!("REGISTRY_HOST={registry_host}"),
         format!("REGISTRY_INSECURE={registry_insecure}"),
+        format!("IMAGE_REPO_BASE={image_repo_base}"),
+        // Deterministic k3s node name so the node identity survives container
+        // recreation (e.g. after an image upgrade). Without this, k3s uses
+        // the container ID as the hostname/node name, which changes on every
+        // container recreate and triggers stale-node PVC cleanup.
+        format!("OPENSHELL_NODE_NAME={}", node_name(name)),
     ];
-    if let Some(image_repo_base) = image_repo_base {
-        env_vars.push(format!("IMAGE_REPO_BASE={image_repo_base}"));
-    }
     if let Some(endpoint) = registry_endpoint {
         env_vars.push(format!("REGISTRY_ENDPOINT={endpoint}"));
     }
@@ -676,10 +755,7 @@ pub async fn ensure_container(
     // When OPENSHELL_PUSH_IMAGES is set the entrypoint overrides the baked-in
     // HelmChart manifest so k3s uses the locally-pushed images with
     // IfNotPresent pull policy instead of pulling from the remote registry.
-    let push_mode = std::env::var("OPENSHELL_PUSH_IMAGES")
-        .ok()
-        .filter(|v| !v.trim().is_empty())
-        .is_some();
+    let push_mode = std::env::var("OPENSHELL_PUSH_IMAGES").is_ok_and(|v| !v.trim().is_empty());
     let effective_tag = std::env::var("IMAGE_TAG")
         .ok()
         .filter(|v| !v.trim().is_empty())
@@ -710,36 +786,41 @@ pub async fn ensure_container(
 
     // GPU support: tell the entrypoint to deploy the NVIDIA device plugin
     // HelmChart CR so k8s workloads can request nvidia.com/gpu resources.
-    if gpu {
+    if !device_ids.is_empty() {
         env_vars.push("GPU_ENABLED=true".to_string());
     }
 
-    if let Some(enabled) = env_non_empty("OPENERAL_PACKAGE_PROXY_ENABLED") {
-        env_vars.push(format!("OPENERAL_PACKAGE_PROXY_ENABLED={enabled}"));
-    }
-    if let Some(profile) = env_non_empty("OPENERAL_PACKAGE_PROXY_PROFILE") {
-        env_vars.push(format!("OPENERAL_PACKAGE_PROXY_PROFILE={profile}"));
-    }
-    if let Some(upstream_url) = env_non_empty("OPENERAL_PACKAGE_PROXY_UPSTREAM_URL") {
-        env_vars.push(format!(
-            "OPENERAL_PACKAGE_PROXY_UPSTREAM_URL={upstream_url}"
-        ));
-    }
-    if let Some(ca_secret_name) = env_non_empty("OPENERAL_PACKAGE_PROXY_CA_SECRET_NAME") {
-        env_vars.push(format!(
-            "OPENERAL_PACKAGE_PROXY_CA_SECRET_NAME={ca_secret_name}"
-        ));
-    }
-    if let Some(auth_secret_name) = env_non_empty("OPENERAL_PACKAGE_PROXY_AUTH_SECRET_NAME") {
-        env_vars.push(format!(
-            "OPENERAL_PACKAGE_PROXY_AUTH_SECRET_NAME={auth_secret_name}"
-        ));
+    // OIDC JWT authentication: pass issuer and audience to the entrypoint
+    // so the HelmChart manifest configures the server pod for JWT validation.
+    if let Some(issuer) = oidc_issuer {
+        env_vars.push(format!("OIDC_ISSUER={issuer}"));
+        env_vars.push(format!("OIDC_AUDIENCE={oidc_audience}"));
+        if let Some(claim) = oidc_roles_claim {
+            env_vars.push(format!("OIDC_ROLES_CLAIM={claim}"));
+        }
+        if let Some(role) = oidc_admin_role {
+            env_vars.push(format!("OIDC_ADMIN_ROLE={role}"));
+        }
+        if let Some(role) = oidc_user_role {
+            env_vars.push(format!("OIDC_USER_ROLE={role}"));
+        }
+        if let Some(claim) = oidc_scopes_claim {
+            env_vars.push(format!("OIDC_SCOPES_CLAIM={claim}"));
+        }
     }
 
     let env = Some(env_vars);
 
     let config = ContainerCreateBody {
         image: Some(image_ref.to_string()),
+        // Set the container hostname to the deterministic node name.
+        // k3s uses the container hostname as its default node name.  Without
+        // this, Docker defaults to the container ID (first 12 hex chars),
+        // which changes on every container recreation and can cause
+        // `clean_stale_nodes` to delete the wrong node on resume.  The
+        // hostname persists across container stop/start cycles, ensuring a
+        // stable node identity.
+        hostname: Some(node_name(name)),
         cmd: Some(cmd),
         env,
         exposed_ports: Some(exposed_ports),
@@ -758,7 +839,7 @@ pub async fn ensure_container(
         .await
         .into_diagnostic()
         .wrap_err("failed to create gateway container")?;
-    Ok(())
+    Ok(gateway_port)
 }
 
 /// Information about a container that is holding a port we need.
@@ -809,22 +890,22 @@ pub async fn check_port_conflicts(
 
         let ports = container.ports.as_deref().unwrap_or_default();
         for port in ports {
-            if let Some(public) = port.public_port {
-                if needed_ports.contains(&public) {
-                    let cname = names
-                        .first()
-                        .map(|n| n.trim_start_matches('/').to_string())
-                        .unwrap_or_else(|| {
-                            container
-                                .id
-                                .clone()
-                                .unwrap_or_else(|| "<unknown>".to_string())
-                        });
-                    conflicts.push(PortConflict {
-                        container_name: cname,
-                        host_port: public,
-                    });
-                }
+            if let Some(public) = port.public_port
+                && needed_ports.contains(&public)
+            {
+                let cname = names.first().map_or_else(
+                    || {
+                        container
+                            .id
+                            .clone()
+                            .unwrap_or_else(|| "<unknown>".to_string())
+                    },
+                    |n| n.trim_start_matches('/').to_string(),
+                );
+                conflicts.push(PortConflict {
+                    container_name: cname,
+                    host_port: public,
+                });
             }
         }
     }
@@ -980,6 +1061,48 @@ pub async fn destroy_gateway_resources(docker: &Docker, name: &str) -> Result<()
     Ok(())
 }
 
+/// Clean up the gateway container and network, preserving the persistent volume.
+///
+/// Used when a resume attempt fails — we want to remove the container we may
+/// have just created but keep the volume so the user can retry without losing
+/// their k3s/etcd state and sandbox data.
+pub async fn cleanup_gateway_container(docker: &Docker, name: &str) -> Result<()> {
+    let container_name = container_name(name);
+    let net_name = network_name(name);
+
+    // Disconnect container from network
+    let _ = docker
+        .disconnect_network(
+            &net_name,
+            NetworkDisconnectRequest {
+                container: container_name.clone(),
+                force: Some(true),
+            },
+        )
+        .await;
+
+    let _ = stop_container(docker, &container_name).await;
+
+    let remove_container = docker
+        .remove_container(
+            &container_name,
+            Some(RemoveContainerOptions {
+                force: true,
+                ..Default::default()
+            }),
+        )
+        .await;
+    if let Err(err) = remove_container
+        && !is_not_found(&err)
+    {
+        return Err(err).into_diagnostic();
+    }
+
+    force_remove_network(docker, &net_name).await?;
+
+    Ok(())
+}
+
 /// Forcefully remove a Docker network, disconnecting any remaining
 /// containers first. This ensures that stale Docker network endpoints
 /// cannot prevent port bindings from being released.
@@ -1015,6 +1138,71 @@ async fn force_remove_network(docker: &Docker, net_name: &str) -> Result<()> {
             .into_diagnostic()
             .wrap_err("failed to remove Docker network"),
     }
+}
+
+/// Ensure a stopped container is connected to the expected Docker network.
+///
+/// When a gateway is resumed after the container was killed (but not removed),
+/// `ensure_network` destroys and recreates the network with a new ID. The
+/// stopped container still holds a reference to the old network ID in its
+/// config, so `docker start` would fail with a 404 "network not found" error.
+///
+/// This function disconnects the container from any networks that no longer
+/// match the expected network name and connects it to the correct one.
+async fn reconcile_container_network(
+    docker: &Docker,
+    container_name: &str,
+    expected_network: &str,
+) -> Result<()> {
+    let info = docker
+        .inspect_container(container_name, None::<InspectContainerOptions>)
+        .await
+        .into_diagnostic()
+        .wrap_err("failed to inspect container for network reconciliation")?;
+
+    // Check the container's current network attachments via NetworkSettings.
+    let attached_networks: Vec<String> = info
+        .network_settings
+        .as_ref()
+        .and_then(|ns| ns.networks.as_ref())
+        .map(|nets| nets.keys().cloned().collect())
+        .unwrap_or_default();
+
+    // If the container is already attached to the expected network (by name),
+    // Docker will resolve the name to the current network ID on start.
+    // However, when the network was destroyed and recreated, the container's
+    // stored endpoint references the old ID. Disconnect and reconnect to
+    // pick up the new network ID.
+    for net_name in &attached_networks {
+        let _ = docker
+            .disconnect_network(
+                net_name,
+                NetworkDisconnectRequest {
+                    container: container_name.to_string(),
+                    force: Some(true),
+                },
+            )
+            .await;
+    }
+
+    // Connect to the (freshly created) expected network.
+    docker
+        .connect_network(
+            expected_network,
+            NetworkConnectRequest {
+                container: container_name.to_string(),
+                endpoint_config: Some(EndpointSettings::default()),
+            },
+        )
+        .await
+        .into_diagnostic()
+        .wrap_err("failed to connect container to gateway network")?;
+
+    tracing::debug!(
+        "Reconciled network for container {container_name}: disconnected from {attached_networks:?}, connected to {expected_network}"
+    );
+
+    Ok(())
 }
 
 fn is_not_found(err: &BollardError) -> bool {
@@ -1210,6 +1398,9 @@ mod tests {
         );
     }
 
+    // Test-only: mutates DOCKER_HOST env var via std::env::set_var/remove_var,
+    // which require unsafe in the 2024 edition.
+    #[allow(unsafe_code)]
     #[test]
     fn docker_not_reachable_error_with_docker_host() {
         // Simulate: DOCKER_HOST is set but daemon unresponsive.
@@ -1257,42 +1448,52 @@ mod tests {
         );
     }
 
+    // --- resolve_gpu_device_ids ---
+
     #[test]
-    fn gateway_repo_override_prefers_explicit_override() {
-        let repo_base = gateway_image_repo_base_override_from_context(
-            Some("ghcr.io/acme/openeral"),
-            "ghcr.io/acme/openeral/cluster:sha-test",
-            DEFAULT_REGISTRY,
-            REGISTRY_NAMESPACE_DEFAULT,
-        );
-        assert_eq!(repo_base.as_deref(), Some("ghcr.io/acme/openeral"));
+    fn resolve_gpu_empty_returns_empty() {
+        assert_eq!(resolve_gpu_device_ids(&[], true), Vec::<String>::new());
+        assert_eq!(resolve_gpu_device_ids(&[], false), Vec::<String>::new());
     }
 
     #[test]
-    fn gateway_repo_override_omits_cluster_derived_repo_base() {
-        let repo_base = gateway_image_repo_base_override_from_context(
-            None,
-            "127.0.0.1:5000/openshell/openeral/cluster:dev",
-            "172.17.0.1:5000",
-            REGISTRY_NAMESPACE_DEFAULT,
-        );
-        assert!(
-            repo_base.is_none(),
-            "cluster image refs should defer to the cluster entrypoint defaults"
+    fn resolve_gpu_auto_cdi_enabled() {
+        assert_eq!(
+            resolve_gpu_device_ids(&["auto".to_string()], true),
+            vec!["nvidia.com/gpu=all"],
         );
     }
 
     #[test]
-    fn gateway_repo_override_uses_custom_registry_when_not_inferable() {
-        let repo_base = gateway_image_repo_base_override_from_context(
-            None,
-            "cluster-local:dev",
-            "registry.internal:5000",
-            "openshell/openeral",
+    fn resolve_gpu_auto_cdi_disabled() {
+        assert_eq!(
+            resolve_gpu_device_ids(&["auto".to_string()], false),
+            vec!["legacy"],
+        );
+    }
+
+    #[test]
+    fn resolve_gpu_legacy_passthrough() {
+        assert_eq!(
+            resolve_gpu_device_ids(&["legacy".to_string()], true),
+            vec!["legacy"],
         );
         assert_eq!(
-            repo_base.as_deref(),
-            Some("registry.internal:5000/openshell/openeral")
+            resolve_gpu_device_ids(&["legacy".to_string()], false),
+            vec!["legacy"],
         );
+    }
+
+    #[test]
+    fn resolve_gpu_cdi_ids_passthrough() {
+        let ids = vec!["nvidia.com/gpu=all".to_string()];
+        assert_eq!(resolve_gpu_device_ids(&ids, true), ids);
+        assert_eq!(resolve_gpu_device_ids(&ids, false), ids);
+
+        let multi = vec![
+            "nvidia.com/gpu=0".to_string(),
+            "nvidia.com/gpu=1".to_string(),
+        ];
+        assert_eq!(resolve_gpu_device_ids(&multi, true), multi);
     }
 }

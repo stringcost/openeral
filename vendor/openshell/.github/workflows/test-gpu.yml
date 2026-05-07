@@ -1,0 +1,56 @@
+name: GPU Test
+
+on:
+  push:
+    branches:
+      - "pull-request/[0-9]+"
+  workflow_dispatch: {}
+  # Add `schedule:` here when we want nightly coverage from the same workflow.
+
+permissions: {}
+
+jobs:
+  pr_metadata:
+    name: Resolve PR metadata
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      pull-requests: read
+    outputs:
+      should_run: ${{ steps.gate.outputs.should_run }}
+    steps:
+      - uses: actions/checkout@v6
+      - id: gate
+        uses: ./.github/actions/pr-gate
+        with:
+          required_label: test:e2e-gpu
+
+  build-gateway:
+    needs: [pr_metadata]
+    if: needs.pr_metadata.outputs.should_run == 'true'
+    permissions:
+      contents: read
+      packages: write
+    uses: ./.github/workflows/docker-build.yml
+    with:
+      component: gateway
+
+  build-cluster:
+    needs: [pr_metadata]
+    if: needs.pr_metadata.outputs.should_run == 'true'
+    permissions:
+      contents: read
+      packages: write
+    uses: ./.github/workflows/docker-build.yml
+    with:
+      component: cluster
+
+  e2e-gpu:
+    needs: [pr_metadata, build-gateway, build-cluster]
+    if: needs.pr_metadata.outputs.should_run == 'true'
+    permissions:
+      contents: read
+      packages: read
+    uses: ./.github/workflows/e2e-gpu-test.yaml
+    with:
+      image-tag: ${{ github.sha }}

@@ -11,12 +11,14 @@ use hyper_util::{
 use openshell_core::proto::{
     CreateProviderRequest, CreateSandboxRequest, CreateSshSessionRequest, CreateSshSessionResponse,
     DeleteProviderRequest, DeleteProviderResponse, DeleteSandboxRequest, DeleteSandboxResponse,
-    ExecSandboxEvent, ExecSandboxRequest, GetProviderRequest, GetSandboxPolicyRequest,
-    GetSandboxPolicyResponse, GetSandboxProviderEnvironmentRequest,
+    ExecSandboxEvent, ExecSandboxRequest, GatewayMessage, GetGatewayConfigRequest,
+    GetGatewayConfigResponse, GetProviderRequest, GetSandboxConfigRequest,
+    GetSandboxConfigResponse, GetSandboxProviderEnvironmentRequest,
     GetSandboxProviderEnvironmentResponse, GetSandboxRequest, HealthRequest, HealthResponse,
     ListProvidersRequest, ListProvidersResponse, ListSandboxesRequest, ListSandboxesResponse,
     ProviderResponse, RevokeSshSessionRequest, RevokeSshSessionResponse, SandboxResponse,
-    SandboxStreamEvent, ServiceStatus, UpdateProviderRequest, WatchSandboxRequest,
+    SandboxStreamEvent, ServiceStatus, SupervisorMessage, UpdateProviderRequest,
+    WatchSandboxRequest,
     open_shell_client::OpenShellClient,
     open_shell_server::{OpenShell, OpenShellServer},
 };
@@ -69,11 +71,18 @@ impl OpenShell for TestOpenShell {
         Ok(Response::new(DeleteSandboxResponse { deleted: true }))
     }
 
-    async fn get_sandbox_policy(
+    async fn get_sandbox_config(
         &self,
-        _request: tonic::Request<GetSandboxPolicyRequest>,
-    ) -> Result<Response<GetSandboxPolicyResponse>, Status> {
-        Ok(Response::new(GetSandboxPolicyResponse::default()))
+        _request: tonic::Request<GetSandboxConfigRequest>,
+    ) -> Result<Response<GetSandboxConfigResponse>, Status> {
+        Ok(Response::new(GetSandboxConfigResponse::default()))
+    }
+
+    async fn get_gateway_config(
+        &self,
+        _request: tonic::Request<GetGatewayConfigRequest>,
+    ) -> Result<Response<GetGatewayConfigResponse>, Status> {
+        Ok(Response::new(GetGatewayConfigResponse::default()))
     }
 
     async fn get_sandbox_provider_environment(
@@ -126,6 +135,20 @@ impl OpenShell for TestOpenShell {
         ))
     }
 
+    async fn list_provider_profiles(
+        &self,
+        _request: tonic::Request<openshell_core::proto::ListProviderProfilesRequest>,
+    ) -> Result<Response<openshell_core::proto::ListProviderProfilesResponse>, Status> {
+        Err(Status::unimplemented("not implemented in test"))
+    }
+
+    async fn get_provider_profile(
+        &self,
+        _request: tonic::Request<openshell_core::proto::GetProviderProfileRequest>,
+    ) -> Result<Response<openshell_core::proto::ProviderProfileResponse>, Status> {
+        Err(Status::unimplemented("not implemented in test"))
+    }
+
     async fn update_provider(
         &self,
         _request: tonic::Request<UpdateProviderRequest>,
@@ -146,6 +169,7 @@ impl OpenShell for TestOpenShell {
 
     type WatchSandboxStream = ReceiverStream<Result<SandboxStreamEvent, Status>>;
     type ExecSandboxStream = ReceiverStream<Result<ExecSandboxEvent, Status>>;
+    type ConnectSupervisorStream = ReceiverStream<Result<GatewayMessage, Status>>;
 
     async fn watch_sandbox(
         &self,
@@ -163,10 +187,10 @@ impl OpenShell for TestOpenShell {
         Ok(Response::new(ReceiverStream::new(rx)))
     }
 
-    async fn update_sandbox_policy(
+    async fn update_config(
         &self,
-        _request: tonic::Request<openshell_core::proto::UpdateSandboxPolicyRequest>,
-    ) -> Result<Response<openshell_core::proto::UpdateSandboxPolicyResponse>, Status> {
+        _request: tonic::Request<openshell_core::proto::UpdateConfigRequest>,
+    ) -> Result<Response<openshell_core::proto::UpdateConfigResponse>, Status> {
         Err(Status::unimplemented("not implemented in test"))
     }
 
@@ -267,6 +291,22 @@ impl OpenShell for TestOpenShell {
     ) -> Result<Response<openshell_core::proto::GetDraftHistoryResponse>, Status> {
         Err(Status::unimplemented("not implemented in test"))
     }
+
+    async fn connect_supervisor(
+        &self,
+        _request: tonic::Request<tonic::Streaming<SupervisorMessage>>,
+    ) -> Result<Response<Self::ConnectSupervisorStream>, Status> {
+        Err(Status::unimplemented("not implemented in test"))
+    }
+
+    type RelayStreamStream = ReceiverStream<Result<openshell_core::proto::RelayFrame, Status>>;
+
+    async fn relay_stream(
+        &self,
+        _request: tonic::Request<tonic::Streaming<openshell_core::proto::RelayFrame>>,
+    ) -> Result<Response<Self::RelayStreamStream>, Status> {
+        Err(Status::unimplemented("not implemented in test"))
+    }
 }
 
 #[tokio::test]
@@ -316,4 +356,77 @@ async fn serves_grpc_and_http_on_same_port() {
     assert_eq!(resp.status(), StatusCode::OK);
 
     server.abort();
+}
+
+/// Verify tonic metadata ↔ HTTP header roundtrip for `x-request-id`.
+///
+/// This intentionally constructs its own request-ID layers from
+/// `tower-http`'s public API rather than reusing the production macro
+/// (which is crate-private). Production middleware composition and
+/// layer ordering are covered by the unit tests in `multiplex::tests`.
+#[tokio::test]
+async fn grpc_response_propagates_request_id() {
+    use tower::ServiceBuilder;
+    use tower_http::request_id::{
+        MakeRequestId, PropagateRequestIdLayer, RequestId, SetRequestIdLayer,
+    };
+
+    #[derive(Clone)]
+    struct TestUuidRequestId;
+
+    impl MakeRequestId for TestUuidRequestId {
+        fn make_request_id<B>(&mut self, _req: &Request<B>) -> Option<RequestId> {
+            let id = uuid::Uuid::new_v4().to_string();
+            Some(RequestId::new(http::HeaderValue::from_str(&id).unwrap()))
+        }
+    }
+
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+
+    let x_request_id = http::HeaderName::from_static("x-request-id");
+    let grpc_service = ServiceBuilder::new()
+        .layer(SetRequestIdLayer::new(
+            x_request_id.clone(),
+            TestUuidRequestId,
+        ))
+        .layer(PropagateRequestIdLayer::new(x_request_id))
+        .service(OpenShellServer::new(TestOpenShell));
+    let http_service = health_router();
+    let service = MultiplexedService::new(grpc_service, http_service);
+
+    tokio::spawn(async move {
+        loop {
+            let Ok((stream, _)) = listener.accept().await else {
+                continue;
+            };
+            let svc = service.clone();
+            tokio::spawn(async move {
+                let _ = Builder::new(TokioExecutor::new())
+                    .serve_connection(TokioIo::new(stream), svc)
+                    .await;
+            });
+        }
+    });
+
+    let mut client = OpenShellClient::connect(format!("http://{addr}"))
+        .await
+        .unwrap();
+
+    // Server generates a UUID when client omits x-request-id.
+    let response = client.health(HealthRequest {}).await.unwrap();
+    let generated = response
+        .metadata()
+        .get("x-request-id")
+        .expect("gRPC response should include server-generated x-request-id");
+    uuid::Uuid::parse_str(generated.to_str().unwrap()).expect("should be a valid UUID");
+
+    // Server preserves a client-supplied x-request-id.
+    let mut request = tonic::Request::new(HealthRequest {});
+    request
+        .metadata_mut()
+        .insert("x-request-id", "grpc-corr-id".parse().unwrap());
+    let response = client.health(request).await.unwrap();
+    let echoed = response.metadata().get("x-request-id").unwrap();
+    assert_eq!(echoed.to_str().unwrap(), "grpc-corr-id");
 }

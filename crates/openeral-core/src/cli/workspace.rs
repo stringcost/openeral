@@ -194,8 +194,6 @@ async fn execute_mount(args: MountWorkspaceArgs) -> Result<(), FsError> {
         fuser::MountOption::FSName("openeral-workspace".to_string()),
         fuser::MountOption::Subtype("openeral".to_string()),
     ];
-    fuse_config.acl = fuser::SessionACL::All;
-
     let handle = tokio::task::spawn_blocking(move || {
         fuser::mount2(fs, &mount_point, &fuse_config).map_err(FsError::IoError)
     });

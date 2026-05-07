@@ -12,11 +12,12 @@
 #     --build-arg OPENSHELL_CARGO_VERSION=0.6.0 \
 #     --output type=local,dest=out/ .
 
-ARG OSXCROSS_IMAGE=crazymax/osxcross:latest
+ARG OSXCROSS_IMAGE=ghcr.io/crazy-max/osxcross:latest
+ARG PYTHON_IMAGE=public.ecr.aws/docker/library/python:3.12-slim
 
 FROM ${OSXCROSS_IMAGE} AS osxcross
 
-FROM python:3.12-slim AS builder
+FROM ${PYTHON_IMAGE} AS builder
 
 ARG CARGO_TARGET_CACHE_SCOPE=default
 
@@ -25,16 +26,19 @@ ENV LD_LIBRARY_PATH="/osxcross/lib"
 
 COPY --from=osxcross /osxcross /osxcross
 
+RUN SDKROOT="$(echo /osxcross/SDK/MacOSX*.sdk)" && ln -sfn "${SDKROOT}" /osxcross/SDK/MacOSX.sdk
+
 RUN apt-get update && apt-get install -y --no-install-recommends \
     build-essential \
     ca-certificates \
     clang \
     cmake \
     curl \
+    libclang-dev \
     pkg-config \
     && rm -rf /var/lib/apt/lists/*
 
-RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --default-toolchain 1.88.0
+RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --default-toolchain 1.95.0
 
 # aws-lc-sys probes with --target=arm64-apple-macosx and clang then looks for
 # arm64-apple-macosx-ld.  Provide a linker alias to osxcross ld64.
@@ -49,6 +53,11 @@ ENV CXX_aarch64_apple_darwin=oa64-clang++
 ENV AR_aarch64_apple_darwin=aarch64-apple-darwin25.1-ar
 ENV CARGO_TARGET_AARCH64_APPLE_DARWIN_LINKER=oa64-clang
 ENV CARGO_TARGET_AARCH64_APPLE_DARWIN_AR=aarch64-apple-darwin25.1-ar
+ENV SDKROOT=/osxcross/SDK/MacOSX.sdk
+ENV MACOSX_DEPLOYMENT_TARGET=13.3
+ENV CFLAGS_aarch64_apple_darwin=--target=arm64-apple-macosx\ -mmacosx-version-min=13.3
+ENV CXXFLAGS_aarch64_apple_darwin=--target=arm64-apple-macosx\ -mmacosx-version-min=13.3
+ENV BINDGEN_EXTRA_CLANG_ARGS_aarch64_apple_darwin=--target=arm64-apple-macosx\ -isysroot\ ${SDKROOT}
 
 # ---------------------------------------------------------------------------
 # Stage 1: dependency caching — copy only manifests, create dummy sources,
@@ -61,36 +70,40 @@ COPY crates/openshell-core/Cargo.toml     crates/openshell-core/Cargo.toml
 COPY crates/openshell-policy/Cargo.toml   crates/openshell-policy/Cargo.toml
 COPY crates/openshell-providers/Cargo.toml crates/openshell-providers/Cargo.toml
 COPY crates/openshell-tui/Cargo.toml      crates/openshell-tui/Cargo.toml
+COPY crates/openshell-prover/Cargo.toml   crates/openshell-prover/Cargo.toml
 COPY crates/openshell-core/build.rs       crates/openshell-core/build.rs
 COPY proto/ proto/
 
 # Scope workspace to CLI crates only — avoids compiling aws-lc-sys (pulled
 # by russh in openshell-sandbox/openshell-server) which is difficult to
 # cross-compile and unnecessary for the CLI binary.
-RUN sed -i 's|members = \["crates/\*"\]|members = ["crates/openshell-cli", "crates/openshell-core", "crates/openshell-bootstrap", "crates/openshell-policy", "crates/openshell-providers", "crates/openshell-tui"]|' Cargo.toml
+RUN sed -i 's|members = \["crates/\*"\]|members = ["crates/openshell-cli", "crates/openshell-core", "crates/openshell-bootstrap", "crates/openshell-policy", "crates/openshell-prover", "crates/openshell-providers", "crates/openshell-tui"]|' Cargo.toml
 
 RUN mkdir -p crates/openshell-cli/src \
              crates/openshell-core/src \
              crates/openshell-bootstrap/src \
              crates/openshell-policy/src \
              crates/openshell-providers/src \
+             crates/openshell-prover/src \
              crates/openshell-tui/src && \
     echo "fn main() {}" > crates/openshell-cli/src/main.rs && \
     touch crates/openshell-core/src/lib.rs && \
     touch crates/openshell-bootstrap/src/lib.rs && \
     touch crates/openshell-policy/src/lib.rs && \
     touch crates/openshell-providers/src/lib.rs && \
+    touch crates/openshell-prover/src/lib.rs && \
     touch crates/openshell-tui/src/lib.rs
 
 RUN --mount=type=cache,id=cargo-registry-cli-macos,sharing=locked,target=/root/.cargo/registry \
     --mount=type=cache,id=cargo-git-cli-macos,sharing=locked,target=/root/.cargo/git \
     --mount=type=cache,id=cargo-target-cli-macos-${CARGO_TARGET_CACHE_SCOPE},sharing=locked,target=/build/target \
-    cargo build --release --target aarch64-apple-darwin -p openshell-cli 2>/dev/null || true
+    cargo build --release --target aarch64-apple-darwin -p openshell-cli --features bundled-z3 2>/dev/null || true
 
 # ---------------------------------------------------------------------------
 # Stage 2: real build
 # ---------------------------------------------------------------------------
 COPY crates/ crates/
+COPY providers/ providers/
 
 # Touch source files to ensure they're rebuilt (not the cached dummy).
 RUN touch crates/openshell-cli/src/main.rs \
@@ -103,16 +116,17 @@ RUN touch crates/openshell-cli/src/main.rs \
     crates/openshell-core/build.rs \
     proto/*.proto
 
-# Declare version ARG here (not earlier) so the git-hash-bearing value does not
+# Declare version ARGs here (not earlier) so the git-hash-bearing values do not
 # invalidate the expensive dependency-build layers above on every commit.
 ARG OPENSHELL_CARGO_VERSION
+ARG OPENSHELL_IMAGE_TAG
 RUN --mount=type=cache,id=cargo-registry-cli-macos,sharing=locked,target=/root/.cargo/registry \
     --mount=type=cache,id=cargo-git-cli-macos,sharing=locked,target=/root/.cargo/git \
     --mount=type=cache,id=cargo-target-cli-macos-${CARGO_TARGET_CACHE_SCOPE},sharing=locked,target=/build/target \
     if [ -n "${OPENSHELL_CARGO_VERSION:-}" ]; then \
       sed -i -E '/^\[workspace\.package\]/,/^\[/{s/^version[[:space:]]*=[[:space:]]*".*"/version = "'"${OPENSHELL_CARGO_VERSION}"'"/}' Cargo.toml; \
     fi && \
-    cargo build --release --target aarch64-apple-darwin -p openshell-cli && \
+    cargo build --release --target aarch64-apple-darwin -p openshell-cli --features bundled-z3 && \
     cp target/aarch64-apple-darwin/release/openshell /openshell
 
 FROM scratch AS binary

@@ -73,26 +73,6 @@ pub fn parse_image_ref(image_ref: &str) -> (String, String) {
     (image_ref.to_string(), "latest".to_string())
 }
 
-/// Return the repository portion of an image reference, stripping any tag or digest.
-pub fn image_repository(image_ref: &str) -> String {
-    if let Some((repo, _digest)) = image_ref.split_once('@') {
-        repo.to_string()
-    } else {
-        parse_image_ref(image_ref).0
-    }
-}
-
-/// Derive a repository base from a cluster image reference.
-///
-/// Examples:
-/// - `ghcr.io/acme/openeral/cluster:latest` -> `ghcr.io/acme/openeral`
-/// - `ghcr.io/acme/openeral/cluster@sha256:...` -> `ghcr.io/acme/openeral`
-pub fn derive_image_repo_base_from_cluster_ref(image_ref: &str) -> Option<String> {
-    image_repository(image_ref)
-        .strip_suffix("/cluster")
-        .map(ToString::to_string)
-}
-
 /// Pull an image from a registry to the local Docker daemon.
 ///
 /// If `platform` is provided (e.g., `"linux/arm64"`), the pull will request that specific
@@ -366,26 +346,6 @@ mod tests {
         assert!(ghcr_credentials(None, None).is_none());
         assert!(ghcr_credentials(None, Some("")).is_none());
         assert!(ghcr_credentials(Some("myuser"), None).is_none());
-    }
-
-    #[test]
-    fn derive_repo_base_from_tagged_cluster_ref() {
-        let base = derive_image_repo_base_from_cluster_ref("ghcr.io/acme/openeral/cluster:latest");
-        assert_eq!(base.as_deref(), Some("ghcr.io/acme/openeral"));
-    }
-
-    #[test]
-    fn derive_repo_base_from_digested_cluster_ref() {
-        let base = derive_image_repo_base_from_cluster_ref(
-            "ghcr.io/acme/openeral/cluster@sha256:0123456789abcdef",
-        );
-        assert_eq!(base.as_deref(), Some("ghcr.io/acme/openeral"));
-    }
-
-    #[test]
-    fn derive_repo_base_rejects_non_cluster_ref() {
-        let base = derive_image_repo_base_from_cluster_ref("ghcr.io/acme/openeral/sandbox:latest");
-        assert!(base.is_none());
     }
 
     #[test]

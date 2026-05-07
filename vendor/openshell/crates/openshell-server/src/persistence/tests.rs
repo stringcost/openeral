@@ -1,8 +1,10 @@
 // SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
-use super::{ObjectId, ObjectName, ObjectType, Store, generate_name};
-use openshell_core::proto::ObjectForTest;
+use super::{ObjectType, Store, generate_name};
+use crate::policy_store::PolicyStoreExt;
+use openshell_core::proto::{ObjectForTest, SandboxPolicy};
+use prost::Message;
 
 #[tokio::test]
 async fn sqlite_put_get_round_trip() {
@@ -11,7 +13,7 @@ async fn sqlite_put_get_round_trip() {
         .unwrap();
 
     store
-        .put("sandbox", "abc", "my-sandbox", b"payload")
+        .put("sandbox", "abc", "my-sandbox", b"payload", None)
         .await
         .unwrap();
 
@@ -23,20 +25,30 @@ async fn sqlite_put_get_round_trip() {
 }
 
 #[tokio::test]
+async fn sqlite_connect_runs_embedded_migrations() {
+    let store = Store::connect("sqlite::memory:?cache=shared")
+        .await
+        .unwrap();
+
+    let records = store.list("sandbox", 10, 0).await.unwrap();
+    assert!(records.is_empty());
+}
+
+#[tokio::test]
 async fn sqlite_updates_timestamp() {
     let store = Store::connect("sqlite::memory:?cache=shared")
         .await
         .unwrap();
 
     store
-        .put("sandbox", "abc", "my-sandbox", b"payload")
+        .put("sandbox", "abc", "my-sandbox", b"payload", None)
         .await
         .unwrap();
 
     let first = store.get("sandbox", "abc").await.unwrap().unwrap();
 
     store
-        .put("sandbox", "abc", "my-sandbox", b"payload2")
+        .put("sandbox", "abc", "my-sandbox", b"payload2", None)
         .await
         .unwrap();
 
@@ -56,7 +68,7 @@ async fn sqlite_list_paging() {
         let name = format!("name-{idx}");
         let payload = format!("payload-{idx}");
         store
-            .put("sandbox", &id, &name, payload.as_bytes())
+            .put("sandbox", &id, &name, payload.as_bytes(), None)
             .await
             .unwrap();
     }
@@ -74,7 +86,7 @@ async fn sqlite_delete_behavior() {
         .unwrap();
 
     store
-        .put("sandbox", "abc", "my-sandbox", b"payload")
+        .put("sandbox", "abc", "my-sandbox", b"payload", None)
         .await
         .unwrap();
 
@@ -117,7 +129,7 @@ async fn sqlite_get_by_name() {
         .unwrap();
 
     store
-        .put("sandbox", "id-1", "my-sandbox", b"payload")
+        .put("sandbox", "id-1", "my-sandbox", b"payload", None)
         .await
         .unwrap();
 
@@ -171,7 +183,7 @@ async fn sqlite_delete_by_name() {
         .unwrap();
 
     store
-        .put("sandbox", "id-1", "my-sandbox", b"payload")
+        .put("sandbox", "id-1", "my-sandbox", b"payload", None)
         .await
         .unwrap();
 
@@ -192,19 +204,27 @@ async fn sqlite_name_unique_per_object_type() {
         .unwrap();
 
     store
-        .put("sandbox", "id-1", "shared-name", b"payload1")
+        .put("sandbox", "id-1", "shared-name", b"payload1", None)
         .await
         .unwrap();
 
-    // Same name, same object_type, different id -> should fail (unique constraint).
-    let result = store
-        .put("sandbox", "id-2", "shared-name", b"payload2")
-        .await;
-    assert!(result.is_err());
+    // Same name, same object_type, different id -> upsert on name.
+    store
+        .put("sandbox", "id-2", "shared-name", b"payload2", None)
+        .await
+        .unwrap();
+
+    let record = store
+        .get_by_name("sandbox", "shared-name")
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(record.id, "id-1");
+    assert_eq!(record.payload, b"payload2");
 
     // Same name, different object_type -> should succeed.
     store
-        .put("secret", "id-3", "shared-name", b"payload3")
+        .put("secret", "id-3", "shared-name", b"payload3", None)
         .await
         .unwrap();
 }
@@ -216,17 +236,16 @@ async fn sqlite_id_globally_unique() {
         .unwrap();
 
     store
-        .put("sandbox", "same-id", "name-a", b"payload1")
+        .put("sandbox", "same-id", "name-a", b"payload1", None)
         .await
         .unwrap();
 
-    // Same id, different object_type -> the upsert is a no-op (WHERE
-    // clause prevents updating a row with a different object_type).
-    // The original row is preserved unchanged.
-    store
-        .put("secret", "same-id", "name-b", b"payload2")
-        .await
-        .unwrap();
+    // Same id, different object_type -> should fail because ids remain global
+    // primary keys even when writes upsert on name.
+    let result = store
+        .put("secret", "same-id", "name-b", b"payload2", None)
+        .await;
+    assert!(result.is_err());
 
     // Original row is untouched.
     let record = store.get("sandbox", "same-id").await.unwrap().unwrap();
@@ -253,16 +272,192 @@ impl ObjectType for ObjectForTest {
     }
 }
 
-impl ObjectId for ObjectForTest {
-    fn object_id(&self) -> &str {
-        &self.id
-    }
+// ObjectId, ObjectName, ObjectLabels implementations
+// for ObjectForTest are in openshell-core::metadata
+
+// ---------------------------------------------------------------------------
+// ObjectMeta tests (labels)
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn labels_round_trip() {
+    let store = Store::connect("sqlite::memory:?cache=shared")
+        .await
+        .unwrap();
+
+    let labels = r#"{"env":"production","team":"platform"}"#;
+    store
+        .put(
+            "sandbox",
+            "id-1",
+            "labeled-sandbox",
+            b"payload",
+            Some(labels),
+        )
+        .await
+        .unwrap();
+
+    let record = store.get("sandbox", "id-1").await.unwrap().unwrap();
+    assert_eq!(record.labels.as_deref(), Some(labels));
 }
 
-impl ObjectName for ObjectForTest {
-    fn object_name(&self) -> &str {
-        &self.name
+#[tokio::test]
+async fn label_selector_single_match() {
+    let store = Store::connect("sqlite::memory:?cache=shared")
+        .await
+        .unwrap();
+
+    store
+        .put("sandbox", "id-1", "s1", b"p1", Some(r#"{"env":"prod"}"#))
+        .await
+        .unwrap();
+    store
+        .put("sandbox", "id-2", "s2", b"p2", Some(r#"{"env":"dev"}"#))
+        .await
+        .unwrap();
+    store
+        .put(
+            "sandbox",
+            "id-3",
+            "s3",
+            b"p3",
+            Some(r#"{"env":"prod","team":"platform"}"#),
+        )
+        .await
+        .unwrap();
+
+    let results = store
+        .list_with_selector("sandbox", "env=prod", 10, 0)
+        .await
+        .unwrap();
+
+    assert_eq!(results.len(), 2);
+    let ids: Vec<&str> = results.iter().map(|r| r.id.as_str()).collect();
+    assert!(ids.contains(&"id-1"));
+    assert!(ids.contains(&"id-3"));
+}
+
+#[tokio::test]
+async fn label_selector_multiple_labels() {
+    let store = Store::connect("sqlite::memory:?cache=shared")
+        .await
+        .unwrap();
+
+    store
+        .put(
+            "sandbox",
+            "id-1",
+            "s1",
+            b"p1",
+            Some(r#"{"env":"prod","team":"platform"}"#),
+        )
+        .await
+        .unwrap();
+    store
+        .put(
+            "sandbox",
+            "id-2",
+            "s2",
+            b"p2",
+            Some(r#"{"env":"prod","team":"data"}"#),
+        )
+        .await
+        .unwrap();
+    store
+        .put(
+            "sandbox",
+            "id-3",
+            "s3",
+            b"p3",
+            Some(r#"{"env":"dev","team":"platform"}"#),
+        )
+        .await
+        .unwrap();
+
+    let results = store
+        .list_with_selector("sandbox", "env=prod,team=platform", 10, 0)
+        .await
+        .unwrap();
+
+    assert_eq!(results.len(), 1);
+    assert_eq!(results[0].id, "id-1");
+}
+
+#[tokio::test]
+async fn label_selector_no_match() {
+    let store = Store::connect("sqlite::memory:?cache=shared")
+        .await
+        .unwrap();
+
+    store
+        .put("sandbox", "id-1", "s1", b"p1", Some(r#"{"env":"prod"}"#))
+        .await
+        .unwrap();
+
+    let results = store
+        .list_with_selector("sandbox", "env=staging", 10, 0)
+        .await
+        .unwrap();
+
+    assert_eq!(results.len(), 0);
+}
+
+#[tokio::test]
+async fn label_selector_respects_paging() {
+    let store = Store::connect("sqlite::memory:?cache=shared")
+        .await
+        .unwrap();
+
+    for idx in 0..5 {
+        let id = format!("id-{idx}");
+        let name = format!("name-{idx}");
+        store
+            .put("sandbox", &id, &name, b"payload", Some(r#"{"env":"prod"}"#))
+            .await
+            .unwrap();
     }
+
+    let page1 = store
+        .list_with_selector("sandbox", "env=prod", 2, 0)
+        .await
+        .unwrap();
+    assert_eq!(page1.len(), 2);
+
+    let page2 = store
+        .list_with_selector("sandbox", "env=prod", 2, 2)
+        .await
+        .unwrap();
+    assert_eq!(page2.len(), 2);
+
+    let page3 = store
+        .list_with_selector("sandbox", "env=prod", 2, 4)
+        .await
+        .unwrap();
+    assert_eq!(page3.len(), 1);
+}
+
+#[tokio::test]
+async fn empty_labels_not_matched_by_selector() {
+    let store = Store::connect("sqlite::memory:?cache=shared")
+        .await
+        .unwrap();
+
+    store
+        .put("sandbox", "id-1", "s1", b"p1", None)
+        .await
+        .unwrap();
+    store
+        .put("sandbox", "id-2", "s2", b"p2", Some(r#"{"env":"prod"}"#))
+        .await
+        .unwrap();
+
+    let results = store
+        .list_with_selector("sandbox", "env=prod", 10, 0)
+        .await
+        .unwrap();
+
+    assert_eq!(results.len(), 1);
+    assert_eq!(results[0].id, "id-2");
 }
 
 // ---------------------------------------------------------------------------
@@ -275,8 +470,9 @@ async fn policy_put_and_get_latest() {
         .await
         .unwrap();
 
+    let policy_v1 = SandboxPolicy::default().encode_to_vec();
     store
-        .put_policy_revision("p1", "sandbox-1", 1, b"policy-v1", "hash1")
+        .put_policy_revision("p1", "sandbox-1", 1, &policy_v1, "hash1")
         .await
         .unwrap();
 
@@ -284,11 +480,16 @@ async fn policy_put_and_get_latest() {
     assert_eq!(latest.version, 1);
     assert_eq!(latest.policy_hash, "hash1");
     assert_eq!(latest.status, "pending");
-    assert_eq!(latest.policy_payload, b"policy-v1");
+    assert_eq!(latest.policy_payload, policy_v1);
 
     // Add version 2
+    let policy_v2 = SandboxPolicy {
+        version: 2,
+        ..SandboxPolicy::default()
+    }
+    .encode_to_vec();
     store
-        .put_policy_revision("p2", "sandbox-1", 2, b"policy-v2", "hash2")
+        .put_policy_revision("p2", "sandbox-1", 2, &policy_v2, "hash2")
         .await
         .unwrap();
 
@@ -303,12 +504,18 @@ async fn policy_get_by_version() {
         .await
         .unwrap();
 
+    let policy_v1 = SandboxPolicy::default().encode_to_vec();
+    let policy_v2 = SandboxPolicy {
+        version: 2,
+        ..SandboxPolicy::default()
+    }
+    .encode_to_vec();
     store
-        .put_policy_revision("p1", "sandbox-1", 1, b"v1", "h1")
+        .put_policy_revision("p1", "sandbox-1", 1, &policy_v1, "h1")
         .await
         .unwrap();
     store
-        .put_policy_revision("p2", "sandbox-1", 2, b"v2", "h2")
+        .put_policy_revision("p2", "sandbox-1", 2, &policy_v2, "h2")
         .await
         .unwrap();
 
@@ -338,8 +545,9 @@ async fn policy_update_status_and_get_loaded() {
         .await
         .unwrap();
 
+    let payload = SandboxPolicy::default().encode_to_vec();
     store
-        .put_policy_revision("p1", "sandbox-1", 1, b"v1", "h1")
+        .put_policy_revision("p1", "sandbox-1", 1, &payload, "h1")
         .await
         .unwrap();
 
@@ -370,8 +578,9 @@ async fn policy_status_failed_with_error() {
         .await
         .unwrap();
 
+    let payload = SandboxPolicy::default().encode_to_vec();
     store
-        .put_policy_revision("p1", "sandbox-1", 1, b"v1", "h1")
+        .put_policy_revision("p1", "sandbox-1", 1, &payload, "h1")
         .await
         .unwrap();
 
@@ -395,16 +604,17 @@ async fn policy_supersede_older() {
         .await
         .unwrap();
 
+    let payload = SandboxPolicy::default().encode_to_vec();
     store
-        .put_policy_revision("p1", "sandbox-1", 1, b"v1", "h1")
+        .put_policy_revision("p1", "sandbox-1", 1, &payload, "h1")
         .await
         .unwrap();
     store
-        .put_policy_revision("p2", "sandbox-1", 2, b"v2", "h2")
+        .put_policy_revision("p2", "sandbox-1", 2, &payload, "h2")
         .await
         .unwrap();
     store
-        .put_policy_revision("p3", "sandbox-1", 3, b"v3", "h3")
+        .put_policy_revision("p3", "sandbox-1", 3, &payload, "h3")
         .await
         .unwrap();
 
@@ -449,16 +659,17 @@ async fn policy_list_ordered_by_version_desc() {
         .await
         .unwrap();
 
+    let payload = SandboxPolicy::default().encode_to_vec();
     store
-        .put_policy_revision("p1", "sandbox-1", 1, b"v1", "h1")
+        .put_policy_revision("p1", "sandbox-1", 1, &payload, "h1")
         .await
         .unwrap();
     store
-        .put_policy_revision("p2", "sandbox-1", 2, b"v2", "h2")
+        .put_policy_revision("p2", "sandbox-1", 2, &payload, "h2")
         .await
         .unwrap();
     store
-        .put_policy_revision("p3", "sandbox-1", 3, b"v3", "h3")
+        .put_policy_revision("p3", "sandbox-1", 3, &payload, "h3")
         .await
         .unwrap();
 
@@ -481,18 +692,96 @@ async fn policy_isolation_between_sandboxes() {
         .await
         .unwrap();
 
+    let policy_s1 = SandboxPolicy::default().encode_to_vec();
+    let policy_s2 = SandboxPolicy {
+        version: 7,
+        ..SandboxPolicy::default()
+    }
+    .encode_to_vec();
     store
-        .put_policy_revision("p1", "sandbox-1", 1, b"v1", "h1")
+        .put_policy_revision("p1", "sandbox-1", 1, &policy_s1, "h1")
         .await
         .unwrap();
     store
-        .put_policy_revision("p2", "sandbox-2", 1, b"v1-s2", "h2")
+        .put_policy_revision("p2", "sandbox-2", 1, &policy_s2, "h2")
         .await
         .unwrap();
 
     let s1 = store.get_latest_policy("sandbox-1").await.unwrap().unwrap();
     let s2 = store.get_latest_policy("sandbox-2").await.unwrap().unwrap();
 
-    assert_eq!(s1.policy_payload, b"v1");
-    assert_eq!(s2.policy_payload, b"v1-s2");
+    assert_eq!(s1.policy_payload, policy_s1);
+    assert_eq!(s2.policy_payload, policy_s2);
+}
+
+// ---- Label selector parsing tests ----
+
+#[test]
+fn parse_label_selector_empty_string() {
+    let result = super::parse_label_selector("").unwrap();
+    assert!(result.is_empty());
+}
+
+#[test]
+fn parse_label_selector_single_pair() {
+    let result = super::parse_label_selector("env=prod").unwrap();
+    assert_eq!(result.len(), 1);
+    assert_eq!(result.get("env"), Some(&"prod".to_string()));
+}
+
+#[test]
+fn parse_label_selector_multiple_pairs() {
+    let result = super::parse_label_selector("env=prod,tier=frontend,version=v1").unwrap();
+    assert_eq!(result.len(), 3);
+    assert_eq!(result.get("env"), Some(&"prod".to_string()));
+    assert_eq!(result.get("tier"), Some(&"frontend".to_string()));
+    assert_eq!(result.get("version"), Some(&"v1".to_string()));
+}
+
+#[test]
+fn parse_label_selector_accepts_empty_value() {
+    // Kubernetes allows empty label values, so selectors should accept "key=" format
+    let result = super::parse_label_selector("env=").unwrap();
+    assert_eq!(result.len(), 1);
+    assert_eq!(result.get("env"), Some(&String::new()));
+}
+
+#[test]
+fn parse_label_selector_multiple_with_empty_value() {
+    let result = super::parse_label_selector("env=,tier=frontend").unwrap();
+    assert_eq!(result.len(), 2);
+    assert_eq!(result.get("env"), Some(&String::new()));
+    assert_eq!(result.get("tier"), Some(&"frontend".to_string()));
+}
+
+#[test]
+fn parse_label_selector_rejects_empty_key() {
+    let result = super::parse_label_selector("=value");
+    assert!(result.is_err());
+    assert!(
+        result
+            .unwrap_err()
+            .to_string()
+            .contains("key cannot be empty")
+    );
+}
+
+#[test]
+fn parse_label_selector_rejects_missing_equals() {
+    let result = super::parse_label_selector("env");
+    assert!(result.is_err());
+    assert!(
+        result
+            .unwrap_err()
+            .to_string()
+            .contains("expected 'key=value'")
+    );
+}
+
+#[test]
+fn parse_label_selector_handles_whitespace() {
+    let result = super::parse_label_selector("env = prod , tier = frontend").unwrap();
+    assert_eq!(result.len(), 2);
+    assert_eq!(result.get("env"), Some(&"prod".to_string()));
+    assert_eq!(result.get("tier"), Some(&"frontend".to_string()));
 }

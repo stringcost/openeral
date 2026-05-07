@@ -7,13 +7,16 @@ use openshell_core::proto::open_shell_server::{OpenShell, OpenShellServer};
 use openshell_core::proto::{
     CreateProviderRequest, CreateSandboxRequest, CreateSshSessionRequest, CreateSshSessionResponse,
     DeleteProviderRequest, DeleteProviderResponse, DeleteSandboxRequest, DeleteSandboxResponse,
-    ExecSandboxEvent, ExecSandboxRequest, GetProviderRequest, GetSandboxPolicyRequest,
-    GetSandboxPolicyResponse, GetSandboxProviderEnvironmentRequest,
+    ExecSandboxEvent, ExecSandboxRequest, GatewayMessage, GetGatewayConfigRequest,
+    GetGatewayConfigResponse, GetProviderRequest, GetSandboxConfigRequest,
+    GetSandboxConfigResponse, GetSandboxProviderEnvironmentRequest,
     GetSandboxProviderEnvironmentResponse, GetSandboxRequest, HealthRequest, HealthResponse,
     ListProvidersRequest, ListProvidersResponse, ListSandboxesRequest, ListSandboxesResponse,
     Provider, ProviderResponse, RevokeSshSessionRequest, RevokeSshSessionResponse, SandboxResponse,
-    SandboxStreamEvent, ServiceStatus, UpdateProviderRequest, WatchSandboxRequest,
+    SandboxStreamEvent, ServiceStatus, SupervisorMessage, UpdateProviderRequest,
+    WatchSandboxRequest,
 };
+use openshell_core::{ObjectId, ObjectName};
 use rcgen::{
     BasicConstraints, Certificate, CertificateParams, ExtendedKeyUsagePurpose, IsCa, KeyPair,
 };
@@ -107,11 +110,18 @@ impl OpenShell for TestOpenShell {
         Ok(Response::new(DeleteSandboxResponse { deleted: true }))
     }
 
-    async fn get_sandbox_policy(
+    async fn get_sandbox_config(
         &self,
-        _request: tonic::Request<GetSandboxPolicyRequest>,
-    ) -> Result<Response<GetSandboxPolicyResponse>, Status> {
-        Ok(Response::new(GetSandboxPolicyResponse::default()))
+        _request: tonic::Request<GetSandboxConfigRequest>,
+    ) -> Result<Response<GetSandboxConfigResponse>, Status> {
+        Ok(Response::new(GetSandboxConfigResponse::default()))
+    }
+
+    async fn get_gateway_config(
+        &self,
+        _request: tonic::Request<GetGatewayConfigRequest>,
+    ) -> Result<Response<GetGatewayConfigResponse>, Status> {
+        Ok(Response::new(GetGatewayConfigResponse::default()))
     }
 
     async fn get_sandbox_provider_environment(
@@ -146,13 +156,16 @@ impl OpenShell for TestOpenShell {
             .provider
             .ok_or_else(|| Status::invalid_argument("provider is required"))?;
         let mut providers = self.state.providers.lock().await;
-        if providers.contains_key(&provider.name) {
+        let provider_name = provider.object_name().to_string();
+        if providers.contains_key(&provider_name) {
             return Err(Status::already_exists("provider already exists"));
         }
-        if provider.id.is_empty() {
-            provider.id = format!("id-{}", provider.name);
+        if provider.object_id().is_empty()
+            && let Some(metadata) = &mut provider.metadata
+        {
+            metadata.id = format!("id-{provider_name}");
         }
-        providers.insert(provider.name.clone(), provider.clone());
+        providers.insert(provider_name, provider.clone());
         Ok(Response::new(ProviderResponse {
             provider: Some(provider),
         }))
@@ -188,6 +201,27 @@ impl OpenShell for TestOpenShell {
         Ok(Response::new(ListProvidersResponse { providers }))
     }
 
+    async fn list_provider_profiles(
+        &self,
+        _request: tonic::Request<openshell_core::proto::ListProviderProfilesRequest>,
+    ) -> Result<Response<openshell_core::proto::ListProviderProfilesResponse>, Status> {
+        Ok(Response::new(
+            openshell_core::proto::ListProviderProfilesResponse {
+                profiles: openshell_providers::default_profiles()
+                    .iter()
+                    .map(openshell_providers::ProviderTypeProfile::to_proto)
+                    .collect(),
+            },
+        ))
+    }
+
+    async fn get_provider_profile(
+        &self,
+        _request: tonic::Request<openshell_core::proto::GetProviderProfileRequest>,
+    ) -> Result<Response<openshell_core::proto::ProviderProfileResponse>, Status> {
+        Err(Status::unimplemented("not implemented in test"))
+    }
+
     async fn update_provider(
         &self,
         request: tonic::Request<UpdateProviderRequest>,
@@ -199,13 +233,13 @@ impl OpenShell for TestOpenShell {
 
         let mut providers = self.state.providers.lock().await;
         let existing = providers
-            .get(&provider.name)
+            .get(provider.object_name())
             .cloned()
             .ok_or_else(|| Status::not_found("provider not found"))?;
         // Merge semantics: empty map = no change, empty value = delete key.
-        let merge = |mut base: std::collections::HashMap<String, String>,
-                     incoming: std::collections::HashMap<String, String>|
-         -> std::collections::HashMap<String, String> {
+        let merge = |mut base: HashMap<String, String>,
+                     incoming: HashMap<String, String>|
+         -> HashMap<String, String> {
             if incoming.is_empty() {
                 return base;
             }
@@ -218,14 +252,21 @@ impl OpenShell for TestOpenShell {
             }
             base
         };
+        let existing_metadata = existing.metadata.clone().unwrap_or_default();
+        let provider_metadata = provider.metadata.clone().unwrap_or_default();
         let updated = Provider {
-            id: existing.id,
-            name: provider.name,
+            metadata: Some(openshell_core::proto::datamodel::v1::ObjectMeta {
+                id: existing_metadata.id,
+                name: provider_metadata.name,
+                created_at_ms: existing_metadata.created_at_ms,
+                labels: existing_metadata.labels,
+            }),
             r#type: existing.r#type,
             credentials: merge(existing.credentials, provider.credentials),
             config: merge(existing.config, provider.config),
         };
-        providers.insert(updated.name.clone(), updated.clone());
+        let updated_name = updated.object_name().to_string();
+        providers.insert(updated_name, updated.clone());
         Ok(Response::new(ProviderResponse {
             provider: Some(updated),
         }))
@@ -244,6 +285,8 @@ impl OpenShell for TestOpenShell {
         tokio_stream::wrappers::ReceiverStream<Result<SandboxStreamEvent, Status>>;
     type ExecSandboxStream =
         tokio_stream::wrappers::ReceiverStream<Result<ExecSandboxEvent, Status>>;
+    type ConnectSupervisorStream =
+        tokio_stream::wrappers::ReceiverStream<Result<GatewayMessage, Status>>;
 
     async fn watch_sandbox(
         &self,
@@ -265,10 +308,10 @@ impl OpenShell for TestOpenShell {
         )))
     }
 
-    async fn update_sandbox_policy(
+    async fn update_config(
         &self,
-        _request: tonic::Request<openshell_core::proto::UpdateSandboxPolicyRequest>,
-    ) -> Result<Response<openshell_core::proto::UpdateSandboxPolicyResponse>, Status> {
+        _request: tonic::Request<openshell_core::proto::UpdateConfigRequest>,
+    ) -> Result<Response<openshell_core::proto::UpdateConfigResponse>, Status> {
         Err(Status::unimplemented("not implemented in test"))
     }
 
@@ -367,6 +410,23 @@ impl OpenShell for TestOpenShell {
         &self,
         _request: tonic::Request<openshell_core::proto::GetDraftHistoryRequest>,
     ) -> Result<Response<openshell_core::proto::GetDraftHistoryResponse>, Status> {
+        Err(Status::unimplemented("not implemented in test"))
+    }
+
+    async fn connect_supervisor(
+        &self,
+        _request: tonic::Request<tonic::Streaming<SupervisorMessage>>,
+    ) -> Result<Response<Self::ConnectSupervisorStream>, Status> {
+        Err(Status::unimplemented("not implemented in test"))
+    }
+
+    type RelayStreamStream =
+        tokio_stream::wrappers::ReceiverStream<Result<openshell_core::proto::RelayFrame, Status>>;
+
+    async fn relay_stream(
+        &self,
+        _request: tonic::Request<tonic::Streaming<openshell_core::proto::RelayFrame>>,
+    ) -> Result<Response<Self::RelayStreamStream>, Status> {
         Err(Status::unimplemented("not implemented in test"))
     }
 }
@@ -488,6 +548,15 @@ async fn provider_cli_run_functions_support_full_crud_flow() {
     run::provider_delete(&ts.endpoint, &["my-claude".to_string()], &ts.tls)
         .await
         .expect("provider delete");
+}
+
+#[tokio::test]
+async fn provider_list_profiles_cli_uses_profile_browsing_rpc() {
+    let ts = run_server().await;
+
+    run::provider_list_profiles(&ts.endpoint, &ts.tls)
+        .await
+        .expect("provider list-profiles");
 }
 
 #[tokio::test]

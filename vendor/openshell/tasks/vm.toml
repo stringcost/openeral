@@ -1,0 +1,29 @@
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+# VM driver development tasks
+#
+# Workflow:
+#   mise run vm:setup          # one-time: download pre-built runtime (~30s)
+#   mise run vm:supervisor     # build the bundled sandbox supervisor
+#   mise run gateway:vm        # start openshell-gateway with the VM driver
+#                              # (defined in tasks/gateway.toml)
+#
+# See tasks/gateway.toml for `gateway:vm`,
+# crates/openshell-driver-vm/README.md for the VM driver workflow.
+
+# ═══════════════════════════════════════════════════════════════════════════
+# Main Commands
+# ═══════════════════════════════════════════════════════════════════════════
+
+["vm:setup"]
+description = "One-time setup: download (or build) the VM driver runtime"
+run = "tasks/scripts/vm/vm-setup.sh"
+
+["vm:supervisor"]
+description = "Build the bundled openshell-sandbox supervisor for openshell-driver-vm"
+run = "tasks/scripts/vm/build-supervisor-bundle.sh"
+
+["vm:smoke:orphan-cleanup"]
+description = "Smoke test: start gateway+driver, create a sandbox, signal the gateway, assert no orphaned processes survive"
+run = "tasks/scripts/vm/smoke-orphan-cleanup.sh"

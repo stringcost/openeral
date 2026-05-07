@@ -31,7 +31,7 @@ The YAML data file is preprocessed before loading into the OPA engine: L7 polici
 
 ### gRPC Mode (Production)
 
-When the sandbox runs inside a managed cluster, it fetches its typed protobuf policy from the gateway:
+When the sandbox runs under a gateway-managed compute platform, it fetches its typed protobuf policy from the gateway:
 
 ```bash
 openshell-sandbox \
@@ -112,9 +112,9 @@ sequenceDiagram
     GW-->>CLI: UpdateSandboxPolicyResponse(version=N, hash)
 
     loop Every 30s (configurable)
-        SB->>GW: GetSandboxPolicy(sandbox_id)
+        SB->>GW: GetSandboxSettings(sandbox_id)
         GW->>DB: get_latest_policy(sandbox_id)
-        GW-->>SB: GetSandboxPolicyResponse(policy, version=N, hash)
+        GW-->>SB: GetSandboxSettingsResponse(policy, version=N, hash)
     end
 
     Note over SB: Detects version > current_version
@@ -140,7 +140,7 @@ sequenceDiagram
 
 Each sandbox maintains an independent, monotonically increasing version counter for its policy revisions:
 
-- **Version 1** is the policy from the sandbox's `spec.policy` at creation time. It is backfilled lazily on the first `GetSandboxPolicy` call if no explicit revision exists in the policy history table. See `crates/openshell-server/src/grpc.rs` -- `get_sandbox_policy()`.
+- **Version 1** is the policy from the sandbox's `spec.policy` at creation time. It is backfilled lazily on the first `GetSandboxSettings` call if no explicit revision exists in the policy history table. See `crates/openshell-server/src/grpc.rs` -- `get_sandbox_settings()`.
 - Each `UpdateSandboxPolicy` call computes the next version as `latest_version + 1` and persists a new `PolicyRecord` with status `"pending"`.
 - When a new version is persisted, all older revisions still in `"pending"` status are marked `"superseded"` via `supersede_pending_policies()`. This handles rapid successive updates where the sandbox has not yet picked up an intermediate version.
 - The `Sandbox` protobuf object carries a `current_policy_version` field (see `proto/datamodel.proto`) that is updated when the sandbox reports a successful load.
@@ -162,6 +162,24 @@ This guarantees that the same logical policy always produces the same hash regar
 
 **Idempotent updates**: `UpdateSandboxPolicy` compares the deterministic hash of the submitted policy against the latest stored revision's hash. If they match, the handler returns the existing version and hash without creating a new revision. The CLI detects this (the returned version equals the pre-call version) and prints `Policy unchanged` instead of `Policy version N submitted`. This makes repeated `policy set` calls safe and idempotent.
 
+### Incremental Merge Updates
+
+`UpdateConfigRequest.merge_operations` supports batched incremental changes to the dynamic `network_policies` section. The CLI exposes this as `openshell policy update`.
+
+Supported first-pass operations:
+
+- `--add-endpoint host:port[:access[:protocol[:enforcement]]]`
+- `--remove-endpoint host:port`
+- `--remove-rule <name>`
+- `--add-allow host:port:METHOD:path_glob`
+- `--add-deny host:port:METHOD:path_glob`
+
+`--add-allow` and `--add-deny` target existing `protocol: rest` endpoints only. `--binary` may be repeated with `--add-endpoint`, and `--rule-name` is allowed only when exactly one `--add-endpoint` is present.
+
+Each `openshell policy update` invocation is atomic at the revision level: the CLI sends one `merge_operations` batch, the server merges the whole batch into the latest policy, validates the result, and persists at most one new revision. Concurrency is handled with optimistic retries on the `(sandbox_id, version)` uniqueness boundary. If another writer wins first, the server refetches the latest policy, reapplies the full batch, revalidates it, and retries. This preserves batch atomicity without serializing all sandbox policy writes behind a sandbox-global mutex.
+
+The gateway emits per-sandbox OCSF `CONFIG:*` audit lines when incremental merge operations are applied and when draft chunks are approved or removed. These audit lines are streamed through the existing gateway log path, so operators can inspect the exact logical mutation that produced a policy revision without waiting for the sandbox poll loop to reload that revision.
+
 ### Policy Revision Statuses
 
 | Status | Meaning |
@@ -182,10 +200,10 @@ In gRPC mode, the sandbox spawns a background task that periodically polls the g
 The poll loop:
 
 1. Connects a reusable gRPC client (`CachedOpenShellClient`) to avoid per-poll TLS handshake overhead.
-2. Fetches the current policy via `GetSandboxPolicy`, which returns the latest version, its policy payload, and a SHA-256 hash.
+2. Fetches the current policy via `GetSandboxSettings`, which returns the latest version, its policy payload, and a SHA-256 hash.
 3. Compares the returned version against the locally tracked `current_version`. If the server version is not greater, the loop sleeps and retries.
 4. On a new version, calls `OpaEngine::reload_from_proto()` which builds a complete new `regorus::Engine` through the same validated pipeline as the initial load (proto-to-JSON conversion, L7 validation, access preset expansion).
-5. If the new engine builds successfully, it atomically replaces the inner `Mutex<regorus::Engine>`. If it fails, the previous engine is untouched.
+5. If the new engine builds successfully, it atomically replaces the inner `Mutex<regorus::Engine>` and increments the policy generation. Active L7 keep-alive tunnels close before forwarding another request after they observe the new generation. If reload fails, the previous engine and generation are untouched.
 6. Reports success or failure back to the server via `ReportPolicyStatus`.
 
 See `crates/openshell-sandbox/src/grpc_client.rs` -- `CachedOpenShellClient`.
@@ -206,33 +224,73 @@ Failure scenarios that trigger LKG behavior include:
 
 ### CLI Commands
 
-The `nav policy` subcommand group manages live policy updates:
+The `openshell policy` subcommand group manages live policy updates through full replacement (`policy set`) and incremental merges (`policy update`):
 
 ```bash
+# Merge endpoint/rule changes into the current sandbox policy
+openshell policy update <sandbox-name> \
+  --add-endpoint api.github.com:443:read-only:rest:enforce \
+  --binary /usr/bin/gh \
+  --wait
+
+# Add a REST allow rule to an existing endpoint
+openshell policy update <sandbox-name> \
+  --add-allow api.github.com:443:POST:/repos/*/issues \
+  --wait
+
 # Push a new policy to a running sandbox
-nav policy set <sandbox-name> --policy updated-policy.yaml
+openshell policy set <sandbox-name> --policy updated-policy.yaml
 
 # Push and wait for the sandbox to load it (with 60s timeout)
-nav policy set <sandbox-name> --policy updated-policy.yaml --wait
+openshell policy set <sandbox-name> --policy updated-policy.yaml --wait
 
 # Push and wait with a custom timeout
-nav policy set <sandbox-name> --policy updated-policy.yaml --wait --timeout 120
+openshell policy set <sandbox-name> --policy updated-policy.yaml --wait --timeout 120
+
+# Set a gateway-global policy (overrides all sandbox policies)
+openshell policy set --global --policy policy.yaml --yes
+
+# Delete the gateway-global policy (restores sandbox-level control)
+openshell policy delete --global --yes
 
 # View the current active policy and its status
-nav policy get <sandbox-name>
+openshell policy get <sandbox-name>
 
 # Inspect a specific revision
-nav policy get <sandbox-name> --rev 3
+openshell policy get <sandbox-name> --rev 3
 
 # Print the full policy as YAML (round-trips with --policy input format)
-nav policy get <sandbox-name> --full
+openshell policy get <sandbox-name> --full
 
 # Combine: inspect a specific revision's full policy
-nav policy get <sandbox-name> --rev 2 --full
+openshell policy get <sandbox-name> --rev 2 --full
 
 # List policy revision history
-nav policy list <sandbox-name> --limit 20
+openshell policy list <sandbox-name> --limit 20
 ```
+
+#### Global Policy
+
+The `--global` flag on `policy set`, `policy delete`, `policy list`, and `policy get` manages a gateway-wide policy override. When a global policy is set, all sandboxes receive it through `GetSandboxSettings` (with `policy_source: GLOBAL`) instead of their own per-sandbox policy. Global policies are versioned through the `sandbox_policies` table using the sentinel `sandbox_id = "__global__"` and delivered to sandboxes via the reserved `policy` key in the `gateway_settings` blob.
+
+| Command | Behavior |
+|---------|----------|
+| `policy set --global --policy FILE` | Creates a versioned revision (marked `loaded` immediately) and stores the policy in the global settings blob. Sandboxes pick it up on their next poll (~10s). Deduplicates against the latest `loaded` revision by hash. |
+| `policy delete --global` | Removes the `policy` key from global settings and supersedes all `__global__` revisions. Sandboxes revert to their per-sandbox policy on the next poll. |
+| `policy list --global [--limit N]` | Lists global policy revision history (version, hash, status, timestamps). |
+| `policy get --global [--rev N] [--full]` | Shows a specific global revision's metadata, or the latest. `--full` includes the full policy as YAML. |
+
+Both `set` and `delete` require interactive confirmation (or `--yes` to bypass). The `--wait` flag is rejected for global policy updates: `"--wait is not supported for global policies; global policies are effective immediately"`.
+
+When a global policy is active, sandbox-scoped policy mutations are blocked:
+
+- `policy set <sandbox>` returns `FailedPrecondition: "policy is managed globally"`
+- `policy update <sandbox>` returns `FailedPrecondition: "policy is managed globally"`
+- `rule approve`, `rule approve-all` return `FailedPrecondition: "cannot approve rules while a global policy is active"`
+- Revoking a previously approved draft chunk is blocked (it would modify the sandbox policy)
+- Rejecting pending chunks is allowed (does not modify the sandbox policy)
+
+See [Gateway Settings Channel](gateway-settings.md#global-policy-lifecycle) for the full state machine, storage model, and implementation details.
 
 #### `policy get` flags
 
@@ -243,7 +301,7 @@ nav policy list <sandbox-name> --limit 20
 
 When `--full` is specified, the server includes the deserialized `SandboxPolicy` protobuf in the `SandboxPolicyRevision.policy` field (see `crates/openshell-server/src/grpc.rs` -- `policy_record_to_revision()` with `include_policy: true`). The CLI converts this proto back to YAML via `policy_to_yaml()`, which uses a `BTreeMap` for `network_policies` to produce deterministic key ordering. See `crates/openshell-cli/src/run.rs` -- `policy_to_yaml()`, `policy_get()`.
 
-See `crates/openshell-cli/src/main.rs` -- `PolicyCommands` enum, `crates/openshell-cli/src/run.rs` -- `policy_set()`, `policy_get()`, `policy_list()`.
+See `crates/openshell-cli/src/main.rs` -- `PolicyCommands` enum, `crates/openshell-cli/src/run.rs` -- `policy_update()`, `policy_set()`, `policy_get()`, `policy_list()`.
 
 ---
 
@@ -293,13 +351,13 @@ Controls which filesystem paths the sandboxed process can access. Enforced via L
 | `read_only`       | `string[]` | `[]`    | Paths accessible in read-only mode                             |
 | `read_write`      | `string[]` | `[]`    | Paths accessible in read-write mode                            |
 
-**Enforcement mapping**: Each path becomes a Landlock `PathBeneath` rule. Read-only paths receive `AccessFs::from_read(ABI::V1)` permissions. Read-write paths receive `AccessFs::from_all(ABI::V1)` permissions (read, write, execute, create, delete, rename). All other paths are denied by the Landlock ruleset.
+**Enforcement mapping**: Each path becomes a Landlock `PathBeneath` rule. Read-only paths receive `AccessFs::from_read(ABI::V2)` permissions. Read-write paths receive `AccessFs::from_all(ABI::V2)` permissions (read, write, execute, create, delete, rename). All other paths are denied by the Landlock ruleset.
 
-**Filesystem preparation**: Before the child process spawns, the supervisor creates any `read_write` directories that do not exist and sets their ownership to `process.run_as_user`:`process.run_as_group` via `chown()`. See `crates/openshell-sandbox/src/lib.rs` -- `prepare_filesystem()`.
+**Filesystem preparation**: Before the child process spawns, the supervisor rejects symlinked `read_write` paths, creates any missing `read_write` directories, and sets ownership via `chown()` only on paths it created. Pre-existing image paths keep their existing ownership. See `crates/openshell-sandbox/src/lib.rs` -- `prepare_filesystem()`.
 
 **Working directory**: When `include_workdir` is `true` and a `--workdir` is specified, the working directory path is appended to `read_write` if not already present. See `crates/openshell-sandbox/src/sandbox/linux/landlock.rs` -- `apply()`.
 
-**TLS directory**: When network proxy mode is active with TLS termination enabled, the directory `/etc/openshell-tls` is automatically appended to `read_only` so sandbox processes can read the ephemeral CA certificate files.
+**TLS directory**: When network proxy mode is active, the directory `/etc/openshell-tls` is automatically appended to `read_only` so sandbox processes can read the ephemeral CA certificate files (used for auto-TLS termination).
 
 ```yaml
 filesystem_policy:
@@ -331,10 +389,16 @@ Controls Landlock LSM compatibility behavior. **Static field** -- immutable afte
 
 | Value              | Behavior                                                                                                                    |
 | ------------------ | --------------------------------------------------------------------------------------------------------------------------- |
-| `best_effort`      | If Landlock is unavailable (older kernel, unprivileged container), log a warning and continue without filesystem sandboxing |
-| `hard_requirement` | If Landlock is unavailable, abort sandbox startup with an error                                                             |
+| `best_effort`      | If Landlock is unavailable (older kernel, unprivileged container), log a warning and continue without filesystem sandboxing. Individual inaccessible paths (missing, permission denied, symlink loops) are skipped with a warning while remaining rules are still applied. If all paths fail, the sandbox continues without Landlock rather than applying an empty ruleset that would block all access. |
+| `hard_requirement` | If Landlock is unavailable or any configured path cannot be opened, abort sandbox startup with an error.                    |
 
-See `crates/openshell-sandbox/src/sandbox/linux/landlock.rs` -- `compat_level()`.
+**Per-path error handling**: `PathFd::new()` (which wraps `open(path, O_PATH | O_CLOEXEC)`) can fail for several reasons beyond path non-existence: `EACCES` (permission denied), `ELOOP` (symlink loop), `ENAMETOOLONG`, `ENOTDIR`. Each failure is classified with a human-readable reason in logs. In `best_effort` mode, the path is skipped and ruleset construction continues. In `hard_requirement` mode, the error is fatal.
+
+**Baseline path filtering**: The enrichment functions (`enrich_proto_baseline_paths`, `enrich_sandbox_baseline_paths`) pre-filter system-injected baseline paths (e.g., `/app`) by checking `Path::exists()` before adding them to the policy. This prevents missing baseline paths from reaching Landlock at all. If a baseline `read_write` path is explicitly configured in `read_only`, enrichment skips the promotion and preserves the stricter policy intent. User-specified paths are not pre-filtered — they are evaluated at Landlock apply time so that misconfigurations surface as warnings (`best_effort`) or errors (`hard_requirement`).
+
+**Zero-rule safety check**: If all paths in the ruleset fail to open, `apply()` returns an error rather than calling `restrict_self()` on an empty ruleset. An empty Landlock ruleset with `restrict_self()` would block all filesystem access — the inverse of the intended degradation behavior. This error is caught by the outer `BestEffort` handler, which logs a warning and continues without Landlock.
+
+See `crates/openshell-sandbox/src/sandbox/linux/landlock.rs` -- `compat_level()`, `try_open_path()`, `classify_path_fd_error()`, `classify_io_error()`.
 
 ```yaml
 landlock:
@@ -405,12 +469,17 @@ Each endpoint defines a network destination and, optionally, L7 inspection behav
 | `host`         | `string`   | _(required)_    | Hostname or glob pattern to match (case-insensitive). Supports wildcards (`*.example.com`). Optional when `allowed_ips` is set (see [Hostless Endpoints](#hostless-endpoints-allowed_ips-without-host)). See [Host Wildcards](#host-wildcards). |
 | `port`         | `integer`  | _(required)_    | TCP port to match. Mutually exclusive with `ports` — if both are set, `ports` takes precedence. See [Multi-Port Endpoints](#multi-port-endpoints). |
 | `ports`        | `integer[]`| `[]`            | Multiple TCP ports to match. When non-empty, the endpoint covers all listed ports. Backwards compatible with `port`. See [Multi-Port Endpoints](#multi-port-endpoints). |
+| `path`         | `string`   | `""`            | Optional HTTP path glob for L7 endpoint selection when multiple protocols share a host:port, such as `/repos/**` and `/graphql`. Empty matches all paths. |
 | `protocol`     | `string`   | `""`            | Application protocol for L7 inspection. See [Behavioral Trigger: L7 Inspection](#behavioral-trigger-l7-inspection). |
-| `tls`          | `string`   | `"passthrough"` | TLS handling mode. See [Behavioral Trigger: TLS Termination](#behavioral-trigger-tls-termination).                  |
+| `tls`          | `string`   | `""` (auto)      | TLS handling mode. Absent or empty: auto-detect and terminate TLS if detected. `"skip"`: bypass TLS detection entirely. `"terminate"` and `"passthrough"` are deprecated (treated as auto). See [Behavioral Trigger: TLS Handling](#behavioral-trigger-tls-handling). |
 | `enforcement`  | `string`   | `"audit"`       | L7 enforcement mode: `"enforce"` or `"audit"`                                                                       |
 | `access`       | `string`   | `""`            | Shorthand preset for common L7 rule sets. Mutually exclusive with `rules`.                                          |
 | `rules`        | `L7Rule[]` | `[]`            | Explicit L7 allow rules. Mutually exclusive with `access`.                                                          |
-| `allowed_ips`  | `string[]` | `[]`            | IP allowlist for SSRF override. See [Private IP Access via `allowed_ips`](#private-ip-access-via-allowed_ips).       |
+| `allowed_ips`  | `string[]` | `[]`            | IP allowlist for SSRF override. Entries overlapping always-blocked ranges (loopback, link-local, unspecified) are rejected at load time. See [Private IP Access via `allowed_ips`](#private-ip-access-via-allowed_ips). |
+| `allow_encoded_slash` | `bool` | `false` | Preserves `%2F` inside L7 request path segments instead of rejecting the request. Required for endpoints such as npm scoped packages. |
+| `persisted_queries` | `string` | `"deny"` | GraphQL hash-only/saved-query behavior. Use `"allow_registered"` only with `graphql_persisted_queries`. |
+| `graphql_persisted_queries` | `map` | `{}` | Trusted GraphQL persisted-query registry keyed by hash or service-specific ID. Values contain `operation_type`, optional `operation_name`, and optional root `fields`. |
+| `graphql_max_body_bytes` | `integer` | `65536` | Maximum GraphQL request body size buffered for inspection. Larger GraphQL bodies are rejected before policy evaluation. |
 
 #### `NetworkBinary`
 
@@ -434,9 +503,21 @@ rules:
   - allow:
       method: GET
       path: "/repos/**"
+      query:
+        per_page: "1*"
   - allow:
       method: POST
       path: "/repos/*/issues"
+      query:
+        labels:
+          any: ["bug*", "p1*"]
+  - allow:
+      operation_type: query
+      fields: [viewer, repository]
+  - allow:
+      operation_type: mutation
+      operation_name: Issue*
+      fields: [createIssue]
 ```
 
 #### `L7Allow`
@@ -446,18 +527,24 @@ rules:
 | `method`  | `string` | HTTP method: `GET`, `HEAD`, `POST`, `PUT`, `DELETE`, `PATCH`, `OPTIONS`, or `*` (any). Case-insensitive matching.            |
 | `path`    | `string` | URL path glob pattern: `**` matches everything, otherwise `glob.match` with `/` delimiter.                                   |
 | `command` | `string` | SQL command: `SELECT`, `INSERT`, `UPDATE`, `DELETE`, or `*` (any). Case-insensitive matching. For `protocol: sql` endpoints. |
+| `query`   | `map`    | Optional REST query rules keyed by decoded query param name. Value is either a glob string (for example, `tag: "foo-*"`) or `{ any: ["foo-*", "bar-*"] }`. |
+| `operation_type` | `string` | GraphQL operation type: `query`, `mutation`, `subscription`, or `*`. Required for `protocol: graphql` allow rules. |
+| `operation_name` | `string` | Optional GraphQL operation-name glob. Omit to match any operation name. |
+| `fields` | `string[]` | Optional GraphQL root-field globs. For allow rules, every selected root field must match one configured glob. For deny rules, any matching root field blocks the request. |
 
-Method and command fields use `*` as wildcard for "any". Path patterns use `**` for "match everything" and standard glob patterns with `/` as a delimiter otherwise. See `sandbox-policy.rego` -- `method_matches()`, `path_matches()`, `command_matches()`.
+Method, command, and GraphQL operation type fields use `*` as wildcard for "any". Path patterns use `**` for "match everything" and standard glob patterns with `/` as a delimiter otherwise. Query matching is case-sensitive and evaluates decoded values; when duplicate keys are present in the request, every value for that key must match the configured matcher. GraphQL field and operation-name matching also uses glob patterns. See `sandbox-policy.rego` -- `method_matches()`, `path_matches()`, `command_matches()`, `query_params_match()`, and `graphql_*`.
+
+GraphQL inspection supports `GET` and `POST` GraphQL-over-HTTP envelopes, JSON batches, named-operation selection, fragments at the operation root, Apollo persisted-query hashes, and service-specific saved-query IDs (`id`, `documentId`, or `queryId`). Hash-only or saved-query-only requests have no parseable document, so they are denied unless `persisted_queries: allow_registered` is set and the hash or ID appears in `graphql_persisted_queries`. If a batch contains any denied, malformed, or unregistered operation, the whole request is denied.
 
 #### Access Presets
 
 The `access` field provides shorthand for common rule sets. During preprocessing, presets are expanded into explicit `rules` arrays before Rego evaluation.
 
-| Preset       | Expands To                                                         | Description                              |
-| ------------ | ------------------------------------------------------------------ | ---------------------------------------- |
-| `read-only`  | `GET/**`, `HEAD/**`, `OPTIONS/**`                                  | Safe read-only HTTP methods on all paths |
-| `read-write` | `GET/**`, `HEAD/**`, `OPTIONS/**`, `POST/**`, `PUT/**`, `PATCH/**` | Read and write but not delete            |
-| `full`       | `*/**`                                                             | All methods, all paths                   |
+| Preset       | REST expansion                                                     | GraphQL expansion              | Description                              |
+| ------------ | ------------------------------------------------------------------ | ------------------------------ | ---------------------------------------- |
+| `read-only`  | `GET/**`, `HEAD/**`, `OPTIONS/**`                                  | `operation_type: query`        | Safe read-only access                    |
+| `read-write` | `GET/**`, `HEAD/**`, `OPTIONS/**`, `POST/**`, `PUT/**`, `PATCH/**` | `query`, `mutation`            | Read and write but not delete for REST   |
+| `full`       | `*/**`                                                             | `operation_type: "*"`          | All supported actions                    |
 
 See `crates/openshell-sandbox/src/l7/mod.rs` -- `expand_access_presets()`.
 
@@ -501,7 +588,7 @@ network_policies:
       - { path: /usr/bin/curl }
 ```
 
-Host wildcards compose with all other endpoint features — L7 inspection, TLS termination, multi-port, and `allowed_ips`:
+Host wildcards compose with all other endpoint features — L7 inspection, auto-TLS termination, multi-port, and `allowed_ips`:
 
 ```yaml
 network_policies:
@@ -511,7 +598,6 @@ network_policies:
       - host: "*.example.com"
         port: 8080
         protocol: rest
-        tls: terminate
         enforcement: enforce
         rules:
           - allow:
@@ -570,7 +656,6 @@ network_policies:
       - host: "*.example.com"
         ports: [443, 8443]
         protocol: rest
-        tls: terminate
         enforcement: enforce
         access: read-only
     binaries:
@@ -596,7 +681,7 @@ network_policies:
 
 Inference routing to `inference.local` is handled by the proxy's `InferenceContext`, not by the OPA policy engine or an `inference` block in the policy YAML. The proxy intercepts HTTPS CONNECT requests to `inference.local` and routes matching inference API requests (e.g., `POST /v1/chat/completions`, `POST /v1/messages`) through the sandbox-local `openshell-router`. See [Inference Routing](inference-routing.md) for details on route configuration and the router architecture.
 
-The proxy always runs in proxy mode so that `inference.local` is addressable from within the sandbox's network namespace. Inference route sources are configured separately from policy: via `--inference-routes` (file mode) or fetched from the gateway's inference bundle (cluster mode). See `crates/openshell-sandbox/src/proxy.rs` -- `InferenceContext`, `crates/openshell-sandbox/src/l7/inference.rs`.
+The proxy always runs in proxy mode so that `inference.local` is addressable from within the sandbox's network namespace. Inference route sources are configured separately from policy: via `--inference-routes` (file mode) or fetched from the gateway's inference bundle (gateway mode). See `crates/openshell-sandbox/src/proxy.rs` -- `InferenceContext`, `crates/openshell-sandbox/src/l7/inference.rs`.
 
 ---
 
@@ -650,11 +735,16 @@ flowchart LR
 | -------------------------- | -------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
 | `protocol` absent or empty | **L4 (transport)**               | The proxy performs a raw `copy_bidirectional` after the CONNECT handshake. No application-layer inspection occurs. Only the host:port and binary identity are checked.   |
 | `protocol: rest`           | **L7 (application)**             | The proxy parses each HTTP/1.1 request within the tunnel, evaluates method+path against the endpoint's `rules`, and either forwards or denies each request individually. |
+| `protocol: graphql`        | **L7 (application)**             | The proxy parses GraphQL-over-HTTP requests, classifies operation type, operation name, root fields, and persisted-query identifiers, then evaluates GraphQL allow and deny rules. |
 | `protocol: sql`            | **L7 (application, audit-only)** | Reserved for SQL protocol inspection. Currently falls through to passthrough with a warning. `enforcement: enforce` is rejected at validation time for SQL endpoints.    |
 
-This is the single most important behavioral trigger in the policy language. An endpoint with no `protocol` field passes traffic opaquely after the L4 (CONNECT) check. Adding `protocol: rest` activates per-request HTTP parsing and policy evaluation inside the proxy.
+This is the single most important behavioral trigger in the policy language. An endpoint with no `protocol` field passes traffic opaquely after the L4 (CONNECT) check. Adding `protocol: rest` or `protocol: graphql` activates per-request HTTP parsing and policy evaluation inside the proxy.
 
-**Implementation path**: After L4 CONNECT is allowed, the proxy calls `query_l7_config()` which evaluates the Rego rule `data.openshell.sandbox.matched_endpoint_config`. This rule only matches endpoints that have a `protocol` field set (see `sandbox-policy.rego` line `ep.protocol`). If a config is returned, the proxy enters `relay_with_inspection()` instead of `copy_bidirectional()`. See `crates/openshell-sandbox/src/proxy.rs` -- `handle_tcp_connection()`.
+**Implementation path**: After L4 CONNECT is allowed, the proxy calls `query_l7_route_snapshot()` which evaluates the Rego rule `data.openshell.sandbox._matching_endpoint_configs` and records the policy generation. If one or more endpoint `protocol` configs are returned, the proxy enters path-aware L7 route selection instead of `copy_bidirectional()`. See `crates/openshell-sandbox/src/proxy.rs` -- `handle_tcp_connection()`.
+
+For L7-inspected CONNECT tunnels, the proxy binds endpoint config and the per-tunnel policy engine clone to the policy generation observed at tunnel setup. If a live policy reload advances the generation, the relay closes the existing keep-alive tunnel before forwarding another request. HTTP passthrough tunnels without endpoint `protocol` use the same generation guard for parsed requests even though they do not evaluate L7 OPA rules. Clients should reconnect so the next request is evaluated under the current policy.
+
+Raw streams are connection-scoped and outside L7 live-reload guarantees. This includes endpoints with `tls: skip`, non-HTTP CONNECT payloads, SQL audit fallback passthrough, HTTP upgrades after `101 Switching Protocols`, and already-forwarded streaming response bodies such as SSE. A policy reload applies to the next connection or next parsed HTTP request; it does not terminate raw bytes already relayed outside the HTTP request parser.
 
 **Validation requirement**: When `protocol` is set, either `rules` or `access` must also be present. An endpoint with `protocol` but no rules/access is rejected at validation time because it would deny all traffic (no allow rules means nothing matches). See `crates/openshell-sandbox/src/l7/mod.rs` -- `validate_l7_policies()`.
 
@@ -689,15 +779,15 @@ If any condition fails, the proxy returns `403 Forbidden`.
 5. Resolves DNS and validates all IPs are private and within `allowed_ips`
 6. Connects to upstream
 7. Rewrites the request: absolute-form → origin-form (`GET /path HTTP/1.1`), strips hop-by-hop headers, adds `Via: 1.1 openshell-sandbox` and `Connection: close`
-8. Forwards the rewritten request, then relays bidirectionally using `tokio::io::copy_bidirectional` (supports chunked transfer, SSE streams, and other long-lived responses with no idle timeout)
+8. Relays the rewritten request and response through the shared guarded HTTP relay. This reuses the same request body framing, CL/TE rejection, credential rewrite fail-closed behavior, unsolicited `101` blocking, and policy-generation checks as CONNECT L7 HTTP.
 
-**V1 simplifications**: Forward proxy v1 injects `Connection: close` (no keep-alive) and does not perform L7 inspection on the forwarded traffic. Every forward proxy connection handles exactly one request-response exchange.
+**V1 simplifications**: Forward proxy v1 injects `Connection: close` (no keep-alive). Every forward proxy connection handles exactly one request-response exchange. The request is bound to the policy generation used for the L4 allow decision and is checked again before upstream connect and request forwarding. When an endpoint has L7 rules configured, the forward proxy also evaluates the single request's method and path against L7 policy before forwarding.
 
 **Implementation**: See `crates/openshell-sandbox/src/proxy.rs` -- `handle_forward_proxy()`, `parse_proxy_uri()`, `rewrite_forward_request()`.
 
 **Logging**: Forward proxy requests are logged distinctly from CONNECT:
 
-```
+```text
 FORWARD method=GET dst_host=10.86.8.223 dst_port=8000 path=/screenshot/ action=allow policy=computer-control
 ```
 
@@ -716,7 +806,7 @@ flowchart TD
     K -- No --> L["403 Forbidden"]
     K -- Yes --> M["TCP connect to upstream"]
     M --> N["Rewrite request to origin-form<br/>Add Via + Connection: close"]
-    N --> O["Forward request + copy_bidirectional"]
+    N --> O["Guarded HTTP relay"]
 ```
 
 #### Example: Forward Proxy Policy
@@ -746,25 +836,33 @@ resp = httpx.get("http://10.86.8.223:8000/screenshot/",
                  proxy="http://10.200.0.1:3128")
 ```
 
-### Behavioral Trigger: TLS Termination
+### Behavioral Trigger: TLS Handling
 
 **Trigger**: The `tls` field on a `NetworkEndpoint`.
 
+TLS termination is automatic. The proxy peeks the first bytes of every CONNECT tunnel and terminates TLS whenever a ClientHello is detected. This removes the need for explicit `tls: terminate` in policy — all HTTPS connections are automatically terminated for credential injection and (when configured) L7 inspection.
+
 | Condition                       | Behavior                                                                                                                                                                                                                                                            |
 | ------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `tls` absent or `"passthrough"` | For L7 endpoints: the proxy inspects plaintext only. For HTTPS endpoints (port 443), L7 rules will not be evaluated because the traffic is encrypted. A validation warning is emitted.                                                                              |
-| `tls: "terminate"`              | The proxy performs MITM TLS termination: it presents a dynamically-generated certificate (signed by an ephemeral per-sandbox CA) to the client, decrypts the traffic, inspects the plaintext HTTP, then re-encrypts to upstream using real root CAs (webpki-roots). |
+| `tls` absent or `""` (default)  | **Auto-detect**: The proxy peeks the first bytes of the tunnel. If TLS is detected (ClientHello pattern), the proxy terminates TLS transparently (MITM), enabling credential injection and L7 inspection. If plaintext HTTP is detected, the proxy inspects directly. If neither, traffic is relayed raw. |
+| `tls: "skip"`                   | **Explicit opt-out**: No TLS detection, no termination, no credential injection. The tunnel is a raw `copy_bidirectional` relay. Use for client-cert mTLS to upstream or non-standard binary protocols. |
+| `tls: "terminate"` _(deprecated)_ | Treated as auto-detect. Emits a deprecation warning: "TLS termination is now automatic. Use `tls: skip` to explicitly disable." |
+| `tls: "passthrough"` _(deprecated)_ | Treated as auto-detect. Emits the same deprecation warning. |
 
-**Prerequisites for TLS termination**:
+**Prerequisites for TLS termination (auto-detect path)**:
 
-- The `protocol` field must also be set. `tls: terminate` without `protocol` is rejected at validation time.
 - The sandbox supervisor generates an ephemeral CA at startup (`SandboxCa::generate()`) and writes it to `/etc/openshell-tls/`.
 - Trust store environment variables are set on the child process: `NODE_EXTRA_CA_CERTS`, `SSL_CERT_FILE`, `REQUESTS_CA_BUNDLE`, `CURL_CA_BUNDLE`.
 - A combined CA bundle (system CAs + sandbox CA) is written to `/etc/openshell-tls/ca-bundle.pem` so `SSL_CERT_FILE` replaces the default trust store while still trusting real CAs.
 
 **Certificate caching**: Per-hostname leaf certificates are cached (up to 256 entries, then the entire cache is cleared). See `crates/openshell-sandbox/src/l7/tls.rs` -- `CertCache`.
 
-**Validation warning**: When `protocol: rest` is set on port 443 without `tls: terminate`, the validator emits a warning: "L7 rules won't be evaluated on encrypted traffic without `tls: terminate`".
+**Credential injection**: When TLS is auto-terminated but no L7 policy is configured (no `protocol` field), the proxy enters a passthrough relay that rewrites credential placeholders in HTTP headers (via `SecretResolver`) and logs requests for observability, but does not evaluate L7 OPA rules. The relay still closes parsed keep-alive HTTP tunnels after policy generation changes before forwarding another request. This means credential injection works on all HTTPS endpoints automatically.
+
+**Validation warnings**:
+
+- `tls: terminate` or `tls: passthrough`: deprecated, emits a warning.
+- `tls: skip` with `protocol: rest` on port 443: emits a warning ("L7 inspection cannot work on encrypted traffic").
 
 ### Behavioral Trigger: Enforcement Mode
 
@@ -806,6 +904,10 @@ The response includes an `X-OpenShell-Policy` header and `Connection: close`. Se
 
 ## Seccomp Filter Details
 
+The seccomp filter uses a default-allow policy (`SeccompAction::Allow`) with targeted rules that return `EPERM`. It provides three layers of protection: socket domain blocks, unconditional syscall blocks, and conditional syscall blocks. See `crates/openshell-sandbox/src/sandbox/linux/seccomp.rs`.
+
+### Blocked socket domains
+
 Regardless of network mode, certain socket domains are always blocked:
 
 | Domain         | Constant | Reason                                                                          |
@@ -817,7 +919,30 @@ Regardless of network mode, certain socket domains are always blocked:
 
 In proxy mode (which is always active), `AF_INET` (2) and `AF_INET6` (10) are allowed so the sandbox process can reach the proxy.
 
-The seccomp filter uses a default-allow policy (`SeccompAction::Allow`) with specific `socket()` syscall rules that return `EPERM` when the first argument (domain) matches a blocked value. See `crates/openshell-sandbox/src/sandbox/linux/seccomp.rs`.
+### Blocked syscalls
+
+These syscalls are blocked unconditionally (EPERM for any invocation):
+
+| Syscall | NR (x86-64) | Reason |
+|---------|-------------|--------|
+| `memfd_create` | 319 | Fileless binary execution bypasses Landlock filesystem restrictions |
+| `ptrace` | 101 | Cross-process memory inspection and code injection |
+| `bpf` | 321 | Kernel BPF program loading |
+| `process_vm_readv` | 310 | Cross-process memory read |
+| `io_uring_setup` | 425 | Async I/O subsystem with extensive CVE history |
+| `mount` | 165 | Filesystem mount could subvert Landlock or overlay writable paths |
+
+### Conditionally blocked syscalls
+
+These syscalls are blocked only when specific flag patterns are present in their arguments:
+
+| Syscall | NR (x86-64) | Condition | Reason |
+|---------|-------------|-----------|--------|
+| `execveat` | 322 | `AT_EMPTY_PATH` (0x1000) set in flags (arg4) | Fileless execution from an anonymous fd |
+| `unshare` | 272 | `CLONE_NEWUSER` (0x10000000) set in flags (arg0) | User namespace creation enables privilege escalation |
+| `seccomp` | 317 | operation == `SECCOMP_SET_MODE_FILTER` (1) in arg0 | Prevents sandboxed code from replacing the active filter |
+
+Flag checks use `MaskedEq` (`(arg & mask) == mask`) to detect the flag bit regardless of other bits. The `seccomp` syscall check uses `Eq` for exact value comparison on the operation argument.
 
 ---
 
@@ -868,11 +993,14 @@ sequenceDiagram
     OPA-->>Proxy: allowed=true, matched_policy="api_policy"
     Proxy-->>Client: 200 Connection Established
 
-    Note over Proxy: Query L7 config for matched endpoint
-    Proxy->>OPA: query_endpoint_config(host, port, binary)
-    OPA-->>Proxy: {protocol: rest, tls: terminate, enforcement: enforce}
+    Note over Proxy: Query L7 config and generation for matched endpoint
+    Proxy->>OPA: query_endpoint_config_with_generation(host, port, binary)
+    OPA-->>Proxy: {protocol: rest, enforcement: enforce}, generation=N
+    Proxy->>OPA: clone_engine_for_tunnel(generation=N)
+    OPA-->>Proxy: generation-bound tunnel evaluator
 
-    Note over Proxy: TLS termination (if configured)
+    Note over Proxy: Auto-detect TLS (peek first bytes)
+    Note over Proxy: TLS ClientHello detected → terminate
     Client->>Proxy: TLS ClientHello
     Proxy-->>Client: TLS ServerHello (ephemeral cert for host)
     Note over Proxy: Decrypt client traffic
@@ -883,9 +1011,12 @@ sequenceDiagram
 
     loop Per HTTP request in tunnel
         Client->>Proxy: GET /repos/myorg/foo HTTP/1.1
+        Note over Proxy: Close if policy generation changed
         Note over Proxy: Parse HTTP request line + headers
+        Note over Proxy: Close if policy generation changed
         Proxy->>OPA: allow_request(method=GET, path=/repos/myorg/foo)
         OPA-->>Proxy: allowed=true
+        Note over Proxy: Close if policy generation changed
         Proxy->>Upstream: GET /repos/myorg/foo HTTP/1.1
         Upstream-->>Proxy: 200 OK (response body)
         Proxy-->>Client: 200 OK (response body)
@@ -917,11 +1048,11 @@ The following validation rules are enforced during policy loading (both file mod
 | ---------------------------------------------- | ------------------------------------------------------------------------------------------ |
 | Both `rules` and `access` on the same endpoint | `rules and access are mutually exclusive`                                                  |
 | `protocol` set without `rules` or `access`     | `protocol requires rules or access to define allowed traffic`                              |
-| `tls: terminate` without `protocol`            | `TLS termination requires a protocol for L7 inspection`                                    |
 | `protocol: sql` with `enforcement: enforce`    | `SQL enforcement requires full SQL parsing (not available in v1). Use enforcement: audit.` |
 | `rules: []` (empty list)                       | `rules list cannot be empty (would deny all traffic). Use access: full or remove rules.`   |
 | Host wildcard is bare `*` or `**`              | `host wildcard '*' matches all hosts; use specific patterns like '*.example.com'`          |
 | Host wildcard does not start with `*.` or `**.`| `host wildcard must start with '*.' or '**.' (e.g., '*.example.com'), got '{host}'`        |
+| `allowed_ips` entry overlaps always-blocked range | `allowed_ips entry {entry} falls within always-blocked range (loopback/link-local/unspecified)` |
 | Invalid HTTP method in REST rules              | _(warning, not error)_                                                                     |
 
 ### Errors (Live Update Rejection)
@@ -934,11 +1065,22 @@ These errors are returned by the gateway's `UpdateSandboxPolicy` handler and rej
 | `landlock` differs from version 1 | `landlock policy cannot be changed on a live sandbox (applied at startup)` |
 | `process` differs from version 1 | `process policy cannot be changed on a live sandbox (applied at startup)` |
 
+### Errors (Rule Merge Rejection)
+
+These errors are returned by the gateway's `merge_chunk_into_policy` when approving proposed rules. See `crates/openshell-server/src/grpc/policy.rs` -- `validate_rule_not_always_blocked()`.
+
+| Condition | Error Message |
+|-----------|---------------|
+| Proposed endpoint host is a literal always-blocked IP | `proposed rule endpoint host '{host}' is an always-blocked address (loopback/link-local/unspecified)` |
+| Proposed endpoint host is `localhost` | `proposed rule endpoint host 'localhost' is always blocked` |
+| Proposed `allowed_ips` entry overlaps always-blocked range | `proposed rule contains always-blocked allowed_ips entry '{entry}'` |
+
 ### Warnings (Log Only)
 
 | Condition                                                                    | Warning Message                                                                                   |
 | ---------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------- |
-| `protocol: rest` on port 443 without `tls: terminate`                        | `L7 rules won't be evaluated on encrypted traffic without tls: terminate`                         |
+| `tls: terminate` or `tls: passthrough` on any endpoint                       | `'tls: {value}' is deprecated; TLS termination is now automatic. Use 'tls: skip' to disable.`    |
+| `tls: skip` with L7 rules on port 443                                       | `'tls: skip' with L7 rules on port 443 — L7 inspection cannot work on encrypted traffic`         |
 | Host wildcard with ≤2 labels (e.g., `*.com`)                                | `host wildcard '*.com' is very broad (covers all subdomains of a TLD)`                            |
 | Unknown HTTP method in rules (not GET/HEAD/POST/PUT/DELETE/PATCH/OPTIONS/\*) | `Unknown HTTP method '{method}'. Standard methods: GET, HEAD, POST, PUT, DELETE, PATCH, OPTIONS.` |
 
@@ -960,9 +1102,13 @@ These IP ranges are **always blocked**, even when `allowed_ips` is configured on
 |-------|-------------|--------|
 | `127.0.0.0/8` | IPv4 loopback | Prevents proxy bypass via localhost |
 | `169.254.0.0/16` | IPv4 link-local | Prevents cloud metadata SSRF (`169.254.169.254`) |
+| `0.0.0.0` | IPv4 unspecified | Prevents binding/connecting to all interfaces |
 | `::1` | IPv6 loopback | Prevents proxy bypass via IPv6 localhost |
+| `::` | IPv6 unspecified | Prevents binding/connecting to all interfaces |
 | `fe80::/10` | IPv6 link-local | Prevents IPv6 link-local access |
 | `::ffff:0:0/96` (mapped) | IPv4-mapped IPv6 addresses are unwrapped and checked as IPv4 | |
+
+These ranges are enforced at multiple layers: load-time validation rejects `allowed_ips` entries that overlap these ranges (see [`parse_allowed_ips`](#implementation)), the server rejects proposed rules targeting them (see [Server-Side Defense-in-Depth](#server-side-defense-in-depth)), and the proxy runtime blocks resolved IPs that fall within them.
 
 ### Default-Blocked IP Ranges (Private)
 
@@ -977,17 +1123,32 @@ These ranges are blocked by default but can be selectively allowed via the `allo
 
 ### Implementation
 
-Functions in `crates/openshell-sandbox/src/proxy.rs` implement the SSRF checks:
+IP classification helpers live in `crates/openshell-core/src/net.rs` and are shared across the sandbox proxy, the mechanistic mapper, and the gateway server:
 
-- **`is_internal_ip(ip: IpAddr) -> bool`**: Classifies an IP address as internal or public. Checks loopback, link-local, and RFC 1918 ranges. For IPv6, unwraps IPv4-mapped addresses (`::ffff:x.x.x.x`) via `to_ipv4_mapped()` and applies IPv4 checks. Used in the default (no `allowed_ips`) code path.
+- **`is_always_blocked_ip(ip: IpAddr) -> bool`**: Checks if an IP is always blocked regardless of policy — loopback (`127.0.0.0/8`), link-local (`169.254.0.0/16`), and unspecified (`0.0.0.0`). For IPv6, unwraps IPv4-mapped addresses (`::ffff:x.x.x.x`) via `to_ipv4_mapped()` and applies IPv4 checks. Used in the `allowed_ips` code path and by `implicit_allowed_ips_for_ip_host` to enforce the hard block even when private IPs are permitted.
 
-- **`is_always_blocked_ip(ip: IpAddr) -> bool`**: Checks if an IP is always blocked regardless of policy — loopback and link-local only. Used in the `allowed_ips` code path to enforce the hard block on loopback and link-local even when private IPs are permitted.
+- **`is_always_blocked_net(net: IpNet) -> bool`**: Checks if a CIDR network overlaps any always-blocked range. Returns `true` if the network contains or overlaps loopback, link-local, or unspecified addresses. A CIDR like `0.0.0.0/0` is rejected because it contains always-blocked addresses. Used at policy load time by `parse_allowed_ips` and at server-side approval time by `validate_rule_not_always_blocked`.
 
-- **`resolve_and_reject_internal(host, port) -> Result<Vec<SocketAddr>, String>`**: Default SSRF check. Resolves DNS via `tokio::net::lookup_host()`, then checks every resolved address against `is_internal_ip()`. If any address is internal, the entire connection is rejected.
+- **`is_internal_ip(ip: IpAddr) -> bool`**: Classifies an IP address as internal or public. Broader than `is_always_blocked_ip` — also includes RFC 1918 private ranges (`10/8`, `172.16/12`, `192.168/16`) and IPv6 ULA (`fc00::/7`). Used in the default (no `allowed_ips`) SSRF code path and by the mechanistic mapper to detect when `allowed_ips` should be populated in proposals.
 
-- **`resolve_and_check_allowed_ips(host, port, allowed_ips) -> Result<Vec<SocketAddr>, String>`**: Allowlist-based SSRF check. Resolves DNS, rejects any always-blocked IPs, then verifies every resolved address matches at least one entry in the `allowed_ips` list.
+Runtime resolution and enforcement functions remain in `crates/openshell-sandbox/src/proxy.rs`:
 
-- **`parse_allowed_ips(raw) -> Result<Vec<IpNet>, String>`**: Parses CIDR/IP strings into typed `IpNet` values. Rejects entries that cover loopback or link-local ranges. Accepts both CIDR notation (`10.0.5.0/24`) and bare IPs (`10.0.5.20`, treated as `/32`).
+- **`resolve_and_reject_internal(host, port, entrypoint_pid) -> Result<Vec<SocketAddr>, String>`**: Default SSRF check. Resolves the host using the sandbox's `/etc/hosts` first on Linux (via `/proc/<pid>/root/etc/hosts`, which captures Kubernetes `hostAliases`), then falls back to `tokio::net::lookup_host()`. It checks every resolved address against `is_internal_ip()`. If any address is internal, the entire connection is rejected.
+
+- **`resolve_and_check_allowed_ips(host, port, allowed_ips, entrypoint_pid) -> Result<Vec<SocketAddr>, String>`**: Allowlist-based SSRF check. Resolves the host using the sandbox's `/etc/hosts` first on Linux, rejects any always-blocked IPs, then verifies every resolved address matches at least one entry in the `allowed_ips` list.
+
+- **`parse_allowed_ips(raw) -> Result<Vec<IpNet>, String>`**: Parses CIDR/IP strings into typed `IpNet` values. **Rejects entries at load time** that overlap always-blocked ranges (loopback, link-local, unspecified) via `is_always_blocked_net`. Accepts both CIDR notation (`10.0.5.0/24`) and bare IPs (`10.0.5.20`, treated as `/32`). This prevents confusing UX where an entry is accepted in policy but silently denied at runtime.
+
+- **`implicit_allowed_ips_for_ip_host(host) -> Vec<String>`**: When a policy endpoint has a literal IP address as its host (e.g., `10.0.5.20`), synthesizes an `allowed_ips` entry so the allowlist-validation path is used instead of blanket internal-IP rejection. **Skips always-blocked addresses** — if the host is loopback, link-local, or unspecified, returns empty and logs a warning instead of synthesizing an un-enforceable entry.
+
+### Server-Side Defense-in-Depth
+
+The gateway server provides an additional validation layer when merging proposed rules into a sandbox's active policy. Before `merge_chunk_into_policy` applies a proposed rule, it calls `validate_rule_not_always_blocked` (in `crates/openshell-server/src/grpc/policy.rs`) which:
+
+1. Checks if the proposed endpoint host is a literal always-blocked IP (via `is_always_blocked_ip`) or `localhost`.
+2. Checks each `allowed_ips` entry for overlap with always-blocked ranges (via `is_always_blocked_net`).
+
+If either check fails, the merge returns `INVALID_ARGUMENT` and the proposed rule is not applied. This prevents always-blocked destinations from entering the active policy even if the sandbox's mechanistic mapper or an older sandbox version did not filter them.
 
 ### Placement in Proxy Flow
 
@@ -1003,8 +1164,11 @@ flowchart TD
     D --> E{Allowed?}
     E -- No --> F["403 Forbidden"]
     E -- Yes --> G{allowed_ips on endpoint?}
-    G -- Yes --> H["resolve_and_check_allowed_ips(host, port, nets)"]
-    H --> I{All IPs in allowlist<br/>and not loopback/link-local?}
+    G -- Yes --> VAL["parse_allowed_ips:<br/>validate no always-blocked entries"]
+    VAL --> VAL_OK{Valid?}
+    VAL_OK -- No --> J2["Connection rejected<br/>(always-blocked entry in allowed_ips)"]
+    VAL_OK -- Yes --> H["resolve_and_check_allowed_ips(host, port, nets)"]
+    H --> I{All IPs in allowlist<br/>and not always-blocked?}
     I -- No --> J["403 Forbidden + log warning"]
     I -- Yes --> K["TcpStream::connect(resolved addrs)"]
     G -- No --> L["resolve_and_reject_internal(host, port)"]
@@ -1014,7 +1178,8 @@ flowchart TD
     K --> N["200 Connection Established"]
 
     FP --> FP_OPA["OPA evaluation + require allowed_ips"]
-    FP_OPA --> FP_RESOLVE["resolve_and_check_allowed_ips"]
+    FP_OPA --> FP_VAL["parse_allowed_ips: validate"]
+    FP_VAL --> FP_RESOLVE["resolve_and_check_allowed_ips"]
     FP_RESOLVE --> FP_PRIVATE{All IPs private?}
     FP_PRIVATE -- No --> J
     FP_PRIVATE -- Yes --> FP_CONNECT["TCP connect + rewrite + relay"]
@@ -1022,7 +1187,13 @@ flowchart TD
 
 ### Private IP Access via `allowed_ips`
 
-The `allowed_ips` field on a `NetworkEndpoint` enables controlled access to private IP space. When present, the default SSRF internal-IP rejection is replaced by an allowlist check: resolved IPs must match at least one entry in `allowed_ips`, and loopback/link-local are still always blocked.
+The `allowed_ips` field on a `NetworkEndpoint` enables controlled access to private IP space. When present, the default SSRF internal-IP rejection is replaced by an allowlist check: resolved IPs must match at least one entry in `allowed_ips`, and always-blocked ranges (loopback, link-local, unspecified) are still rejected.
+
+**Load-time validation**: `parse_allowed_ips` rejects entries that overlap always-blocked ranges with a hard error at policy load time. This catches misconfigurations early — an entry like `127.0.0.0/8` or `0.0.0.0/0` in `allowed_ips` would be silently un-enforceable at runtime, so it is rejected before the policy is applied. The same validation runs in both file mode (sandbox startup) and gRPC mode (live policy updates via `OpaEngine::reload_from_proto`).
+
+**Sandbox `/etc/hosts` and `hostAliases`**: On Linux, the proxy consults the sandbox's `/etc/hosts` before falling back to DNS. This gives policy evaluation the same hostname-to-IP view that sandboxed tools see when Kubernetes `hostAliases` populate `/etc/hosts`. This is resolver input only. It does **not** synthesize `allowed_ips`, and it does not bypass the private-IP SSRF check. If `searxng.local` resolves to `192.168.1.105`, the request still needs `allowed_ips: ["192.168.1.105/32"]` to succeed.
+
+**Implicit `allowed_ips` for IP hosts**: When a policy endpoint has a literal IP address as its host (e.g., `host: 10.0.5.20`), the proxy synthesizes an `allowed_ips` entry automatically via `implicit_allowed_ips_for_ip_host`. If the host is an always-blocked address (e.g., `127.0.0.1`, `169.254.169.254`, `0.0.0.0`), the function returns empty and logs a warning — no `allowed_ips` entry is synthesized, so the standard SSRF rejection applies.
 
 This supports three usage modes:
 
@@ -1032,13 +1203,31 @@ This supports three usage modes:
 | **Host + allowlist** | `host` + `allowed_ips` | Domain must match `host` AND resolve to an IP in `allowed_ips` |
 | **Hostless allowlist** | `allowed_ips` only (no `host`) | Any domain allowed on the specified `port`, as long as it resolves to an IP in `allowed_ips` |
 
+Example:
+
+```yaml
+network_policies:
+  websearch:
+    name: websearch
+    endpoints:
+      - host: searxng.local
+        port: 8080
+        allowed_ips:
+          - "192.168.1.105/32"
+    binaries:
+      - path: /usr/bin/curl
+```
+
+With a matching sandbox `/etc/hosts` entry such as `192.168.1.105 searxng.local`, this policy works. Without the `allowed_ips` entry, the request stays blocked because the resolved destination is private.
+
 #### `allowed_ips` Format
 
 Entries can be:
+
 - **CIDR notation**: `10.0.5.0/24`, `172.16.0.0/12`, `192.168.1.0/24`
 - **Exact IP**: `10.0.5.20` (treated as `/32` for IPv4 or `/128` for IPv6)
 
-Entries that cover loopback (`127.0.0.0/8`) or link-local (`169.254.0.0/16`) ranges are rejected at parse time.
+Entries that overlap always-blocked ranges — loopback (`127.0.0.0/8`), link-local (`169.254.0.0/16`), or unspecified (`0.0.0.0`) — are rejected at load time with a hard error. Broad CIDRs that contain always-blocked addresses (e.g., `0.0.0.0/0`) are also rejected.
 
 #### Hostless Endpoints (`allowed_ips` without `host`)
 
@@ -1125,14 +1314,13 @@ network_policies:
     binaries:
       - { path: /usr/local/bin/claude }
 
-  # L7 + TLS termination: Full access with HTTPS inspection
+  # L7 + auto-TLS: Full access with HTTPS inspection (TLS terminated automatically)
   claude_code_inspected:
     name: claude_code_inspected
     endpoints:
       - host: api.anthropic.com
         port: 443
         protocol: rest
-        tls: terminate
         enforcement: enforce
         access: full
     binaries:
@@ -1217,14 +1405,13 @@ network_policies:
     binaries:
       - { path: /usr/bin/curl }
 
-  # Multi-port with L7: same L7 rules applied across two ports
+  # Multi-port with L7: same L7 rules applied across two ports (TLS auto-terminated)
   multi_port_l7:
     name: multi_port_l7
     endpoints:
       - host: api.internal.svc
         ports: [8080, 9090]
         protocol: rest
-        tls: terminate
         enforcement: enforce
         access: read-only
     binaries:
@@ -1302,14 +1489,14 @@ Evaluated on every CONNECT request and every forward proxy request. The same OPA
 | `network_action`          | Same input                                                                                                        | `"allow"` if endpoint + binary matched, `"deny"` otherwise                                    |
 | `deny_reason`             | Same input                                                                                                        | Human-readable string explaining why access was denied                                        |
 | `matched_network_policy`  | Same input                                                                                                        | Name of the matched policy (for audit logging)                                                |
-| `matched_endpoint_config` | Same input                                                                                                        | Raw endpoint object for L7 config extraction (returned if endpoint has `protocol` or `allowed_ips` field) |
+| `matched_endpoint_config` | Same input                                                                                                        | Raw endpoint object for L7 config extraction (returned if endpoint has `protocol`, `allowed_ips`, or explicit TLS config) |
 
 ### L7 Rules (per-request within tunnel)
 
-| Rule                  | Signature                                                                       | Returns                                                        |
-| --------------------- | ------------------------------------------------------------------------------- | -------------------------------------------------------------- |
-| `allow_request`       | `input.network.*`, `input.exec.*`, `input.request.method`, `input.request.path` | `true` if the request matches any rule in the matched endpoint |
-| `request_deny_reason` | Same input                                                                      | Human-readable deny message                                    |
+| Rule                  | Signature                                                                                                  | Returns                                                        |
+| --------------------- | ---------------------------------------------------------------------------------------------------------- | -------------------------------------------------------------- |
+| `allow_request`       | `input.network.*`, `input.exec.*`, `input.request.method`, `input.request.path`, optional `request.graphql` | `true` if the request matches the matched endpoint's L7 rules |
+| `request_deny_reason` | Same input                                                                                                 | Human-readable deny message                                    |
 
 See `sandbox-policy.rego` for the full Rego implementation.
 
@@ -1382,6 +1569,7 @@ An empty `sources`/`log_sources` list means no source filtering (all sources pas
 
 - [Sandbox Architecture](sandbox.md) -- Full sandbox lifecycle, enforcement mechanisms, and component interaction
 - [Gateway Architecture](gateway.md) -- How the gateway stores and delivers policies via gRPC
+- [Gateway Settings Channel](gateway-settings.md) -- Runtime settings channel, global policy override, CLI/TUI settings commands
 - [Inference Routing](inference-routing.md) -- How `inference.local` requests are routed to model backends
 - [Overview](README.md) -- System-level context for how policies fit into the platform
 - [Plain HTTP Forward Proxy Plan](plans/plain-http-forward-proxy.md) -- Design document for the forward proxy feature

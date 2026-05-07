@@ -6,21 +6,40 @@
 #
 # Tasks are defined in tasks/*.toml — run `mise tasks` to list them all.
 
+# NOTE: keep this version in sync with what CI uses in Dockerfile.ci
+min_version = { soft = "2026.4.25" }
+
 redactions = ["*_TOKEN", "*_PASSWORD"]
 
 [settings]
 experimental = true
+python.precompiled_flavor = "install_only_stripped"
+
+lockfile = true
+lockfile_platforms = ["linux-x64", "linux-arm64", "macos-arm64"]
 
 [tools]
-python = "3.13.12"
-rust = "stable"
-kubectl = "1.35.1"
-uv = "0.10.2"
+python = "3.13.13"
+rust = "1.95.0"
+node = "24.15.0"
+kubectl = "1.35.4"
+uv = "0.10.12"
 protoc = "29.6"
-helm = "4.1.1"
-"ubi:mozilla/sccache" = { version = "0.14.0", matching = "sccache-v" }
-"ubi:anchore/syft" = { version = "1.42.2", matching = "syft_" }
-"ubi:EmbarkStudios/cargo-about" = "0.8.4"
+helm = "4.1.4"
+skaffold = "2.19.0"
+k3d = "5.8.3"
+"github:anchore/syft" = { version = "1.43.0" }
+"github:EmbarkStudios/cargo-about" = { version = "0.8.4", version_prefix = "" }
+zig = "0.14.1"
+"cargo:cargo-zigbuild" = { version = "0.22.3", os = ["macos"] }
+"npm:markdownlint-cli2" = "0.22.0"
+
+[tools."github:mozilla/sccache"]
+version = "0.14.0"
+
+[tools."github:mozilla/sccache".platforms]
+# NOTE: this override is necessary only for linux-x64, otherwise it selects an invalid artifact (sccache-dist-vx.y.z-x86_64-unknown-linux-musl.tar.gz)
+linux-x64 = { asset_pattern = "sccache-v*x86_64*linux*.tar.gz" }
 
 [env]
 _.path = ["{{config_root}}/scripts/bin"]
@@ -36,7 +55,8 @@ UV_CACHE_DIR = "{{config_root}}/.cache/uv"
 RUSTC_WRAPPER = "sccache"
 SCCACHE_DIR = "{{config_root}}/.cache/sccache"
 
-# Shared build constants (overridable via environment)
+# Shared build constants (overridable via environment).
+# DOCKER_BUILDKIT enables BuildKit for Docker; ignored by podman.
 DOCKER_BUILDKIT = "1"
 
 [vars]

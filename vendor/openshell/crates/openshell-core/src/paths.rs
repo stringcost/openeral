@@ -29,6 +29,19 @@ pub fn openshell_config_dir() -> Result<PathBuf> {
     Ok(xdg_config_dir()?.join("openshell"))
 }
 
+/// Resolve the XDG data base directory.
+///
+/// Returns `$XDG_DATA_HOME` if set, otherwise `$HOME/.local/share`.
+pub fn xdg_data_dir() -> Result<PathBuf> {
+    if let Ok(path) = std::env::var("XDG_DATA_HOME") {
+        return Ok(PathBuf::from(path));
+    }
+    let home = std::env::var("HOME")
+        .into_diagnostic()
+        .wrap_err("HOME is not set")?;
+    Ok(PathBuf::from(home).join(".local").join("share"))
+}
+
 /// Create a directory (and parents) with owner-only permissions (`0o700`) on
 /// Unix. On non-Unix platforms, falls back to default permissions.
 ///
@@ -92,9 +105,7 @@ pub fn ensure_parent_dir_restricted(path: &Path) -> Result<()> {
 #[cfg(unix)]
 pub fn is_file_permissions_too_open(path: &Path) -> bool {
     use std::os::unix::fs::PermissionsExt;
-    std::fs::metadata(path)
-        .map(|m| m.permissions().mode() & 0o077 != 0)
-        .unwrap_or(false)
+    std::fs::metadata(path).is_ok_and(|m| m.permissions().mode() & 0o077 != 0)
 }
 
 #[cfg(test)]

@@ -51,15 +51,7 @@ dev = [
     "maturin>=1.5,<2.0",
     "setuptools-scm>=8",
     "grpcio-tools>=1.60",
-]
-docs = [
-    "sphinx<=7.5",
-    "myst-parser<=5",
-    "sphinx-copybutton<=0.6",
-    "sphinx-design",
-    "sphinx-autobuild",
-    "sphinxcontrib-mermaid",
-    "nvidia-sphinx-theme",
+    "pyelftools>=0.30",
 ]
 
 [tool.uv]

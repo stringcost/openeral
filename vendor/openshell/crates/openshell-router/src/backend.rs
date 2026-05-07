@@ -4,6 +4,7 @@
 use crate::RouterError;
 use crate::config::{AuthHeader, ResolvedRoute};
 use crate::mock;
+use std::collections::HashSet;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ValidatedEndpoint {
@@ -31,6 +32,11 @@ struct ValidationProbe {
     path: &'static str,
     protocol: &'static str,
     body: bytes::Bytes,
+    /// Alternate body to try when the primary probe fails with HTTP 400.
+    /// Used for `OpenAI` chat completions where newer models require
+    /// `max_completion_tokens` while legacy/self-hosted backends only
+    /// accept `max_tokens`.
+    fallback_body: Option<bytes::Bytes>,
 }
 
 /// Response from a proxied HTTP request to a backend (fully buffered).
@@ -57,6 +63,9 @@ enum StreamingBody {
     Buffered(Option<bytes::Bytes>),
 }
 
+const COMMON_INFERENCE_REQUEST_HEADERS: [&str; 4] =
+    ["content-type", "accept", "accept-encoding", "user-agent"];
+
 impl StreamingProxyResponse {
     /// Create from a fully-buffered [`ProxyResponse`] (for mock routes).
     pub fn from_buffered(resp: ProxyResponse) -> Self {
@@ -78,19 +87,78 @@ impl StreamingProxyResponse {
     }
 }
 
+fn sanitize_request_headers(
+    route: &ResolvedRoute,
+    headers: &[(String, String)],
+) -> Vec<(String, String)> {
+    let mut allowed = HashSet::new();
+    allowed.extend(
+        COMMON_INFERENCE_REQUEST_HEADERS
+            .iter()
+            .map(|name| (*name).to_string()),
+    );
+    allowed.extend(
+        route
+            .passthrough_headers
+            .iter()
+            .map(|name| name.to_ascii_lowercase()),
+    );
+    allowed.extend(
+        route
+            .default_headers
+            .iter()
+            .map(|(name, _)| name.to_ascii_lowercase()),
+    );
+
+    headers
+        .iter()
+        .filter_map(|(name, value)| {
+            let name_lc = name.to_ascii_lowercase();
+            if should_strip_request_header(&name_lc) || !allowed.contains(&name_lc) {
+                return None;
+            }
+            Some((name.clone(), value.clone()))
+        })
+        .collect()
+}
+
+fn should_strip_request_header(name: &str) -> bool {
+    matches!(
+        name,
+        "authorization" | "x-api-key" | "host" | "content-length"
+    ) || is_hop_by_hop_header(name)
+}
+
+fn is_hop_by_hop_header(name: &str) -> bool {
+    matches!(
+        name,
+        "connection"
+            | "keep-alive"
+            | "proxy-authenticate"
+            | "proxy-authorization"
+            | "proxy-connection"
+            | "te"
+            | "trailer"
+            | "transfer-encoding"
+            | "upgrade"
+    )
+}
+
 /// Build and send an HTTP request to the backend configured in `route`.
 ///
-/// Returns the [`reqwest::Response`] with status, headers, and an un-consumed
-/// body stream. Shared by both the buffered and streaming public APIs.
-async fn send_backend_request(
+/// Returns the prepared [`reqwest::RequestBuilder`] with auth, headers, model
+/// rewrite, and body applied. The caller decides whether to apply a total
+/// request timeout before sending.
+fn prepare_backend_request(
     client: &reqwest::Client,
     route: &ResolvedRoute,
     method: &str,
     path: &str,
-    headers: Vec<(String, String)>,
+    headers: &[(String, String)],
     body: bytes::Bytes,
-) -> Result<reqwest::Response, RouterError> {
+) -> Result<(reqwest::RequestBuilder, String), RouterError> {
     let url = build_backend_url(&route.endpoint, path);
+    let headers = sanitize_request_headers(route, headers);
 
     let reqwest_method: reqwest::Method = method
         .parse()
@@ -107,17 +175,7 @@ async fn send_backend_request(
             builder = builder.header(*header_name, &route.api_key);
         }
     }
-
-    // Strip auth and host headers — auth is re-injected above from the route
-    // config, and host must match the upstream.
-    let strip_headers: [&str; 3] = ["authorization", "x-api-key", "host"];
-
-    // Forward non-sensitive headers.
     for (name, value) in &headers {
-        let name_lc = name.to_ascii_lowercase();
-        if strip_headers.contains(&name_lc.as_str()) {
-            continue;
-        }
         builder = builder.header(name.as_str(), value.as_str());
     }
 
@@ -146,15 +204,55 @@ async fn send_backend_request(
     };
     builder = builder.body(body);
 
-    builder.send().await.map_err(|e| {
-        if e.is_timeout() {
-            RouterError::UpstreamUnavailable(format!("request to {url} timed out"))
-        } else if e.is_connect() {
-            RouterError::UpstreamUnavailable(format!("failed to connect to {url}: {e}"))
-        } else {
-            RouterError::Internal(format!("HTTP request failed: {e}"))
-        }
-    })
+    Ok((builder, url))
+}
+
+/// Send an error-mapped request, shared by both buffered and streaming paths.
+fn map_send_error(e: reqwest::Error, url: &str) -> RouterError {
+    if e.is_timeout() {
+        RouterError::UpstreamUnavailable(format!("request to {url} timed out"))
+    } else if e.is_connect() {
+        RouterError::UpstreamUnavailable(format!("failed to connect to {url}: {e}"))
+    } else {
+        RouterError::Internal(format!("HTTP request failed: {e}"))
+    }
+}
+
+/// Build and send an HTTP request to the backend with a total request timeout.
+///
+/// The timeout covers the entire request lifecycle (connect + headers + body).
+/// Suitable for non-streaming responses where the body is buffered completely.
+async fn send_backend_request(
+    client: &reqwest::Client,
+    route: &ResolvedRoute,
+    method: &str,
+    path: &str,
+    headers: Vec<(String, String)>,
+    body: bytes::Bytes,
+) -> Result<reqwest::Response, RouterError> {
+    let (builder, url) = prepare_backend_request(client, route, method, path, &headers, body)?;
+    builder
+        .timeout(route.timeout)
+        .send()
+        .await
+        .map_err(|e| map_send_error(e, &url))
+}
+
+/// Build and send an HTTP request without a total request timeout.
+///
+/// For streaming responses, the total duration is unbounded — liveness is
+/// enforced by the caller's per-chunk idle timeout instead. Connection
+/// establishment is still bounded by the client-level `connect_timeout`.
+async fn send_backend_request_streaming(
+    client: &reqwest::Client,
+    route: &ResolvedRoute,
+    method: &str,
+    path: &str,
+    headers: Vec<(String, String)>,
+    body: bytes::Bytes,
+) -> Result<reqwest::Response, RouterError> {
+    let (builder, url) = prepare_backend_request(client, route, method, path, &headers, body)?;
+    builder.send().await.map_err(|e| map_send_error(e, &url))
 }
 
 fn validation_probe(route: &ResolvedRoute) -> Result<ValidationProbe, ValidationFailure> {
@@ -163,12 +261,17 @@ fn validation_probe(route: &ResolvedRoute) -> Result<ValidationProbe, Validation
         .iter()
         .any(|protocol| protocol == "openai_chat_completions")
     {
+        // Use max_completion_tokens (modern OpenAI parameter, required by GPT-5+)
+        // with max_tokens as fallback for legacy/self-hosted backends.
         return Ok(ValidationProbe {
             path: "/v1/chat/completions",
             protocol: "openai_chat_completions",
             body: bytes::Bytes::from_static(
-                br#"{"messages":[{"role":"user","content":"ping"}],"max_tokens":32}"#,
+                br#"{"messages":[{"role":"user","content":"ping"}],"max_completion_tokens":32}"#,
             ),
+            fallback_body: Some(bytes::Bytes::from_static(
+                br#"{"messages":[{"role":"user","content":"ping"}],"max_tokens":32}"#,
+            )),
         });
     }
 
@@ -183,6 +286,7 @@ fn validation_probe(route: &ResolvedRoute) -> Result<ValidationProbe, Validation
             body: bytes::Bytes::from_static(
                 br#"{"messages":[{"role":"user","content":"ping"}],"max_tokens":32}"#,
             ),
+            fallback_body: None,
         });
     }
 
@@ -195,6 +299,7 @@ fn validation_probe(route: &ResolvedRoute) -> Result<ValidationProbe, Validation
             path: "/v1/responses",
             protocol: "openai_responses",
             body: bytes::Bytes::from_static(br#"{"input":"ping","max_output_tokens":32}"#),
+            fallback_body: None,
         });
     }
 
@@ -207,6 +312,7 @@ fn validation_probe(route: &ResolvedRoute) -> Result<ValidationProbe, Validation
             path: "/v1/completions",
             protocol: "openai_completions",
             body: bytes::Bytes::from_static(br#"{"prompt":"ping","max_tokens":32}"#),
+            fallback_body: None,
         });
     }
 
@@ -233,7 +339,47 @@ pub async fn verify_backend_endpoint(
         });
     }
 
-    let response = send_backend_request(client, route, "POST", probe.path, headers, probe.body)
+    let result = try_validation_request(
+        client,
+        route,
+        probe.path,
+        probe.protocol,
+        headers.clone(),
+        probe.body,
+    )
+    .await;
+
+    // If the primary probe failed with a request-shape error (HTTP 400) and
+    // there is a fallback body, retry with the alternate token parameter.
+    // This handles the split between `max_completion_tokens` (GPT-5+) and
+    // `max_tokens` (legacy/self-hosted backends).
+    if let (Err(err), Some(fallback_body)) = (&result, probe.fallback_body)
+        && err.kind == ValidationFailureKind::RequestShape
+    {
+        return try_validation_request(
+            client,
+            route,
+            probe.path,
+            probe.protocol,
+            headers,
+            fallback_body,
+        )
+        .await;
+    }
+
+    result
+}
+
+/// Send a single validation request and classify the response.
+async fn try_validation_request(
+    client: &reqwest::Client,
+    route: &ResolvedRoute,
+    path: &str,
+    protocol: &str,
+    headers: Vec<(String, String)>,
+    body: bytes::Bytes,
+) -> Result<ValidatedEndpoint, ValidationFailure> {
+    let response = send_backend_request(client, route, "POST", path, headers, body)
         .await
         .map_err(|err| match err {
             RouterError::UpstreamUnavailable(details) => ValidationFailure {
@@ -253,12 +399,12 @@ pub async fn verify_backend_endpoint(
                 details,
             },
         })?;
-    let url = build_backend_url(&route.endpoint, probe.path);
+    let url = build_backend_url(&route.endpoint, path);
 
     if response.status().is_success() {
         return Ok(ValidatedEndpoint {
             url,
-            protocol: probe.protocol.to_string(),
+            protocol: protocol.to_string(),
         });
     }
 
@@ -355,7 +501,8 @@ pub async fn proxy_to_backend_streaming(
     headers: Vec<(String, String)>,
     body: bytes::Bytes,
 ) -> Result<StreamingProxyResponse, RouterError> {
-    let response = send_backend_request(client, route, method, path, headers, body).await?;
+    let response =
+        send_backend_request_streaming(client, route, method, path, headers, body).await?;
     let (status, resp_headers) = extract_response_metadata(&response);
 
     Ok(StreamingProxyResponse {
@@ -376,7 +523,7 @@ fn build_backend_url(endpoint: &str, path: &str) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{build_backend_url, verify_backend_endpoint};
+    use super::{ValidationFailureKind, build_backend_url, verify_backend_endpoint};
     use crate::config::ResolvedRoute;
     use openshell_core::inference::AuthHeader;
     use wiremock::matchers::{body_partial_json, header, method, path};
@@ -415,7 +562,93 @@ mod tests {
             protocols: protocols.iter().map(|p| (*p).to_string()).collect(),
             auth,
             default_headers: vec![("anthropic-version".to_string(), "2023-06-01".to_string())],
+            passthrough_headers: vec![
+                "anthropic-version".to_string(),
+                "anthropic-beta".to_string(),
+            ],
+            timeout: crate::config::DEFAULT_ROUTE_TIMEOUT,
         }
+    }
+
+    #[test]
+    fn sanitize_request_headers_drops_unknown_sensitive_headers() {
+        let route = ResolvedRoute {
+            name: "inference.local".to_string(),
+            endpoint: "https://api.example.com/v1".to_string(),
+            model: "test-model".to_string(),
+            api_key: "sk-test".to_string(),
+            protocols: vec!["openai_chat_completions".to_string()],
+            auth: AuthHeader::Bearer,
+            default_headers: Vec::new(),
+            passthrough_headers: vec!["openai-organization".to_string()],
+            timeout: crate::config::DEFAULT_ROUTE_TIMEOUT,
+        };
+
+        let kept = super::sanitize_request_headers(
+            &route,
+            &[
+                ("content-type".to_string(), "application/json".to_string()),
+                ("authorization".to_string(), "Bearer client".to_string()),
+                ("cookie".to_string(), "session=1".to_string()),
+                ("x-amz-security-token".to_string(), "token".to_string()),
+                ("openai-organization".to_string(), "org_123".to_string()),
+            ],
+        );
+
+        assert!(
+            kept.iter()
+                .any(|(name, _)| name.eq_ignore_ascii_case("content-type"))
+        );
+        assert!(
+            kept.iter()
+                .any(|(name, _)| name.eq_ignore_ascii_case("openai-organization"))
+        );
+        assert!(
+            kept.iter()
+                .all(|(name, _)| !name.eq_ignore_ascii_case("authorization"))
+        );
+        assert!(
+            kept.iter()
+                .all(|(name, _)| !name.eq_ignore_ascii_case("cookie"))
+        );
+        assert!(
+            kept.iter()
+                .all(|(name, _)| !name.eq_ignore_ascii_case("x-amz-security-token"))
+        );
+    }
+
+    #[test]
+    fn sanitize_request_headers_preserves_allowed_provider_headers() {
+        let route = test_route(
+            "https://api.anthropic.com/v1",
+            &["anthropic_messages"],
+            AuthHeader::Custom("x-api-key"),
+        );
+
+        let kept = super::sanitize_request_headers(
+            &route,
+            &[
+                ("anthropic-version".to_string(), "2024-10-22".to_string()),
+                (
+                    "anthropic-beta".to_string(),
+                    "tool-use-2024-10-22".to_string(),
+                ),
+                ("x-api-key".to_string(), "client-key".to_string()),
+            ],
+        );
+
+        assert!(kept.iter().any(
+            |(name, value)| name.eq_ignore_ascii_case("anthropic-version") && value == "2024-10-22"
+        ));
+        assert!(
+            kept.iter()
+                .any(|(name, value)| name.eq_ignore_ascii_case("anthropic-beta")
+                    && value == "tool-use-2024-10-22")
+        );
+        assert!(
+            kept.iter()
+                .all(|(name, _)| !name.eq_ignore_ascii_case("x-api-key"))
+        );
     }
 
     #[tokio::test]
@@ -462,5 +695,103 @@ mod tests {
 
         assert_eq!(validated.protocol, "openai_chat_completions");
         assert_eq!(validated.url, "mock://test-backend/v1/chat/completions");
+    }
+
+    /// GPT-5+ models reject `max_tokens` — the primary probe uses
+    /// `max_completion_tokens` so validation should succeed directly.
+    #[tokio::test]
+    async fn verify_openai_chat_uses_max_completion_tokens() {
+        let mock_server = MockServer::start().await;
+        let route = test_route(
+            &mock_server.uri(),
+            &["openai_chat_completions"],
+            AuthHeader::Bearer,
+        );
+
+        Mock::given(method("POST"))
+            .and(path("/v1/chat/completions"))
+            .and(body_partial_json(serde_json::json!({
+                "max_completion_tokens": 32,
+            })))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_json(serde_json::json!({"id": "chatcmpl-1"})),
+            )
+            .mount(&mock_server)
+            .await;
+
+        let client = reqwest::Client::builder().build().unwrap();
+        let validated = verify_backend_endpoint(&client, &route).await.unwrap();
+
+        assert_eq!(validated.protocol, "openai_chat_completions");
+    }
+
+    /// Legacy/self-hosted backends that reject `max_completion_tokens`
+    /// should succeed on the fallback probe using `max_tokens`.
+    #[tokio::test]
+    async fn verify_openai_chat_falls_back_to_max_tokens() {
+        let mock_server = MockServer::start().await;
+        let route = test_route(
+            &mock_server.uri(),
+            &["openai_chat_completions"],
+            AuthHeader::Bearer,
+        );
+
+        // Reject the primary probe (max_completion_tokens) with 400.
+        Mock::given(method("POST"))
+            .and(path("/v1/chat/completions"))
+            .and(body_partial_json(serde_json::json!({
+                "max_completion_tokens": 32,
+            })))
+            .respond_with(ResponseTemplate::new(400).set_body_string(
+                r#"{"error":{"message":"Unsupported parameter: 'max_completion_tokens'"}}"#,
+            ))
+            .expect(1)
+            .mount(&mock_server)
+            .await;
+
+        // Accept the fallback probe (max_tokens).
+        Mock::given(method("POST"))
+            .and(path("/v1/chat/completions"))
+            .and(body_partial_json(serde_json::json!({
+                "max_tokens": 32,
+            })))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_json(serde_json::json!({"id": "chatcmpl-2"})),
+            )
+            .expect(1)
+            .mount(&mock_server)
+            .await;
+
+        let client = reqwest::Client::builder().build().unwrap();
+        let validated = verify_backend_endpoint(&client, &route).await.unwrap();
+
+        assert_eq!(validated.protocol, "openai_chat_completions");
+    }
+
+    /// Non-chat-completions probes (e.g. `anthropic_messages`) should not
+    /// have a fallback — a 400 remains a hard failure.
+    #[tokio::test]
+    async fn verify_non_chat_completions_no_fallback() {
+        let mock_server = MockServer::start().await;
+        let route = test_route(
+            &mock_server.uri(),
+            &["anthropic_messages"],
+            AuthHeader::Custom("x-api-key"),
+        );
+
+        Mock::given(method("POST"))
+            .and(path("/v1/messages"))
+            .respond_with(ResponseTemplate::new(400).set_body_string("bad request"))
+            .mount(&mock_server)
+            .await;
+
+        let client = reqwest::Client::builder().build().unwrap();
+        let result = verify_backend_endpoint(&client, &route).await;
+
+        assert!(result.is_err());
+        assert_eq!(
+            result.unwrap_err().kind,
+            ValidationFailureKind::RequestShape
+        );
     }
 }

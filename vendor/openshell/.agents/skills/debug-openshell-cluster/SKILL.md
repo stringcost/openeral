@@ -1,370 +1,214 @@
 ---
 name: debug-openshell-cluster
-description: Debug why a openshell cluster failed to start or is unhealthy. Use when the user has a failed `openshell gateway start`, cluster health check failure, or wants to diagnose cluster infrastructure issues. Trigger keywords - debug cluster, cluster failing, cluster not starting, deploy failed, cluster troubleshoot, cluster health, cluster diagnose, why won't my cluster start, health check failed, gateway start failed, gateway not starting.
+description: Debug why an OpenShell gateway deployment is unhealthy, unreachable, or unable to create sandboxes. Use when the user has a gateway health failure, Docker/Podman runtime issue, Helm install failure, Kubernetes scheduling issue, TLS secret issue, VM driver issue, or sandbox startup problem. Trigger keywords - debug gateway, gateway failing, deployment failing, helm install failing, cluster health, gateway health, gateway not starting, health check failed, sandbox pending, docker driver, podman driver, vm driver.
 ---
 
-# Debug OpenShell Cluster
+# Debug OpenShell Gateway Deployment
 
-Diagnose why a openshell cluster failed to start after `openshell gateway start`.
+Diagnose a gateway and its selected compute platform. Do not assume OpenShell provisions Kubernetes or runs a k3s container. OpenShell targets a reachable gateway endpoint backed by Docker, Podman, Kubernetes, or the experimental VM driver.
 
-Use **only** `openshell` CLI commands (`openshell status`, `openshell doctor logs`, `openshell doctor exec`) to inspect and fix the cluster. Do **not** use raw `docker`, `ssh`, or `kubectl` commands directly — always go through the `openshell doctor` interface. The CLI auto-resolves local vs remote gateways, so the same commands work everywhere.
+Use `openshell` first to identify the active endpoint. Then use the platform tools that match the gateway's compute driver: `docker`, `podman`, `kubectl`/`helm`, or VM driver logs.
 
 ## Overview
 
-`openshell gateway start` creates a Docker container running k3s with the OpenShell server deployed via Helm. The deployment stages, in order, are:
+The target deployment flow is:
 
-1. **Pre-deploy check**: `openshell gateway start` in interactive mode prompts to **reuse** (keep volume, clean stale nodes) or **recreate** (destroy everything, fresh start). `mise run cluster` always recreates before deploy.
-2. Ensure cluster image is available (local build or remote pull)
-3. Create Docker network (`openshell-cluster`) and volume (`openshell-cluster-{name}`)
-4. Create and start a privileged Docker container (`openshell-cluster-{name}`)
-5. Wait for k3s to generate kubeconfig (up to 60s)
-6. **Clean stale nodes**: Remove any `NotReady` k3s nodes left over from previous container instances that reused the same persistent volume
-7. **Prepare local images** (if `OPENSHELL_PUSH_IMAGES` is set): In `internal` registry mode, bootstrap waits for the in-cluster registry and pushes tagged images there. In `external` mode, bootstrap uses legacy `ctr -n k8s.io images import` push-mode behavior.
-8. **Reconcile TLS PKI**: Load existing TLS secrets from the cluster; if missing, incomplete, or malformed, generate fresh PKI (CA + server + client certs). Apply secrets to cluster. If rotation happened and the OpenShell workload is already running, rollout restart and wait for completion (failed rollout aborts deploy).
-9. **Store CLI mTLS credentials**: Persist client cert/key/CA locally for CLI authentication.
-10. Wait for cluster health checks to pass (up to 6 min):
-    - k3s API server readiness (`/readyz`)
-    - `openshell` statefulset ready in `openshell` namespace
-    - TLS secrets `openshell-server-tls` and `openshell-client-tls` exist in `openshell` namespace
-    - Sandbox supervisor binary exists at `/opt/openshell/bin/openshell-sandbox` (emits `HEALTHCHECK_MISSING_SUPERVISOR` marker if absent)
+1. Operator starts or deploys the gateway.
+2. Operator configures the compute driver.
+3. Operator provides TLS and SSH relay material for the deployment mode.
+4. The CLI registers a reachable gateway endpoint with `openshell gateway add`.
+5. The gateway creates sandboxes through the selected compute driver.
 
-For local deploys, metadata endpoint selection now depends on Docker connectivity:
-
-- default local Docker socket (`unix:///var/run/docker.sock`): `https://127.0.0.1:{port}` (default port 8080)
-- TCP Docker daemon (`DOCKER_HOST=tcp://<host>:<port>`): `https://<host>:{port}` for non-loopback hosts
-
-The host port is configurable via `--port` on `openshell gateway start` (default 8080) and is stored in `ClusterMetadata.gateway_port`.
-
-The TCP host is also added as an extra gateway TLS SAN so mTLS hostname validation succeeds.
-
-The default cluster name is `openshell`. The container is `openshell-cluster-{name}`.
+For local evaluation only, TLS may be disabled and the gateway can be reached through `http://127.0.0.1:<port>`.
 
 ## Prerequisites
 
-- Docker must be running (locally or on the remote host)
-- The `openshell` CLI must be available
-- For remote clusters: SSH access to the remote host
-
-## Tools Available
-
-All diagnostics go through three `openshell` commands. They auto-resolve local vs remote gateways — the same commands work for both:
-
-```bash
-# Quick connectivity check
-openshell status
-
-# Fetch container logs
-openshell doctor logs --lines 100
-openshell doctor logs --tail          # stream live
-
-# Run any command inside the gateway container (KUBECONFIG is pre-configured)
-openshell doctor exec -- kubectl get pods -A
-openshell doctor exec -- kubectl -n openshell logs statefulset/openshell --tail=100
-openshell doctor exec -- cat /etc/rancher/k3s/registries.yaml
-openshell doctor exec -- df -h /
-openshell doctor exec -- free -h
-openshell doctor exec -- sh           # interactive shell
-```
+- The `openshell` CLI must be available for endpoint checks.
+- Know the active gateway name and endpoint, or be able to inspect local gateway metadata.
+- Know the compute platform: Docker, Podman, Kubernetes, or VM.
+- For Kubernetes: `kubectl` must target the cluster that hosts OpenShell and Helm version 3 or later must be available.
+- For Docker or Podman: the runtime socket must be reachable from the gateway host.
 
 ## Workflow
 
-When the user asks to debug a cluster failure, **run diagnostics automatically** through the steps below in order. Stop and report findings as soon as a root cause is identified. Do not ask the user to choose which checks to run.
+Run diagnostics in order and stop once the root cause is clear.
 
-### Determine Context
-
-Before running commands, establish:
-
-1. **Cluster name**: Default is `openshell`, giving container name `openshell-cluster-openshell`
-2. **Remote or local**: The `openshell doctor` commands auto-resolve this from gateway metadata — no special flags needed for the active gateway
-3. **Config directory**: `~/.config/openshell/gateways/{name}/`
-
-### Step 0: Quick Connectivity Check
-
-Run `openshell status` first. This immediately reveals:
-- Which gateway and endpoint the CLI is targeting
-- Whether the CLI can reach the server (mTLS handshake success/failure)
-- The server version if connected
-
-Common errors at this stage:
-- **`tls handshake eof`**: The server isn't running or mTLS credentials are missing/mismatched
-- **`connection refused`**: The container isn't running or port mapping is broken
-- **`No gateway configured`**: No gateway has been deployed yet
-
-### Step 1: Check Container Logs
-
-Get recent container logs to identify startup failures:
+### Step 1: Check CLI Reachability
 
 ```bash
-openshell doctor logs --lines 100
+openshell gateway info
+openshell status
 ```
 
-Look for:
+Common findings:
 
-- DNS resolution failures in the entrypoint script
-- k3s startup errors (certificate issues, port binding failures)
-- Manifest copy errors from `/opt/openshell/manifests/`
-- `iptables` or `cgroup` errors (privilege/capability issues)
+- `No active gateway`: register one with `openshell gateway add <endpoint>`.
+- Connection refused: gateway process is not running, service exposure is wrong, or a port-forward/proxy is not active.
+- TLS/certificate errors: CLI mTLS bundle does not match the gateway CA, or the gateway is running with unexpected TLS settings.
 
-### Step 2: Check k3s Cluster Health
+### Step 2: Identify the Compute Platform
 
-Verify k3s itself is functional:
+Use gateway metadata, deployment values, or the user's setup notes to identify the driver.
+
+| Platform | Primary checks |
+|---|---|
+| Docker | Gateway process logs, Docker daemon health, sandbox containers, image pulls. |
+| Podman | Podman socket, rootless networking, sandbox containers, image pulls. |
+| Kubernetes | Helm release, StatefulSet, service, secrets, sandbox pods, events. |
+| VM | VM driver logs, rootfs availability, host virtualization support. |
+
+### Step 3: Check Docker-Backed Gateways
 
 ```bash
-# API server readiness
-openshell doctor exec -- kubectl get --raw="/readyz"
-
-# Node status
-openshell doctor exec -- kubectl get nodes -o wide
-
-# All pods
-openshell doctor exec -- kubectl get pods -A -o wide
+docker info
+docker ps --filter name=openshell
+docker logs <container> --tail=200
+openshell status
 ```
 
-If `/readyz` fails, k3s is still starting or has crashed. Check container logs (Step 1).
+Common findings:
 
-If pods are in `CrashLoopBackOff`, `ImagePullBackOff`, or `Pending`, investigate those pods specifically.
+- Docker daemon unavailable: start Docker Desktop or Docker Engine.
+- Gateway process stopped: inspect exit status and logs.
+- Sandbox image missing or pull denied: verify image reference and registry credentials.
+- Sandbox never registers: check gateway logs and supervisor callback endpoint.
 
-Also check for node pressure conditions that cause the kubelet to evict pods and reject scheduling:
+For source checkout development, restart the local gateway with:
 
 ```bash
-# Check node conditions (DiskPressure, MemoryPressure, PIDPressure)
-openshell doctor exec -- kubectl get nodes -o jsonpath="{range .items[*]}{.metadata.name}{range .status.conditions[*]} {.type}={.status}{end}{\"\n\"}{end}"
-
-# Check disk usage inside the container
-openshell doctor exec -- df -h /
-
-# Check memory usage
-openshell doctor exec -- free -h
+mise run gateway:docker
 ```
 
-If any pressure condition is `True`, pods will be evicted and new ones rejected. The bootstrap now detects `HEALTHCHECK_NODE_PRESSURE` markers from the health-check script and aborts early with a clear diagnosis. To fix: free disk/memory on the host, then recreate the gateway.
-
-### Step 3: Check OpenShell Server StatefulSet
-
-The OpenShell server is deployed via a HelmChart CR as a StatefulSet named `openshell` in the `openshell` namespace. Check its status:
+### Step 4: Check Podman-Backed Gateways
 
 ```bash
-# StatefulSet status
-openshell doctor exec -- kubectl -n openshell get statefulset/openshell -o wide
-
-# OpenShell pod logs
-openshell doctor exec -- kubectl -n openshell logs statefulset/openshell --tail=100
-
-# Describe statefulset for events
-openshell doctor exec -- kubectl -n openshell describe statefulset/openshell
-
-# Helm install job logs (the job that installs the OpenShell chart)
-openshell doctor exec -- kubectl -n kube-system logs -l job-name=helm-install-openshell --tail=200
+podman info
+podman ps --filter name=openshell
+podman logs <container> --tail=200
+openshell status
 ```
 
-Common issues:
+Common findings:
 
-- **Replicas 0/0**: The StatefulSet has been scaled to zero — no pods are running. This can happen after a failed deploy, manual scale-down, or Helm values misconfiguration. Fix: `openshell doctor exec -- kubectl -n openshell scale statefulset openshell --replicas=1`
-- **ImagePullBackOff**: The component image failed to pull. In `internal` mode, verify internal registry readiness and pushed image tags (Step 5). In `external` mode, check `/etc/rancher/k3s/registries.yaml` credentials/endpoints and DNS (Step 8). Default external registry is `ghcr.io/nvidia/openshell/` (public, no auth required). If using a private registry, ensure `--registry-username` and `--registry-token` (or `OPENSHELL_REGISTRY_USERNAME`/`OPENSHELL_REGISTRY_TOKEN`) were provided during deploy.
-- **CrashLoopBackOff**: The server is crashing. Check pod logs for the actual error.
-- **Pending**: Insufficient resources or scheduling constraints.
+- Podman socket unavailable: start or expose the user socket.
+- Rootless networking unavailable: inspect Podman network configuration.
+- Sandbox image missing or pull denied: verify image reference and registry credentials.
+- Supervisor cannot call back: check callback endpoint and gateway logs.
 
-### Step 4: Check Networking
-
-The OpenShell server is exposed via a NodePort service on port `30051`:
+### Step 5: Check Kubernetes Helm Gateways
 
 ```bash
-# Service status
-openshell doctor exec -- kubectl -n openshell get service/openshell
+helm -n openshell status openshell
+helm -n openshell get values openshell
+kubectl -n openshell get statefulset,pod,svc,pvc
+kubectl -n openshell logs statefulset/openshell --tail=200
+kubectl -n openshell rollout status statefulset/openshell
 ```
 
-Expected port: `30051/tcp` (mapped to configurable host port, default 8080; set via `--port` on deploy).
+Look for failed installs, unexpected values, missing namespace, wrong image tag, TLS settings that do not match the registered endpoint, and scheduling failures.
 
-### Step 5: Check Image Availability
-
-Component images (server, sandbox) can reach kubelet via two paths:
-
-**Local/external pull mode** (default local via `mise run cluster`): Local images are tagged to the configured local registry base (default `127.0.0.1:5000/openshell/*`), pushed to that registry, and pulled by k3s via `registries.yaml` mirror endpoint (typically `host.docker.internal:5000`). The `cluster` task pushes prebuilt local tags (`openshell/*:dev`, falling back to `localhost:5000/openshell/*:dev` or `127.0.0.1:5000/openshell/*:dev`).
+Check required Helm deployment secrets:
 
 ```bash
-# Verify image refs currently used by openshell deployment
-openshell doctor exec -- kubectl -n openshell get statefulset openshell -o jsonpath="{.spec.template.spec.containers[*].image}"
-
-# Verify registry mirror/auth endpoint configuration
-openshell doctor exec -- cat /etc/rancher/k3s/registries.yaml
+kubectl -n openshell get secret \
+  openshell-ssh-handshake \
+  openshell-server-tls \
+  openshell-server-client-ca \
+  openshell-client-tls
 ```
 
-**Legacy push mode**: Images are imported into the k3s containerd `k8s.io` namespace.
+Check the image references currently used by the gateway deployment:
 
 ```bash
-# Check if images were imported into containerd (k3s default namespace is k8s.io)
-openshell doctor exec -- ctr -a /run/k3s/containerd/containerd.sock images ls | grep openshell
+kubectl -n openshell get statefulset openshell -o jsonpath="{.spec.template.spec.containers[*].image}{\"\n\"}{.spec.template.spec.containers[*].env[?(@.name==\"OPENSHELL_SUPERVISOR_IMAGE\")].value}{\"\n\"}"
+helm -n openshell get values openshell | grep -E 'repository|tag|supervisorImage'
 ```
 
-**External pull mode** (remote deploy, or local with `OPENSHELL_REGISTRY_HOST`/`IMAGE_REPO_BASE` pointing at a non-local registry): Images are pulled from an external registry at runtime. The entrypoint generates `/etc/rancher/k3s/registries.yaml`.
+The gateway image and `server.supervisorImage` should use the same build tag in branch and E2E deploys. A stale supervisor image can make sandbox behavior lag behind gateway policy or proto changes.
+
+For plaintext local evaluation, confirm the chart has:
 
 ```bash
-# Verify registries.yaml exists and has credentials
-openshell doctor exec -- cat /etc/rancher/k3s/registries.yaml
-
-# Test pulling an image manually from inside the cluster
-openshell doctor exec -- crictl pull ghcr.io/nvidia/openshell/gateway:latest
+helm -n openshell get values openshell | grep -E 'disableTls|grpcEndpoint'
 ```
 
-If `registries.yaml` is missing or has wrong values, verify env wiring (`OPENSHELL_REGISTRY_HOST`, `OPENSHELL_REGISTRY_INSECURE`, username/password for authenticated registries).
+Expected shape:
 
-### Step 6: Check mTLS / PKI
+```yaml
+server:
+  disableTls: true
+  grpcEndpoint: http://openshell.openshell.svc.cluster.local:8080
+```
 
-TLS certificates are generated by the `openshell-bootstrap` crate (using `rcgen`) and stored as K8s secrets before the Helm release installs. There is no PKI job or cert-manager — certificates are applied directly via `kubectl apply`.
+Check service exposure:
 
 ```bash
-# Check if the three TLS secrets exist
-openshell doctor exec -- kubectl -n openshell get secret openshell-server-tls openshell-server-client-ca openshell-client-tls
-
-# Inspect server cert expiry (if openssl is available in the container)
-openshell doctor exec -- sh -c 'kubectl -n openshell get secret openshell-server-tls -o jsonpath="{.data.tls\.crt}" | base64 -d | openssl x509 -noout -dates 2>/dev/null || echo "openssl not available"'
-
-# Check if CLI-side mTLS files exist locally
-ls -la ~/.config/openshell/gateways/<name>/mtls/
+kubectl -n openshell get svc openshell -o wide
+kubectl -n openshell get endpoints openshell
 ```
 
-On redeploy, bootstrap reuses existing secrets if they are valid PEM. If secrets are missing or malformed, fresh PKI is generated and the OpenShell workload is automatically restarted. If the rollout restart fails after rotation, the deploy aborts and CLI-side certs are not updated. Certificates use rcgen defaults (effectively never expire).
-
-If the local mTLS files are missing but the secrets exist in the cluster, you can extract them manually:
+For local port-forward testing:
 
 ```bash
-mkdir -p ~/.config/openshell/gateways/<name>/mtls
-openshell doctor exec -- kubectl -n openshell get secret openshell-client-tls -o jsonpath='{.data.ca\.crt}' | base64 -d > ~/.config/openshell/gateways/<name>/mtls/ca.crt
-openshell doctor exec -- kubectl -n openshell get secret openshell-client-tls -o jsonpath='{.data.tls\.crt}' | base64 -d > ~/.config/openshell/gateways/<name>/mtls/tls.crt
-openshell doctor exec -- kubectl -n openshell get secret openshell-client-tls -o jsonpath='{.data.tls\.key}' | base64 -d > ~/.config/openshell/gateways/<name>/mtls/tls.key
+kubectl -n openshell port-forward svc/openshell 8080:8080
+openshell gateway add http://127.0.0.1:8080 --local --name local
+openshell status
 ```
 
-Common mTLS issues:
-- **Secrets missing**: The `openshell` namespace may not have been created yet (Helm controller race). Bootstrap waits up to 2 minutes for the namespace.
-- **mTLS mismatch after manual secret deletion**: Delete all three secrets and redeploy — bootstrap will regenerate and restart the workload.
-- **CLI can't connect after redeploy**: Check that `~/.config/openshell/gateways/<name>/mtls/` contains `ca.crt`, `tls.crt`, `tls.key` and that they were updated at deploy time.
-- **Local mTLS files missing**: The gateway was deployed but CLI credentials weren't persisted (e.g., interrupted deploy). Extract from the cluster secret as shown above.
-
-### Step 7: Check Kubernetes Events
-
-Events catch scheduling failures, image pull errors, and resource issues:
+If the gateway is healthy but sandbox creation fails:
 
 ```bash
-openshell doctor exec -- kubectl get events -A --sort-by=.lastTimestamp | tail -n 50
+kubectl -n openshell get pods
+kubectl -n openshell get events --sort-by=.lastTimestamp | tail -n 50
+kubectl -n openshell logs statefulset/openshell --tail=200
 ```
 
-Look for:
-
-- `FailedScheduling` — resource constraints
-- `ImagePullBackOff` / `ErrImagePull` — registry auth failure or DNS issue (check `/etc/rancher/k3s/registries.yaml`)
-- `CrashLoopBackOff` — application crashes
-- `OOMKilled` — memory limits too low
-- `FailedMount` — volume issues
-
-### Step 8: Check DNS Resolution
-
-DNS misconfiguration is a common root cause, especially on remote/Linux hosts:
+Check the configured sandbox namespace:
 
 ```bash
-# Check the resolv.conf k3s is using
-openshell doctor exec -- cat /etc/rancher/k3s/resolv.conf
-
-# Test DNS resolution from inside the container
-openshell doctor exec -- sh -c 'nslookup google.com || wget -q -O /dev/null http://google.com && echo "network ok" || echo "network unreachable"'
+helm -n openshell get values openshell | grep sandboxNamespace
 ```
 
-Check the entrypoint's DNS decision in the container logs:
+Then inspect sandbox resources in that namespace.
+
+### Step 6: Check VM-Backed Gateways
+
+Use the VM driver logs and host diagnostics available in the user's environment. Verify:
+
+- The VM driver process is running and reachable by the gateway.
+- The runtime rootfs exists and matches the expected architecture.
+- Host virtualization support is enabled.
+- The sandbox supervisor can establish its callback connection to the gateway.
+
+Then run:
 
 ```bash
-openshell doctor logs --lines 20
+openshell status
+openshell logs <sandbox-name>
 ```
-
-The entrypoint script selects DNS resolvers in this priority:
-
-1. Viable nameservers from `/etc/resolv.conf` (not loopback/link-local)
-2. Docker `ExtServers` from `/etc/resolv.conf` comments
-3. Host gateway IP (Docker Desktop only, `192.168.*`)
-4. Fallback to `8.8.8.8` / `8.8.4.4`
-
-If DNS is broken, all image pulls from the distribution registry will fail, as will pods that need external network access.
 
 ## Common Failure Patterns
 
-| Symptom | Likely Cause | Fix |
-|---------|-------------|-----|
-| `tls handshake eof` from `openshell status` | Server not running or mTLS credentials missing/mismatched | Check StatefulSet replicas (Step 3) and mTLS files (Step 6) |
-| StatefulSet `0/0` replicas | StatefulSet scaled to zero (failed deploy, manual scale-down, or Helm misconfiguration) | `openshell doctor exec -- kubectl -n openshell scale statefulset openshell --replicas=1` |
-| Local mTLS files missing | Deploy was interrupted before credentials were persisted | Extract from cluster secret `openshell-client-tls` (Step 6) |
-| Container not found | Image not built | `mise run docker:build:cluster` (local) or re-deploy (remote) |
-| Container exited, OOMKilled | Insufficient memory | Increase host memory or reduce workload |
-| Container exited, non-zero exit | k3s crash, port conflict, privilege issue | Check `openshell doctor logs` for details |
-| `/readyz` fails | k3s still starting or crashed | Wait longer or check container logs for k3s errors |
-| OpenShell pods `Pending` | Insufficient CPU/memory for scheduling, or PVC not bound | `openshell doctor exec -- kubectl describe pod -n openshell` and `openshell doctor exec -- kubectl get pvc -n openshell` |
-| OpenShell pods `CrashLoopBackOff` | Server application error | `openshell doctor exec -- kubectl -n openshell logs statefulset/openshell` |
-| OpenShell pods `ImagePullBackOff` (push mode) | Images not imported or wrong containerd namespace | Check `openshell doctor exec -- ctr -a /run/k3s/containerd/containerd.sock -n k8s.io images ls` (Step 5) |
-| OpenShell pods `ImagePullBackOff` (pull mode) | Registry auth or DNS issue | Check `openshell doctor exec -- cat /etc/rancher/k3s/registries.yaml` and DNS (Step 8) |
-| Image import fails | Corrupt tar stream or containerd not ready | Retry after k3s is fully started; check container logs |
-| Push mode images not found by kubelet | Imported into wrong containerd namespace | Must use `k3s ctr -n k8s.io images import`, not `k3s ctr images import` |
-| mTLS secrets missing | Bootstrap couldn't apply secrets (namespace not ready) | Check deploy logs and verify `openshell` namespace exists (Step 6) |
-| mTLS mismatch after redeploy | PKI rotated but workload not restarted, or rollout failed | Check that all three TLS secrets exist and that the openshell pod restarted after cert rotation (Step 6) |
-| Helm install job failed | Chart values error or dependency issue | `openshell doctor exec -- kubectl -n kube-system logs -l job-name=helm-install-openshell` |
-| Architecture mismatch (remote) | Built on arm64, deploying to amd64 | Cross-build the image for the target architecture |
-| Port conflict | Another service on the configured gateway host port (default 8080) | Stop conflicting service or use `--port` on `openshell gateway start` to pick a different host port |
-| gRPC connect refused to `127.0.0.1:443` in CI | Docker daemon is remote (`DOCKER_HOST=tcp://...`) but metadata still points to loopback | Verify metadata endpoint host matches `DOCKER_HOST` and includes non-loopback host |
-| DNS failures inside container | Entrypoint DNS detection failed | `openshell doctor exec -- cat /etc/rancher/k3s/resolv.conf` and `openshell doctor logs --lines 20` |
-| Node DiskPressure / MemoryPressure / PIDPressure | Insufficient disk, memory, or PIDs on host | Free disk (`docker system prune -a --volumes`), increase memory, or expand host resources. Bootstrap auto-detects via `HEALTHCHECK_NODE_PRESSURE` marker |
-| Pods evicted with "The node had condition: [DiskPressure]" | Host disk full, kubelet evicting pods | Free disk space on host, then `openshell gateway destroy <name> && openshell gateway start` |
-| `metrics-server` errors in logs | Normal k3s noise, not the root cause | These errors are benign — look for the actual failing health check component |
-| Stale NotReady nodes from previous deploys | Volume reused across container recreations | The deploy flow now auto-cleans stale nodes; if it still fails, manually delete NotReady nodes (see Step 2) or choose "Recreate" when prompted |
-| gRPC `UNIMPLEMENTED` for newer RPCs in push mode | Helm values still point at older pulled images instead of the pushed refs | Verify rendered `openshell-helmchart.yaml` uses the expected push refs (`server`, `sandbox`, `pki-job`) and not `:latest` |
-| Sandbox pods crash with `/opt/openshell/bin/openshell-sandbox: no such file or directory` | Supervisor binary missing from cluster image | The cluster image was built/published without the `supervisor-builder` target in `deploy/docker/Dockerfile.images`. Rebuild with `mise run docker:build:cluster` and recreate gateway. Bootstrap auto-detects via `HEALTHCHECK_MISSING_SUPERVISOR` marker |
-| `HEALTHCHECK_MISSING_SUPERVISOR` in health check logs | `/opt/openshell/bin/openshell-sandbox` not found in gateway container | Rebuild cluster image: `mise run docker:build:cluster`, then `openshell gateway destroy <name> && openshell gateway start` |
+| Symptom | Likely cause | Check |
+|---|---|---|
+| `openshell status` fails | Gateway endpoint unreachable or auth mismatch | `openshell gateway info`, gateway logs |
+| Gateway starts but sandbox create fails | Compute driver cannot reach runtime | Docker/Podman/Kubernetes/VM driver logs |
+| Docker or Podman sandbox never registers | Wrong callback endpoint or supervisor startup failure | Gateway logs and sandbox container logs |
+| Kubernetes gateway pod pending | PVC unbound, taint, selector, or insufficient resources | `kubectl -n openshell describe pod <pod>` |
+| Kubernetes gateway pod crash loops | Missing secret, bad DB URL, bad TLS config | `kubectl -n openshell logs statefulset/openshell` |
+| CLI TLS error | Local mTLS bundle does not match server cert/CA | Check `~/.config/openshell/gateways/<name>/mtls/` |
+| Image pull failure | Gateway or sandbox image cannot be pulled | Runtime events and image pull credentials |
+| `K8s namespace not ready` with `envoy-gateway-openshell.yaml: the server could not find the requested resource` | Optional Gateway API manifest was auto-applied without Envoy Gateway CRDs, or k3s Helm controller startup exceeded the namespace wait | Confirm the cluster image only bundles core manifests; apply `deploy/kube/manifests/envoy-gateway-openshell.yaml` manually only when `grpcRoute` is enabled |
 
-## Full Diagnostic Dump
+## Reporting
 
-Run all diagnostics at once for a comprehensive report:
+When handing results back to the user, include:
 
-```bash
-echo "=== Connectivity Check ==="
-openshell status
-
-echo "=== Container Logs (last 50 lines) ==="
-openshell doctor logs --lines 50
-
-echo "=== k3s Readiness ==="
-openshell doctor exec -- kubectl get --raw='/readyz'
-
-echo "=== Nodes ==="
-openshell doctor exec -- kubectl get nodes -o wide
-
-echo "=== Node Conditions ==="
-openshell doctor exec -- kubectl get nodes -o jsonpath='{range .items[*]}{.metadata.name}{range .status.conditions[*]} {.type}={.status}{end}{"\n"}{end}'
-
-echo "=== Disk Usage ==="
-openshell doctor exec -- df -h /
-
-echo "=== All Pods ==="
-openshell doctor exec -- kubectl get pods -A -o wide
-
-echo "=== Failing Pods ==="
-openshell doctor exec -- kubectl get pods -A --field-selector=status.phase!=Running,status.phase!=Succeeded
-
-echo "=== OpenShell StatefulSet ==="
-openshell doctor exec -- kubectl -n openshell get statefulset/openshell -o wide
-
-echo "=== OpenShell Service ==="
-openshell doctor exec -- kubectl -n openshell get service/openshell
-
-echo "=== TLS Secrets ==="
-openshell doctor exec -- kubectl -n openshell get secret openshell-server-tls openshell-server-client-ca openshell-client-tls
-
-echo "=== Recent Events ==="
-openshell doctor exec -- kubectl get events -A --sort-by=.lastTimestamp | tail -n 50
-
-echo "=== Helm Install OpenShell Logs ==="
-openshell doctor exec -- kubectl -n kube-system logs -l job-name=helm-install-openshell --tail=100
-
-echo "=== Registry Configuration ==="
-openshell doctor exec -- cat /etc/rancher/k3s/registries.yaml
-
-echo "=== Supervisor Binary ==="
-openshell doctor exec -- ls -la /opt/openshell/bin/openshell-sandbox
-
-echo "=== DNS Configuration ==="
-openshell doctor exec -- cat /etc/rancher/k3s/resolv.conf
-```
+- Active gateway endpoint and auth mode.
+- Compute platform and driver.
+- Gateway process or workload status.
+- Recent gateway log summary.
+- Missing or malformed TLS or SSH relay material.
+- Service exposure status.
+- Sandbox workload status.
+- The exact command that failed and the shortest fix.

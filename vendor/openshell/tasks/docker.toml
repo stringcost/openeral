@@ -8,12 +8,8 @@ description = "Build all Docker images"
 depends = [
   "build:docker:gateway",
   "build:docker:cluster",
+  "build:docker:supervisor",
 ]
-hide = true
-
-["docker:build"]
-description = "Alias for build:docker"
-depends = ["build:docker"]
 hide = true
 
 ["build:docker:ci"]
@@ -21,9 +17,9 @@ description = "Build the CI Docker image"
 run = "tasks/scripts/docker-build-ci.sh"
 hide = true
 
-["docker:build:ci"]
-description = "Alias for build:docker:ci"
-depends = ["build:docker:ci"]
+["build:docker:prebuilt"]
+description = "Build and stage Rust binaries consumed by Docker image builds"
+run = "tasks/scripts/stage-prebuilt-binaries.sh all"
 hide = true
 
 ["build:docker:gateway"]
@@ -31,14 +27,24 @@ description = "Build the gateway Docker image"
 run = "tasks/scripts/docker-build-image.sh gateway"
 hide = true
 
-["docker:build:gateway"]
-description = "Alias for build:docker:gateway"
-depends = ["build:docker:gateway"]
+["build:docker:supervisor"]
+description = "Build the supervisor image (FROM scratch, binary only)"
+run = "tasks/scripts/docker-build-image.sh supervisor"
 hide = true
 
 ["build:docker:cluster"]
 description = "Build the k3s cluster image (component images pulled at runtime from registry)"
 run = "tasks/scripts/docker-build-image.sh cluster"
+hide = true
+
+["docker:build:gateway"]
+description = "Alias for build:docker:gateway"
+depends = ["build:docker:gateway"]
+hide = true
+
+["docker:build:supervisor"]
+description = "Alias for build:docker:supervisor"
+depends = ["build:docker:supervisor"]
 hide = true
 
 ["docker:build:cluster"]

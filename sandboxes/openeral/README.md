@@ -1,389 +1,123 @@
 # OpenEral Sandbox
 
-This sandbox exists for one purpose: run Claude Code in OpenShell with a persistent PostgreSQL-backed home directory at `/home/agent`.
+This image is the OpenShell sandbox runtime for Claude Code with a persistent
+PostgreSQL-backed home at `/home/agent`.
 
-`/db` is mounted too, but it is secondary. The primary success criterion is that Claude writes `~/.claude` into `/home/agent` and that those files survive reconnects.
+It is not a standalone entrypoint image. OpenShell starts the patched
+`openshell-sandbox` supervisor, and the supervisor mounts the FUSE filesystems
+declared in this image's `/etc/fstab`.
 
-The user-facing CLI remains the stock upstream `openshell` release. This repo customizes the runtime images, not the CLI command users invoke.
+## Runtime Contract
 
-## Fresh Machine Flow
+The supported flow uses:
 
-Assume a fresh machine with:
+- upstream `openshell` CLI on the host
+- openeral `gateway` image running the OpenShell Docker compute driver
+- openeral `supervisor` image containing the patched supervisor binary
+- this openeral `sandbox` image
 
-- upstream `openshell`
-- a live PostgreSQL database
-- the openeral cluster image reference
-- the openeral sandbox image reference
-- host `ANTHROPIC_API_KEY`
+The sandbox image owns:
 
-From there, the supported flow is:
+- `/usr/local/bin/openeral`
+- `fuse3`
+- `/etc/fstab` entries for `/db` and `/home/agent`
+- `/etc/openshell/policy.yaml`
 
-1. start the gateway with the openeral cluster image
-2. create one generic provider for the live database
-3. launch Claude from the sandbox image
+The gateway must set `OPENSHELL_DOCKER_FUSE_DEVICE=/dev/fuse`; otherwise Docker
+will not map `/dev/fuse` into sandbox containers and the FUSE mounts will fail.
 
-## Image Contract
+## Mounts
 
-OpenEral FUSE support uses three custom runtime images:
+The image declares:
 
-- `cluster`
-  - boots k3s
-  - bundles the patched `openshell-sandbox` supervisor
-  - installs the FUSE device-plugin manifests
-- `gateway`
-  - creates sandbox pod specs
-  - requests the FUSE device resource
-- `sandbox`
-  - contains `openeral`, `fuse3`, and `/etc/fstab`
-  - installs this repo's `sandboxes/openeral/policy.yaml` as
-    `/etc/openshell/policy.yaml`
+```text
+env /db fuse.openeral ro,allow_other,noauto 0 0
+env#workspace#${OPENSHELL_SANDBOX_ID} /home/agent fuse.openeral rw,allow_other,noauto 0 0
+```
 
-Only two refs are user-facing:
+At sandbox startup:
 
-- `OPENSHELL_CLUSTER_IMAGE`
-- `OPENERAL_SANDBOX_IMAGE`
+- provider env supplies `DATABASE_URL`
+- the supervisor maps it to `OPENERAL_DATABASE_URL`
+- `mount.fuse3` starts `openeral`
+- `/db` is read-only database context
+- `/home/agent` is the writable durable Claude home
 
-The `gateway` image is internal. It is resolved from the cluster image and must come from the same openeral image set.
+Create the `db` provider with the OpenShell CLI env-lookup form:
 
-With stock upstream `openshell 0.0.12`, also set `IMAGE_REPO_BASE` to the openeral repo base when using canonical openeral image refs. Otherwise the CLI still defaults the internal gateway pull to upstream OpenShell.
+```bash
+DATABASE_URL="$OPENERAL_DATABASE_URL" openshell provider create \
+  --gateway "$OPENERAL_GATEWAY_NAME" \
+  --name db \
+  --type generic \
+  --credential DATABASE_URL
+```
 
-Unsupported combinations:
+Do not pass `DATABASE_URL=...` directly in the `--credential` argument. The
+env-lookup form keeps secrets out of argv and is the supported docs path.
 
-- openeral `cluster` + upstream `gateway`
-- upstream `cluster` + openeral `gateway`
-- upstream `cluster` + openeral `sandbox`
+## Claude Code
 
-The vendored OpenShell source in this repo exists to build the custom `cluster` and `gateway` images. It is not the supported source of the user-facing CLI.
+Run Claude with:
 
-## Sandbox Policy Is Image-Owned
+```bash
+HOME=/home/agent claude
+```
 
-The openeral sandbox image ships its own full OpenShell policy file:
+Non-interactive check:
+
+```bash
+HOME=/home/agent claude -p 'Reply with READY and nothing else.'
+```
+
+Claude state must persist under `/home/agent`, especially:
+
+- `/home/agent/.claude.json`
+- `/home/agent/.claude/settings.json`
+- `/home/agent/.claude/projects/...`
+
+Do not treat `/sandbox` as durable state.
+
+## Policy
+
+This image replaces the base OpenShell policy with:
 
 ```text
 /etc/openshell/policy.yaml
 ```
 
-This is copied from:
+That policy is copied from `sandboxes/openeral/policy.yaml` and is part of the
+runtime contract. It allows Claude's Anthropic traffic and keeps
+`ANTHROPIC_API_KEY` as a child-visible placeholder that the OpenShell proxy
+rewrites at egress.
 
-```text
-sandboxes/openeral/policy.yaml
-```
+If Claude auth fails, check both:
 
-That file is not just a small addon. It is the authoritative sandbox policy for
-the openeral image.
+- the `claude` provider contains `ANTHROPIC_API_KEY`
+- `/etc/openshell/policy.yaml` still contains the Anthropic REST endpoint and
+  `secret_injection` rule
 
-Why the override exists:
-
-- the upstream base sandbox policy was not enough for the current
-  placeholder-based Claude auth path
-- openeral needs the child process to keep seeing
-  `openshell:resolve:env:ANTHROPIC_API_KEY`
-- the proxy then needs an explicit secret-injection rule to rewrite that
-  placeholder into the outbound `x-api-key` header for Anthropic
-
-Today the image policy contains two important Anthropic-related rules:
-
-- `claude_code`
-  - for the normal Claude Code runtime path
-  - secret injection on `x-api-key`
-- `anthropic_secret_test`
-  - for direct `curl`-based live verification with `GET /v1/models`
-
-## Optional Package Proxy
-
-OpenEral can also route package-manager traffic through the built-in OpenShell
-sandbox proxy to an upstream package proxy.
-
-- OpenShell policy still decides whether a given binary may reach a given host
-- once allowed, package-manager traffic can be chained through an upstream proxy
-- if that upstream proxy is down, package-manager requests fail closed
-
-For a real Socket Firewall Enterprise deployment, the sandbox must trust the
-Socket proxy CA. The supported control-plane knob is
-`OPENERAL_PACKAGE_PROXY_CA_SECRET_NAME`, pointing at a Kubernetes secret with a
-`ca.crt` entry mounted into the sandbox pod.
-
-Cluster-scoped control knobs:
-
-- `OPENERAL_PACKAGE_PROXY_ENABLED`
-- `OPENERAL_PACKAGE_PROXY_PROFILE`
-- `OPENERAL_PACKAGE_PROXY_UPSTREAM_URL`
-- optional `OPENERAL_PACKAGE_PROXY_CA_SECRET_NAME`
-- optional `OPENERAL_PACKAGE_PROXY_AUTH_SECRET_NAME`
-
-The validated behavior is:
-
-- allowed `npm` traffic is chained through the upstream proxy
-- non-allowed binaries are still denied by normal OpenShell policy
-- if the upstream package proxy is down, package-manager requests fail closed
-
-Observed runtime caveat:
-
-- generic upstream proxy routing is validated end to end
-- actual Socket service mode still requires the account entitlement behind
-  `socketdev/socket-firewall --service`; without it, the service exits before the
-  OpenShell sandbox can use it
-
-## Boundary Secret Injection
-
-OpenEral also supports endpoint-scoped boundary secret injection inside the same
-built-in OpenShell sandbox proxy.
-
-- the child process sees placeholder values such as
-  `openshell:resolve:env:OPENAI_API_KEY`
-- the proxy rewrites those placeholders to real provider-env secrets only on
-  matching endpoints
-- v1 supports header and query-string rewriting on inspected REST traffic
-
-Required endpoint shape:
-
-- `protocol: rest`
-- `tls: terminate`
-- `secret_injection:` rules on the endpoint
-
-If an endpoint also uses `egress_via: package_proxy`:
-
-- non-secret requests still use the normal package-proxy route
-- secret-bearing requests switch to direct egress after rewrite
-- unauthorized or leaked placeholders are denied
-
-Migration note:
-
-- plain `HTTP_PROXY` forward-proxy requests no longer rewrite
-  `openshell:resolve:env:*` placeholders
-- placeholder-based auth must use the CONNECT + REST + TLS-terminate path
-
-Current Anthropic detail:
-
-- the openeral sandbox policy rewrites `ANTHROPIC_API_KEY` into the
-  `x-api-key` header for Claude traffic to `api.anthropic.com`
-- this is what allows the stock `claude` CLI to run successfully while the
-  child environment still contains only the placeholder value
-
-### Local Development
-
-If you are developing locally, build and publish all three images to a local registry first.
-
-Start a local registry:
+Create the `claude` provider with:
 
 ```bash
-docker run -d --restart=always -p 5000:5000 --name openshell-local-registry registry:2
-```
-
-Build and push the cluster image:
-
-```bash
-docker build \
-  -f vendor/openshell/deploy/docker/Dockerfile.images \
-  --target cluster \
-  --build-arg OPENERAL_DEFAULT_IMAGE_REPO_BASE=172.17.0.1:5000/openshell/openeral \
-  --build-arg OPENERAL_DEFAULT_IMAGE_TAG=dev \
-  -t 127.0.0.1:5000/openshell/openeral/cluster:dev \
-  vendor/openshell
-
-docker push 127.0.0.1:5000/openshell/openeral/cluster:dev
-```
-
-Build and push the matching gateway image:
-
-```bash
-docker build \
-  -f vendor/openshell/deploy/docker/Dockerfile.images \
-  --target gateway \
-  -t 127.0.0.1:5000/openshell/openeral/gateway:dev \
-  vendor/openshell
-
-docker push 127.0.0.1:5000/openshell/openeral/gateway:dev
-```
-
-Build and push the sandbox image:
-
-```bash
-docker build \
-  -f sandboxes/openeral/Dockerfile \
-  -t 127.0.0.1:5000/openshell/openeral/sandbox:dev \
-  .
-
-docker push 127.0.0.1:5000/openshell/openeral/sandbox:dev
-```
-
-Then use:
-
-- `OPENSHELL_CLUSTER_IMAGE=127.0.0.1:5000/openshell/openeral/cluster:dev`
-- `OPENSHELL_REGISTRY_HOST=172.17.0.1:5000`
-- `OPENSHELL_REGISTRY_INSECURE=true`
-- `OPENERAL_SANDBOX_IMAGE=172.17.0.1:5000/openshell/openeral/sandbox:dev`
-
-The cluster image is pulled by host Docker, so `127.0.0.1:5000` is correct there. The cluster image itself is baked to resolve its sibling gateway image via `172.17.0.1:5000`, and the sandbox image is also pulled from inside the cluster, so use `172.17.0.1:5000` for the sandbox image reference and the registry host.
-
-## Start Gateway
-
-```bash
-export OPENSHELL_CLUSTER_IMAGE='<provided-cluster-image-ref>'
-export IMAGE_REPO_BASE='<provided-gateway-repo-base>'
-export OPENSHELL_REGISTRY_HOST='ghcr.io'
-export OPENSHELL_GATEWAY_NAME=openeral
-
-openshell gateway start --name "$OPENSHELL_GATEWAY_NAME"
-```
-
-If your cluster image ref is `ghcr.io/<owner>/openeral/cluster:<tag>`, then `IMAGE_REPO_BASE` should be `ghcr.io/<owner>/openeral`.
-
-## Create Database Provider
-
-```bash
-export DATABASE_URL='host=<host> port=<port> user=<user> password=<password> dbname=<dbname>'
-export OPENERAL_DB_PROVIDER=openeral-db
-
-openshell provider create \
-  --gateway "$OPENSHELL_GATEWAY_NAME" \
-  --name "$OPENERAL_DB_PROVIDER" \
+ANTHROPIC_API_KEY="$ANTHROPIC_API_KEY" openshell provider create \
+  --gateway "$OPENERAL_GATEWAY_NAME" \
+  --name claude \
   --type generic \
-  --credential DATABASE_URL
+  --credential ANTHROPIC_API_KEY
 ```
 
-## One-Command Launch
+## Fresh Machine Usage
+
+Use the root `README.md` flow. The important sandbox command is:
 
 ```bash
-export OPENERAL_SANDBOX_IMAGE='<provided-sandbox-image-ref>'
-export OPENERAL_SANDBOX_NAME=openeral-demo
-
-set -a
-. ./.env
-set +a
-
 openshell sandbox create \
-  --gateway "$OPENSHELL_GATEWAY_NAME" \
+  --gateway "$OPENERAL_GATEWAY_NAME" \
   --name "$OPENERAL_SANDBOX_NAME" \
   --from "$OPENERAL_SANDBOX_IMAGE" \
-  --provider "$OPENERAL_DB_PROVIDER" \
+  --provider db \
   --provider claude \
   --auto-providers \
   --no-tty -- env HOME=/home/agent claude
 ```
-
-The cluster image resolves the matching gateway image automatically. The gateway image is still required, but it is not a user-facing input. With upstream `openshell 0.0.12`, `IMAGE_REPO_BASE` is the required hint that points that internal gateway pull at the openeral repo base instead of upstream. For repeatable deployments, prefer the provided immutable refs, for example a release tag or `sha-<commit>`. Do not assume the canonical `latest` tags exist or are the intended deployment channel.
-
-This is the preferred and supported user flow:
-
-- single `openshell` command
-- no wrapper scripts
-- no `sandbox upload`
-- no manual `sandbox connect` just to start Claude
-
-The same rule applies in CI: release smoke installs the upstream released `openshell` CLI and drives the published openeral images through that CLI path.
-
-## Live-Proven Checks
-
-The current sandbox image was live-tested with these checks:
-
-### Claude path
-
-```bash
-HOME=/home/agent claude -p 'Reply with READY and nothing else.'
-```
-
-Expected properties during that run:
-
-- `ANTHROPIC_API_KEY=openshell:resolve:env:ANTHROPIC_API_KEY` inside the child
-- Claude returns `READY`
-- `.claude*` rows appear in `_openeral.workspace_files`
-
-### Direct secret-injection path
-
-```bash
-curl -fsS https://api.anthropic.com/v1/models \
-  -H "x-api-key: $ANTHROPIC_API_KEY" \
-  -H 'anthropic-version: 2023-06-01'
-```
-
-Expected properties during that run:
-
-- `$ANTHROPIC_API_KEY` is still the placeholder value in the child env
-- the request succeeds through the proxy rewrite path
-- the response contains Anthropic model data
-
-## Database Migrations
-
-`openeral` carries its own embedded PostgreSQL migrations with `refinery`.
-
-That means image upgrades are self-contained:
-
-- the first upgraded mount auto-applies pending `_openeral` schema changes
-- if migrations fail, the sandbox does not get a working `/db` or `/home/agent` mount
-
-That auto-run path is the normal OpenShell behavior. If you are debugging or preparing a database manually and have direct access to the binary, you can run:
-
-```bash
-openeral migrate --connection "$DATABASE_URL"
-```
-
-Without `--connection`, the command falls back to `OPENERAL_DATABASE_URL`.
-
-## Runtime Contract
-
-When the sandbox is healthy:
-
-- `/home/agent` is mounted read-write by `openeral`
-- `/db` is mounted read-only by `openeral`
-- Claude runs with `HOME=/home/agent`
-- `.claude` files are written into PostgreSQL-backed storage
-- `/etc/openshell/policy.yaml` comes from this repo's sandbox image, not from
-  the upstream base image unchanged
-
-The sandbox image declares these mounts in `/etc/fstab`:
-
-- `env /db fuse.openeral ro,allow_other,noauto 0 0`
-- `env#workspace#${OPENSHELL_SANDBOX_ID} /home/agent fuse.openeral rw,allow_other,noauto 0 0`
-
-OpenShell side-loads `openshell-sandbox`, which reads `/etc/fstab` and launches `mount.fuse3` before the child process starts. The database provider's `DATABASE_URL` is mapped to `OPENERAL_DATABASE_URL` for `openeral`.
-
-## Persistence Rules
-
-- `/home/agent` is the durable Claude home
-- reconnect to the same sandbox: same workspace
-- delete and recreate the sandbox: new workspace
-
-If Claude is not running with `HOME=/home/agent`, persistence is not configured correctly.
-
-## Quick Checks
-
-Inside the sandbox, these are the checks that matter:
-
-```bash
-grep -E ' /db | /home/agent ' /proc/mounts
-stat -c '%u:%g %a %n' /home/agent
-HOME=/home/agent claude -p 'Reply with READY and nothing else.'
-```
-
-If you need to confirm persistence in PostgreSQL:
-
-```sql
-SELECT path, uid, gid, size
-FROM _openeral.workspace_files
-WHERE workspace_id = '<sandbox-id>'
-ORDER BY path;
-```
-
-You should see Claude state files such as:
-
-- `/.claude.json`
-- `/.claude/settings.json`
-- `/.claude/projects/...`
-
-## Failure Meaning
-
-- missing `/home/agent`:
-  - OpenShell or FUSE bootstrap failed
-- missing `/db`:
-  - database provider or FUSE bootstrap failed
-- Claude auth failure:
-  - Anthropic credential issue, not an openeral mount issue
-- state not preserved:
-  - Claude was not run with `HOME=/home/agent`
-
-## Image Notes
-
-- `openshell sandbox create --from sandboxes/openeral` is not the supported user flow
-- this image is meant to be published and referenced by image tag
-- the image `ENTRYPOINT` is not the OpenShell control path; the supervisor mounts FUSE from `/etc/fstab`

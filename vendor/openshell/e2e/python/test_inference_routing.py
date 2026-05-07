@@ -32,7 +32,7 @@ if TYPE_CHECKING:
 
 _BASE_FILESYSTEM = sandbox_pb2.FilesystemPolicy(
     include_workdir=True,
-    read_only=["/usr", "/lib", "/etc", "/app", "/var/log"],
+    read_only=["/usr", "/lib", "/etc", "/app", "/var/log", "/proc", "/dev/urandom"],
     read_write=["/sandbox", "/tmp"],
 )
 _BASE_LANDLOCK = sandbox_pb2.LandlockPolicy(compatibility="best_effort")
@@ -66,7 +66,7 @@ def _upsert_managed_inference(
     base_url: str,
 ) -> None:
     provider = datamodel_pb2.Provider(
-        name=provider_name,
+        metadata=datamodel_pb2.ObjectMeta(name=provider_name),
         type=provider_type,
         credentials={credential_key: "mock"},
         config={
@@ -94,11 +94,6 @@ def _upsert_managed_inference(
                 break
             except grpc.RpcError as create_exc:
                 if create_exc.code() == grpc.StatusCode.ALREADY_EXISTS:
-                    continue
-                if (
-                    create_exc.code() == grpc.StatusCode.INTERNAL
-                    and "UNIQUE constraint failed" in (create_exc.details() or "")
-                ):
                     continue
                 raise
     else:
@@ -131,6 +126,9 @@ def _restore_cluster_inference(
     inference_client.set_cluster(
         provider_name=previous.provider_name,
         model_id=previous.model_id,
+        # Teardown restores prior shared state as-is, even if the previous
+        # route is intentionally unreachable or no longer verifiable.
+        no_verify=True,
     )
 
 
@@ -319,7 +317,7 @@ def test_unsupported_protocol_returns_400(
         assert result.exit_code == 0, f"stderr: {result.stderr}"
         output = result.stdout.strip()
         assert output.startswith("http_error_400"), output
-        assert "no compatible route" in output
+        assert "no compatible inference route" in output
 
 
 def test_non_inference_host_is_not_intercepted(

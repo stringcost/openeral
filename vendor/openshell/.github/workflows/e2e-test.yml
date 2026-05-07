@@ -11,7 +11,7 @@ on:
         description: "GitHub Actions runner label"
         required: false
         type: string
-        default: "build-amd64"
+        default: "linux-amd64-cpu8"
 
 permissions:
   contents: read
@@ -19,9 +19,22 @@ permissions:
 
 jobs:
   e2e:
-    name: E2E
+    name: "E2E (${{ matrix.suite }})"
     runs-on: ${{ inputs.runner }}
     timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - suite: python
+            cmd: "mise run --no-deps --skip-deps e2e:python"
+            apt_packages: ""
+          - suite: rust-docker
+            cmd: "mise run --no-deps --skip-deps e2e:rust"
+            apt_packages: "openssh-client"
+          - suite: rust-podman
+            cmd: "mise run --no-deps --skip-deps e2e:podman"
+            apt_packages: "openssh-client podman"
     container:
       image: ghcr.io/nvidia/openshell/ci:latest
       credentials:
@@ -30,6 +43,7 @@ jobs:
       options: --privileged
       volumes:
         - /var/run/docker.sock:/var/run/docker.sock
+        - /home/runner/_work:/home/runner/_work
     env:
       MISE_GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
       IMAGE_TAG: ${{ inputs.image-tag }}
@@ -39,30 +53,26 @@ jobs:
       OPENSHELL_REGISTRY_USERNAME: ${{ github.actor }}
       OPENSHELL_REGISTRY_PASSWORD: ${{ secrets.GITHUB_TOKEN }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
 
-      - name: Log in to GHCR
+      - name: Install OS test dependencies
+        if: matrix.apt_packages != ''
+        env:
+          APT_PACKAGES: ${{ matrix.apt_packages }}
+        run: apt-get update && apt-get install -y ${APT_PACKAGES} && rm -rf /var/lib/apt/lists/*
+
+      - name: Log in to GHCR with Docker
         run: echo "${{ secrets.GITHUB_TOKEN }}" | docker login ghcr.io -u "${{ github.actor }}" --password-stdin
 
-      - name: Pull cluster image
-        run: docker pull ghcr.io/nvidia/openshell/cluster:${{ inputs.image-tag }}
+      - name: Log in to GHCR with Podman
+        if: matrix.suite == 'rust-podman'
+        run: echo "${{ secrets.GITHUB_TOKEN }}" | podman login ghcr.io -u "${{ github.actor }}" --password-stdin
 
       - name: Install Python dependencies and generate protobuf stubs
-        run: uv sync --frozen && mise run --no-prepare python:proto
+        if: matrix.suite == 'python'
+        run: uv sync --frozen && mise run --no-deps python:proto
 
-      - name: Bootstrap and deploy cluster
+      - name: Run tests
         env:
-          GATEWAY_HOST: host.docker.internal
-          GATEWAY_PORT: "8080"
-          SKIP_IMAGE_PUSH: "1"
-          SKIP_CLUSTER_IMAGE_BUILD: "1"
-          OPENSHELL_CLUSTER_IMAGE: ghcr.io/nvidia/openshell/cluster:${{ inputs.image-tag }}
-        run: mise run --no-prepare --skip-deps cluster
-
-      - name: Install SSH client for Rust CLI e2e tests
-        run: apt-get update && apt-get install -y --no-install-recommends openssh-client && rm -rf /var/lib/apt/lists/*
-
-      - name: Run E2E tests
-        run: |
-          mise run --no-prepare --skip-deps e2e:python
-          mise run --no-prepare --skip-deps e2e:rust
+          OPENSHELL_SUPERVISOR_IMAGE: ${{ format('ghcr.io/nvidia/openshell/supervisor:{0}', inputs.image-tag) }}
+        run: ${{ matrix.cmd }}

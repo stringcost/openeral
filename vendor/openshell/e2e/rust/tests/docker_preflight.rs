@@ -32,6 +32,7 @@ async fn run_without_docker(args: &[&str]) -> (String, i32, std::time::Duration)
         .env("HOME", tmpdir.path())
         .env("DOCKER_HOST", "unix:///tmp/openshell-e2e-nonexistent.sock")
         .env_remove("OPENSHELL_GATEWAY")
+        .env_remove("OPENSHELL_GATEWAY_ENDPOINT")
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
 
@@ -86,7 +87,7 @@ async fn gateway_start_error_mentions_docker() {
 }
 
 /// When Docker is unavailable, the error output should include guidance
-/// about DOCKER_HOST since that's the likely fix for non-default runtimes.
+/// about `DOCKER_HOST` since that's the likely fix for non-default runtimes.
 #[tokio::test]
 async fn gateway_start_error_mentions_docker_host() {
     let (output, code, _) = run_without_docker(&["gateway", "start"]).await;
@@ -249,6 +250,7 @@ async fn doctor_check_passes_with_docker() {
         .env("XDG_CONFIG_HOME", tmpdir.path())
         .env("HOME", tmpdir.path())
         .env_remove("OPENSHELL_GATEWAY")
+        .env_remove("OPENSHELL_GATEWAY_ENDPOINT")
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
 

@@ -25,8 +25,8 @@ Quick-reference for the `openshell` command-line interface. For workflow guidanc
 ```
 openshell
 ├── gateway
-│   ├── start [opts]
-│   ├── stop [opts]
+│   ├── add <endpoint> [opts]
+│   ├── login [name]
 │   ├── destroy [opts]
 │   ├── info [--name]
 │   └── select [name]
@@ -73,40 +73,37 @@ openshell
 
 ## Gateway Commands
 
-### `openshell gateway start`
+### `openshell gateway add <ENDPOINT>`
 
-Provision or start a cluster (local or remote).
-
-| Flag | Default | Description |
-|------|---------|-------------|
-| `--name <NAME>` | `openshell` | Cluster name |
-| `--remote <USER@HOST>` | none | SSH destination for remote deployment |
-| `--ssh-key <PATH>` | none | SSH private key for remote deployment |
-| `--port <PORT>` | 8080 | Host port mapped to gateway |
-| `--gateway-host <HOST>` | none | Override gateway host in metadata |
-| `--recreate` | false | Destroy and recreate from scratch if a gateway already exists (skips interactive prompt) |
-
-### `openshell gateway stop`
-
-Stop a cluster (preserves state for later restart).
+Register an existing gateway endpoint.
 
 | Flag | Description |
 |------|-------------|
-| `--name <NAME>` | Cluster name (defaults to active) |
-| `--remote <USER@HOST>` | SSH destination |
-| `--ssh-key <PATH>` | SSH private key |
+| `--name <NAME>` | Gateway name |
+| `--local` | Register a local endpoint, commonly a trusted port-forward |
+| `--remote <USER@HOST>` | Register a remote gateway associated with an SSH destination |
+| `--ssh-key <PATH>` | SSH private key for the remote host |
+
+Examples:
+
+- `openshell gateway add http://127.0.0.1:8080 --local --name local`
+- `openshell gateway add https://gateway.example.com --name production`
 
 ### `openshell gateway destroy`
 
-Destroy a cluster and all its state. Same flags as `stop`.
+Remove a gateway registration. For Helm deployments this affects local CLI metadata only; it does not uninstall the Helm release.
+
+### `openshell gateway login [name]`
+
+Refresh browser-based authentication for a gateway behind an edge proxy.
 
 ### `openshell gateway info`
 
-Show deployment details: endpoint and remote host.
+Show gateway details: endpoint, auth mode, and remote host metadata when present.
 
 | Flag | Description |
 |------|-------------|
-| `--name <NAME>` | Cluster name (defaults to active) |
+| `--name <NAME>` | Gateway name (defaults to active) |
 
 ### `openshell gateway select [name]`
 
@@ -118,7 +115,7 @@ Set the active gateway. Writes to `~/.config/openshell/active_gateway`. When cal
 
 ### `openshell doctor logs`
 
-Fetch logs from the gateway Docker container.
+Fetch logs when gateway metadata supports it. For Helm deployments, prefer `kubectl -n openshell logs statefulset/openshell`.
 
 | Flag | Default | Description |
 |------|---------|-------------|
@@ -130,8 +127,7 @@ Fetch logs from the gateway Docker container.
 
 ### `openshell doctor exec -- <COMMAND...>`
 
-Run a command inside the gateway container with KUBECONFIG pre-configured.
-Launches an interactive `docker exec` session (tunnelled over SSH for remote gateways).
+Run a diagnostic command when gateway metadata supports it. For Helm deployments, prefer direct `kubectl` and `helm` commands.
 
 | Flag | Default | Description |
 |------|---------|-------------|
@@ -140,9 +136,9 @@ Launches an interactive `docker exec` session (tunnelled over SSH for remote gat
 | `--ssh-key <PATH>` | none | SSH private key for remote gateways |
 
 Examples:
-- `openshell doctor exec -- kubectl get pods -A`
-- `openshell doctor exec -- k9s`
-- `openshell doctor exec -- sh` (interactive shell)
+- `kubectl -n openshell get pods`
+- `kubectl -n openshell logs statefulset/openshell`
+- `helm -n openshell status openshell`
 
 ---
 
@@ -158,7 +154,7 @@ Show server connectivity and version for the active gateway.
 
 ### `openshell sandbox create [OPTIONS] [-- COMMAND...]`
 
-Create a sandbox, wait for readiness, then connect or execute the trailing command. Auto-bootstraps a cluster if none exists.
+Create a sandbox through the active gateway, wait for readiness, then connect or execute the trailing command.
 
 | Flag | Description |
 |------|-------------|
@@ -169,19 +165,19 @@ Create a sandbox, wait for readiness, then connect or execute the trailing comma
 | `--provider <NAME>` | Provider to attach (repeatable) |
 | `--policy <PATH>` | Path to custom policy YAML |
 | `--forward <PORT>` | Forward local port to sandbox (keeps the sandbox alive) |
-| `--remote <USER@HOST>` | SSH destination for auto-bootstrap |
-| `--ssh-key <PATH>` | SSH private key for auto-bootstrap |
 | `--tty` | Force pseudo-terminal allocation |
 | `--no-tty` | Disable pseudo-terminal allocation |
-| `--bootstrap` | Auto-bootstrap a gateway if none is available (skips interactive prompt) |
-| `--no-bootstrap` | Never auto-bootstrap; error immediately if no gateway is available |
 | `--auto-providers` | Auto-create missing providers from local credentials (skips interactive prompt) |
 | `--no-auto-providers` | Never auto-create providers; skip missing providers silently |
 | `[-- COMMAND...]` | Command to execute (defaults to interactive shell) |
 
 ### `openshell sandbox get <name>`
 
-Show sandbox details (id, name, namespace, phase, policy).
+Show sandbox details (id, name, namespace, phase) and the **active** policy from the gateway (same source whether policy is sandbox-scoped or global). Metadata includes **Policy source** (`sandbox` or `global`) and **Revision** (global policy row when source is global, otherwise sandbox policy row).
+
+| Flag | Description |
+|------|-------------|
+| `--policy-only` | Print only the active policy YAML to stdout (same policy as above; use for scripts and piping) |
 
 ### `openshell sandbox list`
 
@@ -268,9 +264,32 @@ View sandbox logs. Supports one-shot and streaming.
 
 ## Policy Commands
 
+### `openshell policy update <name>`
+
+Incrementally merge live network policy changes into the current sandbox policy. Multiple flags in one invocation are applied as one atomic batch and create at most one new revision.
+
+| Flag | Default | Description |
+|------|---------|-------------|
+| `--add-endpoint <SPEC>` | repeatable | `host:port[:access[:protocol[:enforcement]]]`. Adds or merges an endpoint. `access`: `read-only`, `read-write`, `full`. `protocol`: `rest`, `sql`. `enforcement`: `enforce`, `audit`. |
+| `--remove-endpoint <SPEC>` | repeatable | `host:port`. Removes the endpoint or just the requested port from a multi-port endpoint. |
+| `--add-allow <SPEC>` | repeatable | `host:port:METHOD:path_glob`. Adds REST allow rules to an existing `protocol: rest` endpoint. |
+| `--add-deny <SPEC>` | repeatable | `host:port:METHOD:path_glob`. Adds REST deny rules to an existing `protocol: rest` endpoint that already has an allow base. |
+| `--remove-rule <NAME>` | repeatable | Deletes a named network rule. |
+| `--binary <PATH>` | repeatable | Adds binaries to each `--add-endpoint` rule. Valid only with `--add-endpoint`. |
+| `--rule-name <NAME>` | none | Overrides the generated rule name. Valid only when exactly one `--add-endpoint` is provided. |
+| `--dry-run` | false | Preview the merged policy locally without sending an update to the gateway. |
+| `--wait` | false | Wait for the sandbox to confirm the new policy revision is loaded. |
+| `--timeout <SECS>` | 60 | Timeout for `--wait`. |
+
+Notes:
+
+- `--add-allow` and `--add-deny` currently operate only on `protocol: rest` endpoints.
+- `--wait` cannot be combined with `--dry-run`.
+- Use `policy set` when replacing the full policy or changing static sections.
+
 ### `openshell policy set <name> --policy <PATH>`
 
-Update the policy on a live sandbox. Only the dynamic `network_policies` field can be changed at runtime.
+Replace the full policy on a live sandbox. Only the dynamic `network_policies` field can be changed at runtime.
 
 | Flag | Default | Description |
 |------|---------|-------------|
