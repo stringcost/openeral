@@ -28,8 +28,8 @@ What each image owns:
 - `gateway` runs the patched OpenShell gateway with the Docker compute driver.
 - `supervisor` contains the patched `openshell-sandbox` binary that reads
   `/etc/fstab` and starts the openeral FUSE mounts.
-- `sandbox` contains Claude Code, `openeral`, `fuse3`, `/etc/fstab`, and
-  `/etc/openshell/policy.yaml`.
+- `sandbox` contains Claude Code support, optional OpenClaw support,
+  `openeral`, `fuse3`, `/etc/fstab`, and `/etc/openshell/policy.yaml`.
 
 Do not mix openeral `gateway`, `supervisor`, or `sandbox` images with upstream
 OpenShell runtime images. The upstream CLI is the only upstream component in the
@@ -38,9 +38,13 @@ supported user flow.
 ## OpenShell CLI Compatibility
 
 The host CLI is upstream `openshell`, but it must speak the same protobuf API as
-the openeral gateway image. For published `latest` images, install the current
-upstream CLI with the upstream installer unless the image release notes pin a
-specific `OPENSHELL_VERSION`.
+the openeral gateway image. The Docker-driver gateway currently tracks upstream
+OpenShell `main`; released installers can lag that API.
+
+Known-bad example: upstream release CLI `0.0.36` is not compatible with the
+current Docker-driver gateway because it uses the pre-`ObjectMeta` protobuf
+layout. Use an upstream OpenShell CLI built from the same upstream source
+version as the openeral gateway image until NVIDIA publishes a matching release.
 
 ```bash
 openshell --version
@@ -48,15 +52,15 @@ openshell --version
 
 If provider or sandbox commands fail with protobuf decode errors, treat that as
 a CLI/gateway version mismatch. Do not work around it by using repo-local wrapper
-scripts or a vendored CLI in the user flow. Install the matching upstream CLI
-release, or use an openeral image tag built from the upstream version already
-installed on the host.
+scripts. Install or build the matching upstream CLI, or use an openeral image
+tag built from the upstream version already installed on the host.
 
 ## Fresh Machine Flow
 
 Assume a fresh machine with:
 
-- upstream `openshell` already installed
+- upstream `openshell` already installed from a source/API version matching the
+  openeral gateway image
 - Docker available on the host
 - `/dev/fuse` available on the host
 - a live PostgreSQL database already available
@@ -108,9 +112,10 @@ docker run -d --name openeral-gateway --network host \
   --port "$OPENERAL_GATEWAY_PORT"
 ```
 
-The explicit `--bind-address` and `--port` arguments are intentional. The gateway image has an upstream default command
-that binds port `8080`; passing these arguments makes `OPENERAL_GATEWAY_PORT` authoritative instead of relying on image
-defaults.
+The explicit `--bind-address` and `--port` arguments are intentional. The
+gateway image has an upstream default command that binds port `8080`; passing
+these arguments makes `OPENERAL_GATEWAY_PORT` authoritative instead of relying
+on image defaults.
 
 Register it with the stock OpenShell CLI:
 
@@ -138,10 +143,36 @@ ANTHROPIC_API_KEY="$ANTHROPIC_API_KEY" openshell provider create \
   --credential ANTHROPIC_API_KEY
 ```
 
+Optional providers:
+
+```bash
+SOCKET_TOKEN="$SOCKET_TOKEN" openshell provider create \
+  --gateway "$OPENERAL_GATEWAY_NAME" \
+  --name socket \
+  --type generic \
+  --credential SOCKET_TOKEN
+
+STRINGCOST_API_KEY="$STRINGCOST_API_KEY" openshell provider create \
+  --gateway "$OPENERAL_GATEWAY_NAME" \
+  --name stringcost \
+  --type generic \
+  --credential STRINGCOST_API_KEY
+
+OPENERAL_AGENT=openclaw openshell provider create \
+  --gateway "$OPENERAL_GATEWAY_NAME" \
+  --name openclaw \
+  --type generic \
+  --credential OPENERAL_AGENT
+```
+
 Always pass provider secrets through the CLI's environment lookup form
 `--credential NAME`. Do not put secret values directly in the command line with
 `--credential NAME=value`; that leaks through shell history/process listings and
 has produced brittle behavior across OpenShell CLI/gateway versions.
+
+Do not upload `DATABASE_URL` into the sandbox. The supervisor receives the real
+database provider value before child env is converted to placeholders, mounts
+`/db` and `/home/agent`, and then starts the child with placeholder secrets.
 
 Run Claude Code with a persistent home:
 
@@ -152,8 +183,28 @@ openshell sandbox create \
   --from "$OPENERAL_SANDBOX_IMAGE" \
   --provider db \
   --provider claude \
+  --provider socket \
+  --provider stringcost \
   --auto-providers \
   --no-tty -- env HOME=/home/agent claude
+```
+
+Omit optional providers you do not use, and omit their matching `--provider`
+flags. The sandbox bootstrap is image-owned and runs automatically after FUSE
+mounts are ready; there is no `openeral` wrapper entrypoint in the user flow.
+
+Run OpenClaw instead of Claude Code:
+
+```bash
+openshell sandbox create \
+  --gateway "$OPENERAL_GATEWAY_NAME" \
+  --name "${OPENERAL_SANDBOX_NAME}-openclaw" \
+  --from "$OPENERAL_SANDBOX_IMAGE" \
+  --provider db \
+  --provider claude \
+  --provider openclaw \
+  --auto-providers \
+  --no-tty -- env HOME=/home/agent openclaw
 ```
 
 Non-interactive validation:
@@ -186,6 +237,7 @@ Expected results:
 - `/home/agent` is writable and backed by PostgreSQL.
 - `/db` is read-only database context.
 - `ANTHROPIC_API_KEY` is a placeholder value in the child environment.
+- `/home/agent/.claude/settings.json` is seeded automatically.
 
 The sandbox policy at `/etc/openshell/policy.yaml` authorizes the Anthropic
 REST path so the OpenShell proxy can rewrite the placeholder at egress. Real
@@ -204,15 +256,37 @@ Important paths:
 Those files are stored in the backing database table
 `_openeral.workspace_files`. `/sandbox` is not the durable home.
 
+The FUSE workspace denies common credential and history paths instead of
+persisting them, including `~/.ssh`, `~/.aws`, `~/.azure`, `~/.docker`,
+`~/.gnupg`, `~/.kube`, `~/.npm`, `~/.npmrc`, shell history files, and
+`~/.local/share/keyrings`.
+
+Refresh Claude memory files inside a running sandbox:
+
+```bash
+openeral memory refresh --project-root /sandbox/project
+```
+
+The command writes under `/home/agent/.claude/projects/.../memory`, so the
+result persists through the PostgreSQL-backed workspace mount.
+
 ## Local Development
 
 Local development uses the same Docker compute driver flow. Build local image
 tags, then run the same OpenShell commands with those tags.
 
-The local dev flow still uses the upstream `openshell` CLI. If vendored
-OpenShell is ahead of the installed upstream CLI and protobuf decode errors
-appear, align versions before testing the product flow. Do not replace the
-documented flow with a custom CLI or wrapper script.
+The local dev flow still uses the upstream `openshell` CLI. When the latest
+OpenShell release lags the vendored upstream source, build the matching CLI from
+`vendor/openshell`; this is still the upstream OpenShell CLI source, not an
+openeral wrapper.
+
+```bash
+cargo build --manifest-path vendor/openshell/Cargo.toml --release -p openshell-cli
+export PATH="$PWD/vendor/openshell/target/release:$PATH"
+openshell --version
+```
+
+Do not replace the documented flow with a custom CLI or wrapper script.
 
 Build the openeral gateway and supervisor from vendored OpenShell:
 
@@ -273,6 +347,12 @@ bash .github/scripts/smoke_openshell.sh
 The smoke script is verification automation. It is not the documented user
 interface; user-facing instructions should remain composed `docker` and
 `openshell` commands.
+
+If a change touches `openeral` CLI subcommands, keep
+`crates/openeral-core/src/cli/fuse_fd.rs` in sync. `mount.fuse3` invokes the
+binary as `openeral <source> <mountpoint>`, so every real CLI subcommand must be
+listed in `KNOWN_SUBCOMMANDS`; otherwise a command such as `openeral bootstrap`
+can be misclassified as a FUSE mount source.
 
 Lower-level checks:
 

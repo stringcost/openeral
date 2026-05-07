@@ -22,7 +22,9 @@ database clients unless the task is explicitly a lower-level diagnostic.
 grep -E ' /db | /home/agent ' /proc/mounts
 ```
 
-If either mount is missing, stop treating it as a data-navigation problem. It is an infrastructure problem.
+If either mount is missing, stop treating it as a data-navigation problem. It is
+an infrastructure problem; the fix belongs in the OpenShell Docker-driver
+gateway/supervisor/sandbox path, not in ad hoc direct database clients.
 
 ## Fast Database Reads
 
@@ -58,8 +60,24 @@ Claude-visible secrets should remain provider placeholders. Real provider
 values are injected by the OpenShell proxy at egress, not written into
 `/home/agent`.
 
+Do not repair missing state by uploading files into the sandbox. Durable Claude
+state belongs in `/home/agent` so it passes through the PostgreSQL-backed FUSE
+workspace.
+
+`/home/agent/.claude/settings.json` is seeded automatically by bootstrap. To
+refresh project memory for Claude, run:
+
+```bash
+openeral memory refresh --project-root /sandbox/project
+```
+
+The output lands under `/home/agent/.claude/projects/.../memory` and persists
+through PostgreSQL.
+
 ## What Not To Do
 
 - do not write to `/db`
 - do not assume `/sandbox` is durable
+- do not store credentials under `/home/agent`; common credential paths like
+  `~/.ssh`, `~/.aws`, and `~/.npmrc` are denied by the FUSE workspace
 - do not scan huge tables blindly when `.filter/` or `.info/count` will answer the question

@@ -15,6 +15,8 @@ Assume:
 - `/sandbox` is not durable
 - `OPENERAL_DATABASE_URL` is exported on the host
 - `ANTHROPIC_API_KEY` is exported on the host
+- optional `SOCKET_TOKEN`, `STRINGCOST_API_KEY`, and `OPENERAL_AGENT=openclaw`
+  providers can be added without changing the user flow
 
 ## Fresh Machine Flow
 
@@ -31,9 +33,14 @@ openshell --version
 test -e /dev/fuse
 ```
 
+For the current Docker-driver image set, upstream release CLI `0.0.36` is a
+known-bad pairing because it uses the pre-`ObjectMeta` protobuf layout. Use a
+matching upstream OpenShell CLI built from the same source/API version as the
+gateway image until NVIDIA publishes a compatible release.
+
 If provider or sandbox commands fail with protobuf decode errors, fix the
-OpenShell CLI/gateway version pairing. Do not switch to a wrapper script or a
-vendored CLI for the user flow.
+OpenShell CLI/gateway version pairing. Do not switch to a wrapper script for
+the user flow.
 
 Start the gateway as a Docker-driver gateway container, then register it:
 
@@ -91,10 +98,35 @@ ANTHROPIC_API_KEY="$ANTHROPIC_API_KEY" openshell provider create \
 
 Use `--credential NAME`, not `--credential NAME=value`. The former reads the
 secret from the host environment and avoids putting secrets in argv/history.
+Do not upload `DATABASE_URL` or API keys into the sandbox.
+
+Optional providers:
+
+```bash
+SOCKET_TOKEN="$SOCKET_TOKEN" openshell provider create \
+  --gateway "$OPENERAL_GATEWAY_NAME" \
+  --name socket \
+  --type generic \
+  --credential SOCKET_TOKEN
+
+STRINGCOST_API_KEY="$STRINGCOST_API_KEY" openshell provider create \
+  --gateway "$OPENERAL_GATEWAY_NAME" \
+  --name stringcost \
+  --type generic \
+  --credential STRINGCOST_API_KEY
+
+OPENERAL_AGENT=openclaw openshell provider create \
+  --gateway "$OPENERAL_GATEWAY_NAME" \
+  --name openclaw \
+  --type generic \
+  --credential OPENERAL_AGENT
+```
 
 Launch Claude:
 
 ```bash
+export OPENERAL_SANDBOX_NAME="${OPENERAL_SANDBOX_NAME:-claude-openeral}"
+
 openshell sandbox create \
   --gateway "$OPENERAL_GATEWAY_NAME" \
   --name "$OPENERAL_SANDBOX_NAME" \
@@ -105,6 +137,28 @@ openshell sandbox create \
   --no-tty -- env HOME=/home/agent claude
 ```
 
+The sandbox bootstrap runs automatically after FUSE mounts are ready. It seeds
+`.claude`, configures optional Socket.dev and StringCost settings, and keeps
+real provider secrets out of the child process.
+
+If optional providers were not created, omit their `--provider` flags. Keep the
+flow as composed `openshell` commands; do not use sandbox upload or wrapper
+scripts to inject database credentials.
+
+Launch OpenClaw with the same command-composed pattern:
+
+```bash
+openshell sandbox create \
+  --gateway "$OPENERAL_GATEWAY_NAME" \
+  --name "${OPENERAL_SANDBOX_NAME}-openclaw" \
+  --from "$OPENERAL_SANDBOX_IMAGE" \
+  --provider db \
+  --provider claude \
+  --provider openclaw \
+  --auto-providers \
+  --no-tty -- env HOME=/home/agent openclaw
+```
+
 ## Health Checks
 
 Inside the sandbox:
@@ -113,6 +167,7 @@ Inside the sandbox:
 test -e /dev/fuse
 grep -E ' /db | /home/agent ' /proc/mounts
 test -w /home/agent
+test -f /home/agent/.claude/settings.json
 ```
 
 Non-interactive Claude check:
@@ -128,3 +183,9 @@ Expected persistent paths:
 - `/home/agent/.claude/projects/...`
 
 If state disappears, debug `HOME` and the `/home/agent` mount first.
+
+Refresh persisted Claude memory files inside the sandbox:
+
+```bash
+openeral memory refresh --project-root /sandbox/project
+```

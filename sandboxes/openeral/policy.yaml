@@ -15,10 +15,15 @@ filesystem_policy:
     - /app
     - /etc
     - /var/log
+    - /opt
   read_write:
     - /sandbox
+    - /sandbox/project
     - /tmp
     - /dev/null
+    - /home/agent
+    - /home/**
+    - /mnt/**
 
 landlock:
   compatibility: best_effort
@@ -53,6 +58,95 @@ network_policies:
       - { host: platform.claude.com, port: 443 }
     binaries:
       - { path: /usr/local/bin/claude }
+      - { path: /usr/bin/node }
+
+  openclaw_anthropic:
+    name: openclaw-anthropic
+    endpoints:
+      - host: api.anthropic.com
+        port: 443
+        protocol: rest
+        tls: terminate
+        enforcement: enforce
+        access: full
+        secret_injection:
+          - env_var: ANTHROPIC_API_KEY
+            match_headers: [x-api-key]
+      - { host: statsig.anthropic.com, port: 443 }
+    binaries:
+      - { path: /usr/bin/openclaw }
+      - { path: /usr/local/bin/openclaw }
+      - { path: /usr/bin/node }
+
+  openclaw_openai:
+    name: openclaw-openai
+    endpoints:
+      - host: api.openai.com
+        port: 443
+        protocol: rest
+        tls: terminate
+        enforcement: enforce
+        access: full
+        secret_injection:
+          - env_var: OPENAI_API_KEY
+            match_headers: [authorization]
+    binaries:
+      - { path: /usr/bin/openclaw }
+      - { path: /usr/local/bin/openclaw }
+      - { path: /usr/bin/node }
+
+  socket_packages:
+    name: socket-packages
+    endpoints:
+      - host: registry.socket.dev
+        port: 443
+        protocol: rest
+        tls: terminate
+        enforcement: enforce
+        access: read-only
+        secret_injection:
+          - env_var: SOCKET_TOKEN
+            match_headers: [authorization]
+    binaries:
+      - { path: /usr/bin/npm }
+      - { path: /usr/bin/node }
+
+  npm_registry:
+    name: npm-registry
+    endpoints:
+      - { host: registry.npmjs.org, port: 443 }
+      - { host: github.com, port: 443 }
+      - { host: objects.githubusercontent.com, port: 443 }
+      - { host: release-assets.githubusercontent.com, port: 443 }
+      - { host: raw.githubusercontent.com, port: 443 }
+      - { host: codeload.github.com, port: 443 }
+    binaries:
+      - { path: /usr/bin/npm }
+      - { path: /usr/bin/node }
+      - { path: /usr/bin/npx }
+
+  stringcost:
+    name: stringcost
+    endpoints:
+      - host: proxy.stringcost.com
+        port: 443
+        protocol: rest
+        tls: terminate
+        enforcement: enforce
+        access: full
+        secret_injection:
+          - env_var: ANTHROPIC_API_KEY
+            match_headers: [x-api-key]
+      - host: app.stringcost.com
+        port: 443
+        protocol: rest
+        tls: terminate
+        enforcement: enforce
+        access: full
+    binaries:
+      - { path: /usr/local/bin/claude }
+      - { path: /usr/bin/openclaw }
+      - { path: /usr/local/bin/openclaw }
       - { path: /usr/bin/node }
 
   anthropic_secret_test:

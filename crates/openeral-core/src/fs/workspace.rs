@@ -19,6 +19,23 @@ use crate::fs::workspace_inode::WorkspaceInodeTable;
 
 const TTL: Duration = Duration::from_secs(1);
 
+const SENSITIVE_DIR_NAMES: &[&str] = &[
+    ".aws", ".azure", ".docker", ".gnupg", ".kube", ".npm", ".ssh",
+];
+const SENSITIVE_FILE_NAMES: &[&str] = &[
+    ".bash_history",
+    ".git-credentials",
+    ".lesshst",
+    ".mysql_history",
+    ".netrc",
+    ".npmrc",
+    ".psql_history",
+    ".python_history",
+    ".wget-hsts",
+    ".zsh_history",
+];
+const SENSITIVE_PATH_PREFIXES: &[&str] = &["/.local/share/keyrings"];
+
 /// Tracks an open file handle with write-back buffering.
 struct OpenFileHandle {
     path: String,
@@ -100,6 +117,34 @@ impl WorkspaceFilesystem {
         }
     }
 
+    fn is_sensitive_path(path: &str) -> bool {
+        if path == "/" {
+            return false;
+        }
+
+        if SENSITIVE_PATH_PREFIXES
+            .iter()
+            .any(|prefix| path == *prefix || path.starts_with(&format!("{prefix}/")))
+        {
+            return true;
+        }
+
+        let segments: Vec<&str> = path
+            .split('/')
+            .filter(|segment| !segment.is_empty())
+            .collect();
+        if segments
+            .iter()
+            .any(|segment| SENSITIVE_DIR_NAMES.contains(segment))
+        {
+            return true;
+        }
+
+        segments
+            .last()
+            .is_some_and(|name| SENSITIVE_FILE_NAMES.contains(name))
+    }
+
     fn do_flush(&self, fh_u64: u64) -> Result<(), FsError> {
         let handle = self.open_files.get(&fh_u64).ok_or(FsError::NotFound)?;
         if handle.dirty {
@@ -144,6 +189,10 @@ impl Filesystem for WorkspaceFilesystem {
         };
 
         let child_path = Self::child_path(&parent_path, &name_str);
+        if Self::is_sensitive_path(&child_path) {
+            reply.error(Errno::EACCES);
+            return;
+        }
         match self.rt.block_on(ws_queries::get_file(
             &self.pool,
             &self.workspace_id,
@@ -173,6 +222,10 @@ impl Filesystem for WorkspaceFilesystem {
                 return;
             }
         };
+        if Self::is_sensitive_path(&path) {
+            reply.error(Errno::EACCES);
+            return;
+        }
 
         match self
             .rt
@@ -215,6 +268,10 @@ impl Filesystem for WorkspaceFilesystem {
                 return;
             }
         };
+        if Self::is_sensitive_path(&path) {
+            reply.error(Errno::EACCES);
+            return;
+        }
 
         // If truncating and we have an open file handle, update the buffer too
         if let Some(new_size) = size {
@@ -306,6 +363,10 @@ impl Filesystem for WorkspaceFilesystem {
         for child in children {
             if offset <= idx {
                 let child_path = Self::child_path(&path, &child.name);
+                if Self::is_sensitive_path(&child_path) {
+                    idx += 1;
+                    continue;
+                }
                 let child_ino = self.inodes.get_or_insert(&child_path);
                 let kind = if child.is_dir {
                     FileType::Directory
@@ -330,6 +391,10 @@ impl Filesystem for WorkspaceFilesystem {
                 return;
             }
         };
+        if Self::is_sensitive_path(&path) {
+            reply.error(Errno::EACCES);
+            return;
+        }
 
         match self
             .rt
@@ -491,6 +556,10 @@ impl Filesystem for WorkspaceFilesystem {
         };
 
         let child_path = Self::child_path(&parent_path, &name_str);
+        if Self::is_sensitive_path(&child_path) {
+            reply.error(Errno::EACCES);
+            return;
+        }
         let now_ns = Self::now_ns();
 
         let file = WorkspaceFile {
@@ -565,6 +634,10 @@ impl Filesystem for WorkspaceFilesystem {
         };
 
         let child_path = Self::child_path(&parent_path, &name_str);
+        if Self::is_sensitive_path(&child_path) {
+            reply.error(Errno::EACCES);
+            return;
+        }
         let now_ns = Self::now_ns();
 
         let dir = WorkspaceFile {
@@ -616,6 +689,10 @@ impl Filesystem for WorkspaceFilesystem {
         };
 
         let child_path = Self::child_path(&parent_path, &name_str);
+        if Self::is_sensitive_path(&child_path) {
+            reply.error(Errno::EACCES);
+            return;
+        }
 
         match self.rt.block_on(ws_queries::delete_file(
             &self.pool,
@@ -652,6 +729,10 @@ impl Filesystem for WorkspaceFilesystem {
         };
 
         let child_path = Self::child_path(&parent_path, &name_str);
+        if Self::is_sensitive_path(&child_path) {
+            reply.error(Errno::EACCES);
+            return;
+        }
 
         match self.rt.block_on(ws_queries::delete_directory(
             &self.pool,
@@ -714,6 +795,10 @@ impl Filesystem for WorkspaceFilesystem {
 
         let old_path = Self::child_path(&parent_path, &name_str);
         let new_path = Self::child_path(&newparent_path, &newname_str);
+        if Self::is_sensitive_path(&old_path) || Self::is_sensitive_path(&new_path) {
+            reply.error(Errno::EACCES);
+            return;
+        }
 
         // Check if the source is a directory (need to rename the tree too)
         let is_dir = match self.rt.block_on(ws_queries::get_file(
@@ -776,5 +861,36 @@ impl Filesystem for WorkspaceFilesystem {
         reply: ReplyEmpty,
     ) {
         reply.ok();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::WorkspaceFilesystem;
+
+    #[test]
+    fn sensitive_home_paths_are_denied() {
+        for path in [
+            "/.ssh",
+            "/.ssh/id_rsa",
+            "/project/.aws/config",
+            "/.npmrc",
+            "/.bash_history",
+            "/.local/share/keyrings/login.keyring",
+        ] {
+            assert!(WorkspaceFilesystem::is_sensitive_path(path), "{path}");
+        }
+    }
+
+    #[test]
+    fn agent_state_paths_remain_persistent() {
+        for path in [
+            "/.claude/settings.json",
+            "/.claude/projects/session.json",
+            "/.openeral/presign.json",
+            "/work/file.txt",
+        ] {
+            assert!(!WorkspaceFilesystem::is_sensitive_path(path), "{path}");
+        }
     }
 }

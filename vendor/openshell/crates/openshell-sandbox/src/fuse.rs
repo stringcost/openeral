@@ -10,7 +10,7 @@
 use miette::{IntoDiagnostic, Result};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
-use std::process::{Child, Command};
+use std::process::{Child, Command, ExitStatus};
 use std::time::Duration;
 use tracing::{debug, info, warn};
 
@@ -176,20 +176,68 @@ pub fn spawn_fuse_mount(mount: &FuseMount, env: &HashMap<String, String>) -> Res
     cmd.arg(&mount.mount_point);
     cmd.arg("-o");
     cmd.arg(&mount.options);
+    cmd.current_dir("/");
 
     for (key, value) in env {
         cmd.env(key, value);
     }
+    cmd.env("HOME", "/tmp");
+    cmd.env(
+        "RUST_LOG",
+        env.get("RUST_LOG")
+            .map_or("openeral=info,openeral_core=info,warn", String::as_str),
+    );
 
-    cmd.spawn().into_diagnostic()
+    let child = cmd.spawn().into_diagnostic()?;
+    info!(
+        pid = child.id(),
+        mount_point = %mount.mount_point.display(),
+        "FUSE daemon spawned"
+    );
+    Ok(child)
 }
 
-pub fn wait_for_mount(path: &Path, timeout: Duration) -> Result<()> {
+fn exited_status_message(status: ExitStatus) -> String {
+    match status.code() {
+        Some(code) => format!("exit code {code}"),
+        None => "terminated by signal".to_string(),
+    }
+}
+
+pub fn wait_for_mount(path: &Path, child: &mut Child, timeout: Duration) -> Result<()> {
     let start = std::time::Instant::now();
+    let mut child_exited = false;
     while start.elapsed() < timeout {
         if is_mountpoint(path) {
             info!(path = %path.display(), "FUSE mount ready");
             return Ok(());
+        }
+        if !child_exited {
+            match child.try_wait() {
+                Ok(Some(status)) => {
+                    child_exited = true;
+                    if !status.success() {
+                        return Err(miette::miette!(
+                            "FUSE daemon for {} exited before mount became ready ({})",
+                            path.display(),
+                            exited_status_message(status)
+                        ));
+                    }
+                    warn!(
+                        path = %path.display(),
+                        status = %exited_status_message(status),
+                        "FUSE mount helper exited before mountpoint appeared; waiting for daemonized child"
+                    );
+                }
+                Ok(None) => {}
+                Err(error) => {
+                    warn!(
+                        path = %path.display(),
+                        error = %error,
+                        "Could not poll FUSE daemon status while waiting for mount"
+                    );
+                }
+            }
         }
         std::thread::sleep(Duration::from_millis(500));
     }
@@ -296,9 +344,9 @@ pub fn setup_fuse_mounts(
             std::fs::create_dir_all(&mount.mount_point).into_diagnostic()?;
         }
 
-        let child = spawn_fuse_mount(mount, &fuse_env)?;
+        let mut child = spawn_fuse_mount(mount, &fuse_env)?;
+        wait_for_mount(&mount.mount_point, &mut child, timeout)?;
         daemons.push(child);
-        wait_for_mount(&mount.mount_point, timeout)?;
 
         if mount.read_only {
             policy.filesystem.read_only.push(mount.mount_point.clone());

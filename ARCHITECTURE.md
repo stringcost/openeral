@@ -8,12 +8,15 @@ openeral/
     openeral/                        # Binary crate (CLI entry point)
       src/main.rs                   # Tokio main, tracing init, calls cli::run()
     openeral-core/                   # Library crate (all logic)
-      migrations/                   # Refinery SQL migrations (V1–V4)
+      migrations/                   # Refinery SQL migrations (workspace + optimization schema)
       src/
         lib.rs                      # Module declarations
         error.rs                    # FsError enum → fuser::Errno mapping
         cli/
           mod.rs                    # Cli struct, Commands enum, run()
+          bootstrap.rs              # Post-FUSE OpenShell sandbox bootstrap
+          memory.rs                 # Claude memory refresh under /home/agent
+          optimize.rs               # Optimization metrics inspection
           mount.rs                  # Mount subcommand (pool + migrations + fuser::mount2)
           workspace.rs              # Workspace subcommands (create, mount, seed, list, delete)
           unmount.rs                # fusermount -u wrapper
@@ -117,6 +120,8 @@ Mounts an opaque file store at a path (e.g., `/home/agent`). Stores and retrieve
 _openeral.schema_version   — migration tracking (refinery)
 _openeral.mount_log        — audit log of mount sessions
 _openeral.cache_hints      — persistent cache hints per schema/table
+_openeral.optimization_metrics — optional optimization savings records
+_openeral.api_cache        — optional optimization API cache
 ```
 
 ### Workspace tables
@@ -177,6 +182,12 @@ The policy currently includes:
   - allows Claude traffic to `api.anthropic.com`
   - uses REST + TLS termination
   - rewrites `ANTHROPIC_API_KEY` into the outbound `x-api-key` header
+- `openclaw_anthropic` / `openclaw_openai`
+  - allows optional OpenClaw traffic through the same OpenShell proxy path
+- `socket_packages`
+  - allows npm reads from Socket.dev with `SOCKET_TOKEN` placeholder injection
+- `stringcost`
+  - allows Claude/OpenClaw traffic through a StringCost presign base URL
 - `anthropic_secret_test`
   - allows `/usr/bin/curl`
   - restricts the live verification path to `GET /v1/models`
@@ -219,10 +230,44 @@ Configured via `--statement-timeout` (default 30s). Set at the PostgreSQL connec
 ### Migrations
 Managed by `refinery` (`embed_migrations!` macro). SQL files in `crates/openeral-core/migrations/`. Run automatically before FUSE mount; skip with `--skip-migrations`.
 
+### OpenShell bootstrap
+The patched supervisor runs `openeral bootstrap` after `/db` and `/home/agent`
+mount from `/etc/fstab` and before the user command starts. The prepare phase
+seeds `.claude`, writes optional Socket.dev npm config to `/tmp`, creates or
+reuses StringCost presign metadata, and writes child env additions. The runtime
+phase runs through the normal OpenShell process path so optional long-lived
+OpenClaw gateway processes inherit network namespace and policy enforcement.
+
+The bootstrap replaces the old just-bash setup script behavior without
+reintroducing `openeral-bash`, PGlite, host wrappers, or upload-based database
+credentials.
+
+### Workspace safety deny-list
+The FUSE workspace denies common credential/history paths instead of persisting
+them to PostgreSQL. This preserves the just-bash branch's non-persistence
+intent for paths such as `~/.ssh`, `~/.aws`, `~/.npmrc`, shell histories, and
+`~/.local/share/keyrings`.
+
 ## Live Validation Reference
 
-The current architecture was live-validated with the stock upstream
-`openshell` CLI and the openeral images.
+The current architecture was live-validated with the upstream `openshell` CLI
+matched to the openeral gateway protobuf API and the openeral images. Release
+CLI `0.0.36` is a known-bad pairing for the current Docker-driver gateway
+source.
+
+### mount.fuse3 invocation detection
+
+`mount.fuse3` invokes openeral as:
+
+```text
+openeral <source> <mountpoint> -o <options>
+```
+
+The binary distinguishes that form from normal CLI subcommands in
+`crates/openeral-core/src/cli/fuse_fd.rs`. Every real CLI subcommand must be
+listed in `KNOWN_SUBCOMMANDS`; otherwise a command such as `openeral bootstrap`
+can be misclassified as a FUSE mount source and fail with misleading database
+connection errors.
 
 The reference proof included all of the following in one flow:
 

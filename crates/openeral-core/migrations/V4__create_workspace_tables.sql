@@ -1,4 +1,4 @@
-CREATE TABLE _openeral.workspace_config (
+CREATE TABLE IF NOT EXISTS _openeral.workspace_config (
     id TEXT PRIMARY KEY,
     display_name TEXT,
     config JSONB NOT NULL DEFAULT '{}',
@@ -6,7 +6,7 @@ CREATE TABLE _openeral.workspace_config (
     updated_at TIMESTAMPTZ DEFAULT NOW()
 );
 
-CREATE TABLE _openeral.workspace_files (
+CREATE TABLE IF NOT EXISTS _openeral.workspace_files (
     workspace_id TEXT NOT NULL REFERENCES _openeral.workspace_config(id) ON DELETE CASCADE,
     path TEXT NOT NULL,           -- "/.claude/settings.json"
     parent_path TEXT NOT NULL,    -- "/.claude"
@@ -24,5 +24,5 @@ CREATE TABLE _openeral.workspace_files (
     PRIMARY KEY (workspace_id, path)
 );
 
-CREATE INDEX idx_ws_files_parent
+CREATE INDEX IF NOT EXISTS idx_ws_files_parent
     ON _openeral.workspace_files (workspace_id, parent_path);

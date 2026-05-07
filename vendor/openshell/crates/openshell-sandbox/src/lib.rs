@@ -159,6 +159,166 @@ fn route_refresh_interval_secs() -> u64 {
     }
 }
 
+const OPENERAL_BOOTSTRAP_BINARY: &str = "/usr/local/bin/openeral";
+const OPENERAL_BOOTSTRAP_ENV_PATH: &str = "/tmp/openeral-bootstrap.env";
+
+fn build_openeral_bootstrap_env(
+    base: &std::collections::HashMap<String, String>,
+    sandbox_id: Option<&str>,
+    sandbox_name: Option<&str>,
+) -> std::collections::HashMap<String, String> {
+    let mut env = base.clone();
+    env.insert("OPENSHELL_SANDBOX".to_string(), "1".to_string());
+    if let Some(id) = sandbox_id {
+        env.insert("OPENSHELL_SANDBOX_ID".to_string(), id.to_string());
+    }
+    if let Some(name) = sandbox_name {
+        env.insert("OPENSHELL_SANDBOX_NAME".to_string(), name.to_string());
+    }
+    if !env.contains_key("OPENERAL_DATABASE_URL")
+        && let Some(database_url) = env.get("DATABASE_URL").cloned()
+    {
+        env.insert("OPENERAL_DATABASE_URL".to_string(), database_url);
+    }
+    env
+}
+
+fn merge_openeral_bootstrap_env(
+    provider_env: &mut std::collections::HashMap<String, String>,
+) -> Result<()> {
+    let path = std::path::Path::new(OPENERAL_BOOTSTRAP_ENV_PATH);
+    if !path.exists() {
+        return Ok(());
+    }
+
+    let content = std::fs::read_to_string(path).into_diagnostic()?;
+    for line in content.lines() {
+        let line = line.trim();
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        let Some((key, value)) = line.split_once('=') else {
+            return Err(miette::miette!(
+                "invalid openeral bootstrap env line without '=': {line}"
+            ));
+        };
+        if key.is_empty() || key.contains('\0') || value.contains('\0') {
+            return Err(miette::miette!(
+                "invalid openeral bootstrap env entry for key '{key}'"
+            ));
+        }
+        provider_env.insert(key.to_string(), value.to_string());
+    }
+    Ok(())
+}
+
+#[cfg(target_os = "linux")]
+async fn run_openeral_bootstrap_phase(
+    phase: &str,
+    policy: &SandboxPolicy,
+    netns: Option<&NetworkNamespace>,
+    ca_paths: Option<&(std::path::PathBuf, std::path::PathBuf)>,
+    provider_env: &std::collections::HashMap<String, String>,
+    sandbox_id: Option<&str>,
+    sandbox_name: Option<&str>,
+) -> Result<()> {
+    if std::env::var("OPENERAL_BOOTSTRAP").as_deref() == Ok("0")
+        || !std::path::Path::new(OPENERAL_BOOTSTRAP_BINARY).is_file()
+    {
+        return Ok(());
+    }
+
+    let args = vec![
+        "bootstrap".to_string(),
+        "--phase".to_string(),
+        phase.to_string(),
+        "--home".to_string(),
+        "/home/agent".to_string(),
+        "--connect-home".to_string(),
+        "/sandbox".to_string(),
+        "--env-out".to_string(),
+        OPENERAL_BOOTSTRAP_ENV_PATH.to_string(),
+    ];
+    let env = build_openeral_bootstrap_env(provider_env, sandbox_id, sandbox_name);
+    info!(
+        phase,
+        binary = OPENERAL_BOOTSTRAP_BINARY,
+        "starting openeral bootstrap phase"
+    );
+    let mut handle = ProcessHandle::spawn(
+        OPENERAL_BOOTSTRAP_BINARY,
+        &args,
+        None,
+        false,
+        policy,
+        netns,
+        ca_paths,
+        &env,
+    )?;
+    let status = handle.wait().await.into_diagnostic()?;
+    if !status.success() {
+        warn!(
+            phase,
+            exit_code = status.code(),
+            "openeral bootstrap phase failed"
+        );
+        return Err(miette::miette!(
+            "openeral bootstrap phase '{phase}' failed with exit code {}",
+            status.code()
+        ));
+    }
+    info!(phase, "openeral bootstrap phase complete");
+    Ok(())
+}
+
+#[cfg(not(target_os = "linux"))]
+async fn run_openeral_bootstrap_phase(
+    phase: &str,
+    policy: &SandboxPolicy,
+    _netns: Option<&()>,
+    ca_paths: Option<&(std::path::PathBuf, std::path::PathBuf)>,
+    provider_env: &std::collections::HashMap<String, String>,
+    sandbox_id: Option<&str>,
+    sandbox_name: Option<&str>,
+) -> Result<()> {
+    if std::env::var("OPENERAL_BOOTSTRAP").as_deref() == Ok("0")
+        || !std::path::Path::new(OPENERAL_BOOTSTRAP_BINARY).is_file()
+    {
+        return Ok(());
+    }
+
+    let args = vec![
+        "bootstrap".to_string(),
+        "--phase".to_string(),
+        phase.to_string(),
+        "--home".to_string(),
+        "/home/agent".to_string(),
+        "--connect-home".to_string(),
+        "/sandbox".to_string(),
+        "--env-out".to_string(),
+        OPENERAL_BOOTSTRAP_ENV_PATH.to_string(),
+    ];
+    let env = build_openeral_bootstrap_env(provider_env, sandbox_id, sandbox_name);
+    let mut handle = ProcessHandle::spawn(
+        OPENERAL_BOOTSTRAP_BINARY,
+        &args,
+        None,
+        false,
+        policy,
+        ca_paths,
+        &env,
+    )?;
+    let status = handle.wait().await.into_diagnostic()?;
+    if !status.success() {
+        return Err(miette::miette!(
+            "openeral bootstrap phase '{phase}' failed with exit code {}",
+            status.code()
+        ));
+    }
+    info!(phase, "openeral bootstrap phase complete");
+    Ok(())
+}
+
 #[cfg(target_os = "linux")]
 static MANAGED_CHILDREN: LazyLock<Mutex<HashSet<i32>>> =
     LazyLock::new(|| Mutex::new(HashSet::new()));
@@ -313,7 +473,19 @@ pub async fn run_sandbox(
     // placeholders for child processes, but FUSE daemons need the real values.
     let _fuse_daemons = fuse::setup_fuse_mounts(&mut policy, &provider_env)?;
 
-    let (provider_env, secret_resolver) = SecretResolver::from_provider_env(provider_env);
+    run_openeral_bootstrap_phase(
+        "prepare",
+        &policy,
+        None,
+        None,
+        &provider_env,
+        sandbox_id.as_deref(),
+        sandbox_name_for_agg.as_deref(),
+    )
+    .await?;
+
+    let (mut provider_env, secret_resolver) = SecretResolver::from_provider_env(provider_env);
+    merge_openeral_bootstrap_env(&mut provider_env)?;
     let secret_resolver = secret_resolver.map(Arc::new);
 
     // Create identity cache for SHA256 TOFU when OPA is active
@@ -495,6 +667,30 @@ pub async fn run_sandbox(
     } else {
         (None, None, None)
     };
+
+    #[cfg(target_os = "linux")]
+    run_openeral_bootstrap_phase(
+        "runtime",
+        &policy,
+        netns.as_ref(),
+        ca_file_paths.as_ref(),
+        &provider_env,
+        sandbox_id.as_deref(),
+        sandbox_name_for_agg.as_deref(),
+    )
+    .await?;
+
+    #[cfg(not(target_os = "linux"))]
+    run_openeral_bootstrap_phase(
+        "runtime",
+        &policy,
+        None,
+        ca_file_paths.as_ref(),
+        &provider_env,
+        sandbox_id.as_deref(),
+        sandbox_name_for_agg.as_deref(),
+    )
+    .await?;
 
     // Spawn bypass detection monitor (Linux only, proxy mode only).
     // Reads /dev/kmsg for iptables LOG entries and emits structured
@@ -2415,6 +2611,50 @@ mod tests {
     use temp_env::with_vars;
 
     static ENV_LOCK: LazyLock<Mutex<()>> = LazyLock::new(|| Mutex::new(()));
+
+    #[test]
+    fn openeral_bootstrap_env_maps_database_url_alias() {
+        let mut base = std::collections::HashMap::new();
+        base.insert(
+            "DATABASE_URL".to_string(),
+            "postgresql://postgres:postgres@localhost/postgres".to_string(),
+        );
+
+        let env = build_openeral_bootstrap_env(&base, Some("sandbox-id"), Some("sandbox-name"));
+
+        assert_eq!(
+            env.get("OPENERAL_DATABASE_URL"),
+            Some(&"postgresql://postgres:postgres@localhost/postgres".to_string())
+        );
+        assert_eq!(
+            env.get("OPENSHELL_SANDBOX_ID"),
+            Some(&"sandbox-id".to_string())
+        );
+        assert_eq!(
+            env.get("OPENSHELL_SANDBOX_NAME"),
+            Some(&"sandbox-name".to_string())
+        );
+    }
+
+    #[test]
+    fn openeral_bootstrap_env_preserves_explicit_openeral_database_url() {
+        let mut base = std::collections::HashMap::new();
+        base.insert(
+            "DATABASE_URL".to_string(),
+            "postgresql://fallback".to_string(),
+        );
+        base.insert(
+            "OPENERAL_DATABASE_URL".to_string(),
+            "postgresql://explicit".to_string(),
+        );
+
+        let env = build_openeral_bootstrap_env(&base, None, None);
+
+        assert_eq!(
+            env.get("OPENERAL_DATABASE_URL"),
+            Some(&"postgresql://explicit".to_string())
+        );
+    }
 
     #[test]
     fn bundle_to_resolved_routes_converts_all_fields() {

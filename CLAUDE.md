@@ -11,15 +11,18 @@ OpenEral exists to run Claude Code inside OpenShell with persistent state:
 - `/home/agent` is a PostgreSQL-backed writable FUSE mount
 - `/db` is a read-only database context mount
 - `.claude` persists in `_openeral.workspace_files`
+- bootstrap seeds Claude/OpenClaw runtime state after FUSE mounts are ready
 
 ## Runtime Model
 
 The supported OpenShell flow uses the upstream `openshell` CLI with openeral
-runtime images:
+runtime images. The CLI must match the gateway protobuf API; upstream release
+CLI `0.0.36` is a known-bad pairing for the current Docker-driver gateway
+source.
 
 - `gateway` — patched OpenShell gateway using the Docker compute driver
 - `supervisor` — patched `openshell-sandbox` binary with `/etc/fstab` FUSE startup
-- `sandbox` — Claude Code, `openeral`, `fuse3`, and the openeral policy
+- `sandbox` — Claude/OpenClaw runtime support, `openeral`, `fuse3`, and the openeral policy
 
 The gateway is started as a Docker container and registered with:
 
@@ -60,6 +63,8 @@ call that validation.
 
 - `crates/openeral/` — openeral binary entry point
 - `crates/openeral-core/` — FUSE filesystems, DB queries, migrations, CLI logic
+- `crates/openeral-core/src/cli/bootstrap.rs` — image-owned post-FUSE bootstrap
+- `crates/openeral-core/src/cli/memory.rs` — persisted Claude memory refresh
 - `crates/openeral-core/migrations/` — PostgreSQL schema migrations
 - `sandboxes/openeral/` — supported sandbox image and policy
 - `vendor/openshell/` — vendored OpenShell source used for gateway/supervisor images
@@ -75,6 +80,7 @@ call that validation.
 - Keep the user-facing flow command-composed; do not add wrapper scripts for normal usage.
 - The supported OpenShell runtime path is Docker compute driver with gateway, supervisor, and sandbox images.
 - Do not validate OpenShell by bypassing the supervisor; FUSE mounts must come from `/etc/fstab`.
+- Do not reintroduce just-bash, PGlite, `npx openeral`, or upload-based database credential flows.
 
 ## Implementation Notes
 
@@ -82,3 +88,6 @@ call that validation.
 - `/dev/fuse` is supplied by the Docker driver through `HostConfig.devices`.
 - The gateway container must mount a host path at the same path used for `XDG_DATA_HOME`; Docker later bind-mounts the extracted supervisor binary from that host-visible path into sandbox containers.
 - The sandbox policy is image-owned at `/etc/openshell/policy.yaml`.
+- Every real `openeral` CLI subcommand must be listed in
+  `crates/openeral-core/src/cli/fuse_fd.rs::KNOWN_SUBCOMMANDS`; otherwise the
+  mount.fuse3 invocation detector can treat a subcommand as a FUSE source.

@@ -25,6 +25,7 @@ ARG K3S_DIGEST=sha256:4607083d3cac07e1ccde7317297271d13ed5f60f35a78f33fcef84858a
 ARG K9S_VERSION=v0.50.18
 ARG HELM_VERSION=v3.17.3
 ARG NVIDIA_CONTAINER_TOOLKIT_VERSION=1.18.2-1
+ARG UBUNTU_APT_MIRROR=""
 # Controls binary source: 0 = prebuilt (release), 1 = compile in Docker (local dev).
 # Must be declared here (global scope) so it can be used in FROM instructions below.
 ARG BUILD_FROM_SOURCE=0
@@ -91,8 +92,17 @@ FROM supervisor-binary-${BUILD_FROM_SOURCE} AS supervisor-binary
 # Final gateway image
 # ---------------------------------------------------------------------------
 FROM nvcr.io/nvidia/base/ubuntu:noble-20251013 AS gateway
+ARG UBUNTU_APT_MIRROR
 
-RUN apt-get update && apt-get install -y --no-install-recommends \
+RUN if [ -n "$UBUNTU_APT_MIRROR" ]; then \
+      sed -i \
+        -e "s|http://archive.ubuntu.com/ubuntu|$UBUNTU_APT_MIRROR|g" \
+        -e "s|http://security.ubuntu.com/ubuntu|$UBUNTU_APT_MIRROR|g" \
+        -e "s|https://archive.ubuntu.com/ubuntu|$UBUNTU_APT_MIRROR|g" \
+        -e "s|https://security.ubuntu.com/ubuntu|$UBUNTU_APT_MIRROR|g" \
+        /etc/apt/sources.list /etc/apt/sources.list.d/*.sources /etc/apt/sources.list.d/*.list 2>/dev/null || true; \
+    fi && \
+    apt-get update && apt-get install -y --no-install-recommends \
     ca-certificates && \
     apt-get install -y --only-upgrade gpgv && \
     rm -rf /var/lib/apt/lists/*
@@ -136,27 +146,54 @@ COPY --from=supervisor-binary /build/out/openshell-sandbox /openshell-sandbox
 FROM rancher/k3s:${K3S_VERSION}@${K3S_DIGEST} AS k3s
 
 FROM ubuntu:24.04 AS k9s
+ARG UBUNTU_APT_MIRROR
 ARG K9S_VERSION
 ARG TARGETARCH
-RUN apt-get update && apt-get install -y --no-install-recommends curl ca-certificates && \
+RUN if [ -n "$UBUNTU_APT_MIRROR" ]; then \
+      sed -i \
+        -e "s|http://archive.ubuntu.com/ubuntu|$UBUNTU_APT_MIRROR|g" \
+        -e "s|http://security.ubuntu.com/ubuntu|$UBUNTU_APT_MIRROR|g" \
+        -e "s|https://archive.ubuntu.com/ubuntu|$UBUNTU_APT_MIRROR|g" \
+        -e "s|https://security.ubuntu.com/ubuntu|$UBUNTU_APT_MIRROR|g" \
+        /etc/apt/sources.list /etc/apt/sources.list.d/*.sources /etc/apt/sources.list.d/*.list 2>/dev/null || true; \
+    fi && \
+    apt-get update && apt-get install -y --no-install-recommends curl ca-certificates && \
     curl -fsSL "https://github.com/derailed/k9s/releases/download/${K9S_VERSION}/k9s_Linux_${TARGETARCH}.tar.gz" \
       | tar xz -C /tmp k9s && \
     chmod +x /tmp/k9s && \
     rm -rf /var/lib/apt/lists/*
 
 FROM ubuntu:24.04 AS helm
+ARG UBUNTU_APT_MIRROR
 ARG HELM_VERSION
 ARG TARGETARCH
-RUN apt-get update && apt-get install -y --no-install-recommends curl ca-certificates && \
+RUN if [ -n "$UBUNTU_APT_MIRROR" ]; then \
+      sed -i \
+        -e "s|http://archive.ubuntu.com/ubuntu|$UBUNTU_APT_MIRROR|g" \
+        -e "s|http://security.ubuntu.com/ubuntu|$UBUNTU_APT_MIRROR|g" \
+        -e "s|https://archive.ubuntu.com/ubuntu|$UBUNTU_APT_MIRROR|g" \
+        -e "s|https://security.ubuntu.com/ubuntu|$UBUNTU_APT_MIRROR|g" \
+        /etc/apt/sources.list /etc/apt/sources.list.d/*.sources /etc/apt/sources.list.d/*.list 2>/dev/null || true; \
+    fi && \
+    apt-get update && apt-get install -y --no-install-recommends curl ca-certificates && \
     curl -fsSL "https://get.helm.sh/helm-${HELM_VERSION}-linux-${TARGETARCH}.tar.gz" \
       | tar xz --strip-components=1 -C /tmp "linux-${TARGETARCH}/helm" && \
     chmod +x /tmp/helm && \
     rm -rf /var/lib/apt/lists/*
 
 FROM ubuntu:24.04 AS nvidia-container-toolkit
+ARG UBUNTU_APT_MIRROR
 ARG NVIDIA_CONTAINER_TOOLKIT_VERSION
 
-RUN apt-get update && apt-get install -y --no-install-recommends \
+RUN if [ -n "$UBUNTU_APT_MIRROR" ]; then \
+      sed -i \
+        -e "s|http://archive.ubuntu.com/ubuntu|$UBUNTU_APT_MIRROR|g" \
+        -e "s|http://security.ubuntu.com/ubuntu|$UBUNTU_APT_MIRROR|g" \
+        -e "s|https://archive.ubuntu.com/ubuntu|$UBUNTU_APT_MIRROR|g" \
+        -e "s|https://security.ubuntu.com/ubuntu|$UBUNTU_APT_MIRROR|g" \
+        /etc/apt/sources.list /etc/apt/sources.list.d/*.sources /etc/apt/sources.list.d/*.list 2>/dev/null || true; \
+    fi && \
+    apt-get update && apt-get install -y --no-install-recommends \
         gpg curl ca-certificates && \
     curl -fsSL https://nvidia.github.io/libnvidia-container/gpgkey \
         | gpg --dearmor -o /usr/share/keyrings/nvidia-container-toolkit-keyring.gpg && \
@@ -172,8 +209,17 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 # Final cluster image
 # ---------------------------------------------------------------------------
 FROM nvcr.io/nvidia/base/ubuntu:noble-20251013 AS cluster
+ARG UBUNTU_APT_MIRROR
 
-RUN apt-get update && apt-get install -y --no-install-recommends \
+RUN if [ -n "$UBUNTU_APT_MIRROR" ]; then \
+      sed -i \
+        -e "s|http://archive.ubuntu.com/ubuntu|$UBUNTU_APT_MIRROR|g" \
+        -e "s|http://security.ubuntu.com/ubuntu|$UBUNTU_APT_MIRROR|g" \
+        -e "s|https://archive.ubuntu.com/ubuntu|$UBUNTU_APT_MIRROR|g" \
+        -e "s|https://security.ubuntu.com/ubuntu|$UBUNTU_APT_MIRROR|g" \
+        /etc/apt/sources.list /etc/apt/sources.list.d/*.sources /etc/apt/sources.list.d/*.list 2>/dev/null || true; \
+    fi && \
+    apt-get update && apt-get install -y --no-install-recommends \
     ca-certificates \
     iptables \
     mount \

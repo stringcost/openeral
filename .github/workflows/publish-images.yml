@@ -63,8 +63,53 @@ jobs:
 
       - name: Install system dependencies
         run: |
-          sudo apt-get update
-          sudo apt-get install -y --no-install-recommends libfuse3-dev fuse3 pkg-config libpq-dev postgresql-client
+          set -euo pipefail
+
+          retry() {
+            local attempt=1
+            local delay=5
+
+            until "$@"; do
+              if [ "$attempt" -ge 5 ]; then
+                return 1
+              fi
+
+              sleep "$delay"
+              attempt=$((attempt + 1))
+              delay=$((delay * 2))
+            done
+          }
+
+          configure_apt_for_act() {
+            if [ "${ACT:-}" != "true" ]; then
+              return 0
+            fi
+
+            local mirror="http://mirrors.edge.kernel.org/ubuntu"
+            sudo find /etc/apt/sources.list.d -type f ! -name 'ubuntu.sources' -delete 2>/dev/null || true
+            sudo sed -i \
+              -e "s|http://archive.ubuntu.com/ubuntu|$mirror|g" \
+              -e "s|http://security.ubuntu.com/ubuntu|$mirror|g" \
+              -e "s|https://archive.ubuntu.com/ubuntu|$mirror|g" \
+              -e "s|https://security.ubuntu.com/ubuntu|$mirror|g" \
+              /etc/apt/sources.list /etc/apt/sources.list.d/*.sources /etc/apt/sources.list.d/*.list 2>/dev/null || true
+          }
+
+          apt_index_ready() {
+            sudo rm -rf /var/lib/apt/lists/*
+            sudo apt-get update \
+              -o Acquire::Retries=2 \
+              -o Acquire::http::Timeout=30 \
+              -o Acquire::https::Timeout=30 || return 1
+
+            for package in "$@"; do
+              apt-cache show "$package" >/dev/null 2>&1 || return 1
+            done
+          }
+
+          configure_apt_for_act
+          retry apt_index_ready libfuse3-dev fuse3 pkg-config libpq-dev postgresql-client
+          retry sudo apt-get install -y --no-install-recommends libfuse3-dev fuse3 pkg-config libpq-dev postgresql-client
 
       - name: Build and clippy openeral
         env:
@@ -112,17 +157,72 @@ jobs:
 
       - name: Install smoke dependencies
         run: |
-          sudo apt-get update
-          sudo apt-get install -y --no-install-recommends postgresql-client curl
+          set -euo pipefail
 
-      - name: Install upstream OpenShell CLI
+          retry() {
+            local attempt=1
+            local delay=5
+
+            until "$@"; do
+              if [ "$attempt" -ge 5 ]; then
+                return 1
+              fi
+
+              sleep "$delay"
+              attempt=$((attempt + 1))
+              delay=$((delay * 2))
+            done
+          }
+
+          configure_apt_for_act() {
+            if [ "${ACT:-}" != "true" ]; then
+              return 0
+            fi
+
+            local mirror="http://mirrors.edge.kernel.org/ubuntu"
+            sudo find /etc/apt/sources.list.d -type f ! -name 'ubuntu.sources' -delete 2>/dev/null || true
+            sudo sed -i \
+              -e "s|http://archive.ubuntu.com/ubuntu|$mirror|g" \
+              -e "s|http://security.ubuntu.com/ubuntu|$mirror|g" \
+              -e "s|https://archive.ubuntu.com/ubuntu|$mirror|g" \
+              -e "s|https://security.ubuntu.com/ubuntu|$mirror|g" \
+              /etc/apt/sources.list /etc/apt/sources.list.d/*.sources /etc/apt/sources.list.d/*.list 2>/dev/null || true
+          }
+
+          apt_index_ready() {
+            sudo rm -rf /var/lib/apt/lists/*
+            sudo apt-get update \
+              -o Acquire::Retries=2 \
+              -o Acquire::http::Timeout=30 \
+              -o Acquire::https::Timeout=30 || return 1
+
+            for package in "$@"; do
+              apt-cache show "$package" >/dev/null 2>&1 || return 1
+            done
+          }
+
+          configure_apt_for_act
+          retry apt_index_ready postgresql-client curl clang libclang-dev libz3-dev
+          retry sudo apt-get install -y --no-install-recommends postgresql-client curl clang libclang-dev libz3-dev
+
+      - name: Install Rust for matching OpenShell CLI
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: "1.95.0"
+
+      - name: Cache matching OpenShell CLI build
+        uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: smoke-openshell-cli-1.95
+          cache-workspaces: |
+            vendor/openshell -> vendor/openshell/target
+
+      - name: Build matching OpenShell CLI
         run: |
           set -euo pipefail
-          export OPENSHELL_INSTALL_DIR="${RUNNER_TEMP}/openshell/bin"
-          mkdir -p "$OPENSHELL_INSTALL_DIR"
-          curl -LsSf https://raw.githubusercontent.com/NVIDIA/OpenShell/main/install.sh | sh
-          echo "$OPENSHELL_INSTALL_DIR" >> "$GITHUB_PATH"
-          "$OPENSHELL_INSTALL_DIR/openshell" --version
+          cargo build --manifest-path vendor/openshell/Cargo.toml --release -p openshell-cli
+          echo "${PWD}/vendor/openshell/target/release" >> "$GITHUB_PATH"
+          "${PWD}/vendor/openshell/target/release/openshell" --version
 
       - name: Build gateway image locally
         uses: docker/build-push-action@v6
@@ -137,6 +237,7 @@ jobs:
           build-args: |
             BUILD_FROM_SOURCE=1
             OPENSHELL_IMAGE_TAG=${{ env.CANDIDATE_TAG }}
+            UBUNTU_APT_MIRROR=http://mirrors.edge.kernel.org/ubuntu
 
       - name: Build supervisor image locally
         uses: docker/build-push-action@v6
@@ -151,6 +252,7 @@ jobs:
           build-args: |
             BUILD_FROM_SOURCE=1
             OPENSHELL_IMAGE_TAG=${{ env.CANDIDATE_TAG }}
+            UBUNTU_APT_MIRROR=http://mirrors.edge.kernel.org/ubuntu
 
       - name: Build sandbox image locally
         uses: docker/build-push-action@v6
@@ -161,6 +263,8 @@ jobs:
           tags: ${{ env.IMAGE_REPO_BASE }}/sandbox:${{ env.CANDIDATE_TAG }}
           cache-from: type=gha,scope=publish-sandbox
           cache-to: type=gha,mode=max,scope=publish-sandbox
+          build-args: |
+            UBUNTU_APT_MIRROR=http://mirrors.edge.kernel.org/ubuntu
 
       - name: Run OpenShell Docker-driver smoke test
         env:

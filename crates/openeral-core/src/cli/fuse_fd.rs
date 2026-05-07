@@ -26,8 +26,11 @@ use crate::fs::workspace::WorkspaceFilesystem;
 use crate::fs::PgmountFilesystem;
 
 const KNOWN_SUBCOMMANDS: &[&str] = &[
+    "bootstrap",
+    "memory",
     "mount",
     "migrate",
+    "optimize",
     "unmount",
     "list",
     "version",
@@ -40,9 +43,11 @@ const KNOWN_SUBCOMMANDS: &[&str] = &[
 /// mount.fuse3 calls: `openeral <source> <mountpoint> -o <opts>`
 /// where <source> is a connection string, never matching a known subcommand.
 pub fn is_fuse_fd_invocation() -> bool {
-    std::env::args()
-        .nth(1)
-        .map(|arg| !KNOWN_SUBCOMMANDS.contains(&arg.as_str()) && !arg.starts_with('-'))
+    is_fuse_fd_source_arg(std::env::args().nth(1).as_deref())
+}
+
+fn is_fuse_fd_source_arg(arg: Option<&str>) -> bool {
+    arg.map(|arg| !KNOWN_SUBCOMMANDS.contains(&arg) && !arg.starts_with('-'))
         .unwrap_or(false)
 }
 
@@ -351,6 +356,25 @@ mod tests {
         assert_eq!(parse_dev_fd("/dev/fd/abc"), None);
         assert_eq!(parse_dev_fd("/tmp/test"), None);
         assert_eq!(parse_dev_fd("/dev/fuse"), None);
+    }
+
+    #[test]
+    fn test_detects_cli_subcommands_as_not_fuse_invocations() {
+        for subcommand in KNOWN_SUBCOMMANDS {
+            assert!(
+                !is_fuse_fd_source_arg(Some(subcommand)),
+                "{subcommand} should be treated as a CLI subcommand"
+            );
+        }
+    }
+
+    #[test]
+    fn test_detects_mount_sources_as_fuse_invocations() {
+        assert!(is_fuse_fd_source_arg(Some("env")));
+        assert!(is_fuse_fd_source_arg(Some("env#workspace#abc")));
+        assert!(is_fuse_fd_source_arg(Some("host=pg dbname=mydb")));
+        assert!(!is_fuse_fd_source_arg(Some("--help")));
+        assert!(!is_fuse_fd_source_arg(None));
     }
 
     #[test]

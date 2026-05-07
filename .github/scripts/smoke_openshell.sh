@@ -24,17 +24,21 @@ GATEWAY_CONTAINER="${OPENERAL_GATEWAY_CONTAINER:-${GATEWAY_NAME}-gateway}"
 GATEWAY_STATE="${OPENERAL_GATEWAY_STATE:-$(mktemp -d)}"
 SANDBOX_NAME="${OPENERAL_SANDBOX_NAME:-openeral-smoke-${RANDOM}}"
 DB_PROVIDER="${OPENERAL_DB_PROVIDER:-openeral-db-${RANDOM}}"
+SOCKET_PROVIDER="${OPENERAL_SOCKET_PROVIDER:-openeral-socket-${RANDOM}}"
 DB_CONTAINER="${OPENERAL_SMOKE_DB_CONTAINER:-openeral-smoke-postgres-${RANDOM}}"
 DOWNLOAD_DIR=""
 
 pick_port() {
     python3 - "$@" <<'PY'
+import random
 import socket
 import sys
 
 start = int(sys.argv[1])
 end = int(sys.argv[2])
-for port in range(start, end + 1):
+ports = list(range(start, end + 1))
+random.shuffle(ports)
+for port in ports:
     sock = socket.socket()
     try:
         sock.bind(("127.0.0.1", port))
@@ -48,12 +52,68 @@ PY
 }
 
 DB_PORT="${OPENERAL_SMOKE_DB_PORT:-$(pick_port 15432 15532)}"
-GATEWAY_PORT="${OPENSHELL_GATEWAY_PORT:-$(pick_port 18080 18180)}"
+GATEWAY_PORT="${OPENSHELL_GATEWAY_PORT:-$(pick_port 28080 49151)}"
 
 if [ -z "$DB_PORT" ] || [ -z "$GATEWAY_PORT" ]; then
     echo "Could not allocate free smoke-test ports" >&2
     exit 1
 fi
+
+dump_gateway_logs() {
+    set +e
+    if docker ps -a --format '{{.Names}}' | grep -qx "$GATEWAY_CONTAINER"; then
+        echo "--- gateway logs (${GATEWAY_CONTAINER}) ---" >&2
+        docker logs "$GATEWAY_CONTAINER" >&2 || true
+        echo "--- end gateway logs ---" >&2
+    fi
+}
+
+dump_sandbox_logs() {
+    set +e
+    echo "--- sandbox logs (${SANDBOX_NAME}) ---" >&2
+    openshell --gateway "$GATEWAY_NAME" logs "$SANDBOX_NAME" -n 300 --source all >&2 || true
+    echo "--- end sandbox logs ---" >&2
+
+    echo "--- docker containers visible to smoke (${SANDBOX_NAME}) ---" >&2
+    docker ps -a \
+        --format 'id={{.ID}} name={{.Names}} status={{.Status}} image={{.Image}} labels={{.Labels}}' \
+        | grep -E "openshell|${SANDBOX_NAME}|${GATEWAY_NAME}" >&2 || true
+    echo "--- end docker containers visible to smoke ---" >&2
+
+    local containers
+    containers="$(
+        docker ps -aq \
+            --filter "label=openshell.ai/managed-by=openshell" \
+            --filter "label=openshell.ai/sandbox-name=${SANDBOX_NAME}" 2>/dev/null || true
+    )"
+    if [ -z "$containers" ]; then
+        containers="$(
+            docker ps -aq \
+                --filter "label=openshell.ai/managed-by=openshell" 2>/dev/null \
+                | while read -r container; do
+                    [ -n "$container" ] || continue
+                    docker inspect --format '{{.Name}} {{json .Config.Labels}}' "$container" 2>/dev/null \
+                        | grep -q "$SANDBOX_NAME" && printf '%s\n' "$container"
+                done
+        )"
+    fi
+    if [ -z "$containers" ]; then
+        containers="$(
+            docker ps -aq \
+                --filter "name=${SANDBOX_NAME}" 2>/dev/null || true
+        )"
+    fi
+    if [ -n "$containers" ]; then
+        echo "--- raw sandbox container logs (${SANDBOX_NAME}) ---" >&2
+        for container in $containers; do
+            docker inspect \
+                --format 'container={{.Name}} id={{.Id}} status={{.State.Status}} exit={{.State.ExitCode}} error={{.State.Error}} oom={{.State.OOMKilled}} started={{.State.StartedAt}} finished={{.State.FinishedAt}}' \
+                "$container" >&2 || true
+            docker logs --tail 400 "$container" >&2 || true
+        done
+        echo "--- end raw sandbox container logs ---" >&2
+    fi
+}
 
 cleanup() {
     set +e
@@ -67,7 +127,17 @@ cleanup() {
         rm -rf "$GATEWAY_STATE" >/dev/null 2>&1 || true
     fi
 }
-trap cleanup EXIT
+
+on_exit() {
+    status=$?
+    if [ "$status" -ne 0 ]; then
+        dump_sandbox_logs
+        dump_gateway_logs
+    fi
+    cleanup
+    exit "$status"
+}
+trap on_exit EXIT
 
 docker rm -f "$GATEWAY_CONTAINER" "$DB_CONTAINER" >/dev/null 2>&1 || true
 
@@ -139,9 +209,19 @@ docker run -d \
     -e OPENSHELL_SANDBOX_IMAGE="$OPENERAL_SANDBOX_IMAGE" \
     "$OPENERAL_GATEWAY_IMAGE" \
     --bind-address 0.0.0.0 \
-    --port "$GATEWAY_PORT" >/dev/null
+    --port "$GATEWAY_PORT" \
+    --disable-tls >/dev/null
 
 for _ in $(seq 1 60); do
+    if [ "$(docker inspect -f '{{.State.Running}}' "$GATEWAY_CONTAINER" 2>/dev/null || echo false)" != "true" ]; then
+        echo "Gateway container exited before ready" >&2
+        docker logs "$GATEWAY_CONTAINER" >&2 || true
+        exit 1
+    fi
+    if ! docker logs "$GATEWAY_CONTAINER" 2>&1 | grep -q "Server listening"; then
+        sleep 1
+        continue
+    fi
     if python3 - "$GATEWAY_PORT" <<'PY' >/dev/null 2>&1
 import socket
 import sys
@@ -152,11 +232,6 @@ PY
     then
         GATEWAY_READY=1
         break
-    fi
-    if ! docker ps --format '{{.Names}}' | grep -qx "$GATEWAY_CONTAINER"; then
-        echo "Gateway container exited before ready" >&2
-        docker logs "$GATEWAY_CONTAINER" >&2 || true
-        exit 1
     fi
     sleep 1
 done
@@ -178,12 +253,19 @@ DATABASE_URL="$sandbox_db_url" openshell provider create \
     --type generic \
     --credential DATABASE_URL
 
+SOCKET_TOKEN="smoke-socket-token" openshell provider create \
+    --gateway "$GATEWAY_NAME" \
+    --name "$SOCKET_PROVIDER" \
+    --type generic \
+    --credential SOCKET_TOKEN
+
 SANDBOX_OUTPUT="$(
     openshell sandbox create \
         --gateway "$GATEWAY_NAME" \
         --name "$SANDBOX_NAME" \
         --from "$OPENERAL_SANDBOX_IMAGE" \
         --provider "$DB_PROVIDER" \
+        --provider "$SOCKET_PROVIDER" \
         --no-tty -- \
         sh -lc '
             set -e
@@ -191,9 +273,17 @@ SANDBOX_OUTPUT="$(
             id
             grep -E " /db | /home/agent " /proc/mounts
             test -w /home/agent
+            test "$HOME" = /home/agent
+            test -f /home/agent/.claude/settings.json
+            grep -q enableAllProjectMcpServers /home/agent/.claude/settings.json
+            test -f /tmp/openeral-npmrc
+            grep -q openshell:resolve:env:SOCKET_TOKEN /tmp/openeral-npmrc
+            test ! -e /home/agent/.npmrc
+            ! mkdir /home/agent/.ssh
             cat /db/public/users/.filter/id/1/1/row.json
             printf persist-ok > /home/agent/manual.txt
             cat /home/agent/manual.txt
+            openeral memory refresh --dry-run --project-root /home/agent
         '
 )"
 printf '%s\n' "$SANDBOX_OUTPUT"
@@ -226,6 +316,15 @@ MANUAL_COUNT="$(
 )"
 if [ "$MANUAL_COUNT" != "1" ]; then
     echo "Expected one persisted /manual.txt row, got ${MANUAL_COUNT}" >&2
+    exit 1
+fi
+
+CLAUDE_SETTINGS_COUNT="$(
+    PGPASSWORD=pgmount psql -h localhost -p "$DB_PORT" -U pgmount -d testdb -Atqc \
+        "SELECT count(*) FROM _openeral.workspace_files WHERE path = '/.claude/settings.json'"
+)"
+if [ "$CLAUDE_SETTINGS_COUNT" != "1" ]; then
+    echo "Expected one persisted /.claude/settings.json row, got ${CLAUDE_SETTINGS_COUNT}" >&2
     exit 1
 fi
 

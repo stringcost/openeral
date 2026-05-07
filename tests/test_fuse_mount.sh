@@ -671,7 +671,10 @@ if [ -z "$FUSE3_ALLOW_OTHER_OPT" ]; then
     echo "--- 20. mount.fuse3 Workspace Mount ---"
     echo "  SKIP: /etc/fuse.conf does not enable user_allow_other"
     echo ""
-    echo "--- 21. Consistency: Direct vs mount.fuse3 ---"
+    echo "--- 21. Migration Compatibility Tables ---"
+    echo "  SKIP: /etc/fuse.conf does not enable user_allow_other"
+    echo ""
+    echo "--- 22. Consistency: Direct vs mount.fuse3 ---"
     echo "  SKIP: /etc/fuse.conf does not enable user_allow_other"
     echo ""
 else
@@ -744,6 +747,18 @@ if [ "$fuse3_ws_ready" -eq 1 ]; then
     fuse3_ws_content=$(cat "$FUSE3_WS_MNT/fuse3_test.txt" 2>/dev/null)
     assert_eq "$fuse3_ws_content" "fuse3 workspace test" "mount.fuse3: workspace write+read"
 
+    if mkdir "$FUSE3_WS_MNT/.ssh" 2>/dev/null; then
+        fail "mount.fuse3: sensitive .ssh directory should be denied"
+    else
+        pass "mount.fuse3: sensitive .ssh directory denied"
+    fi
+
+    if printf secret > "$FUSE3_WS_MNT/.npmrc" 2>/dev/null; then
+        fail "mount.fuse3: sensitive .npmrc file should be denied"
+    else
+        pass "mount.fuse3: sensitive .npmrc file denied"
+    fi
+
     fusermount -u "$FUSE3_WS_MNT" 2>/dev/null
     wait "$FUSE3_WS_PID" 2>/dev/null || true
     pass "mount.fuse3 workspace unmount succeeded"
@@ -754,7 +769,13 @@ fi
 rmdir "$FUSE3_WS_MNT" 2>/dev/null
 echo ""
 
-echo "--- 21. Consistency: Direct vs mount.fuse3 ---"
+echo "--- 21. Migration Compatibility Tables ---"
+OPT_TABLE_COUNT=$(PGPASSWORD=pgmount psql -h "$DB_HOST" -U pgmount -d testdb -Atqc \
+    "SELECT count(*) FROM information_schema.tables WHERE table_schema = '_openeral' AND table_name IN ('optimization_metrics', 'api_cache')" 2>/dev/null || echo "0")
+assert_eq "$OPT_TABLE_COUNT" "2" "Optimization tables exist"
+echo ""
+
+echo "--- 22. Consistency: Direct vs mount.fuse3 ---"
 FUSE3_CONS_MNT="/tmp/openeral_fuse3_consistency"
 mkdir -p "$FUSE3_CONS_MNT"
 
