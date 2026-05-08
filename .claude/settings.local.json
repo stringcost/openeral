@@ -111,7 +111,13 @@
       "Bash(git add *)",
       "Bash(git commit -m ' *)",
       "Bash(git config *)",
-      "Bash(git *)"
+      "Bash(git *)",
+      "Bash(grep -v \"^[0-9]*:.*//.*$\")",
+      "Bash(npx tsc *)",
+      "Bash(npx vitest *)",
+      "Bash(bash -n tests/test_setup_e2e.sh)",
+      "Bash(tr -d '\\\\r')",
+      "Read(//tmp/**)"
     ]
   }
 }

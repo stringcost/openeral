@@ -1428,7 +1428,7 @@ async function launchViaSandbox(workspaceId: string, claudeArgs: string[], devMo
     // The openclaw provider credential arrives inside the sandbox as an opaque
     // openshell:resolve:env:* placeholder that OpenClaw cannot use. Deliver the
     // real key by writing it to a temp file and uploading it as a file so
-    // setup.sh can write the actual value into ~/.openclaw/openclaw.json.
+    // setup.sh can export the actual value as ANTHROPIC_API_KEY before exec'ing openclaw.
     const anthropicKey = (process.env.ANTHROPIC_API_KEY ?? '').trim();
     if (!anthropicKey) {
       process.stderr.write(

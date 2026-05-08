@@ -65,7 +65,7 @@ out=$(timeout 60 docker run --rm --network host \
         const p=createPool(process.env.DATABASE_URL);
         try{await p.query(\"INSERT INTO _openeral.workspace_config (id,display_name,config) VALUES(\\\$1,\\\$2,\\x27{}\\x27::jsonb) ON CONFLICT(id) DO NOTHING\",[process.env.WORKSPACE_ID,\"sandbox\"])}catch{}
         const agentKind=process.env.OPENERAL_AGENT||\"claude\";
-        const autoDirs=agentKind===\"openclaw\"?[\"/\",\"/.config\",\"/.openclaw\"]:[\"\/\",\"/.claude\",\"/.claude/projects\"];
+        const autoDirs=agentKind===\"openclaw\"?[\"/\",\"/.config\"]:[\"\/\",\"/.claude\",\"/.claude/projects\"];
         await ws.seedFromConfig(p,process.env.WORKSPACE_ID,{autoDirs,seedFiles:{}});
         await p.end();console.log(\"CHECK:seed=ok:agent=\"+agentKind);
       }).catch(e=>{console.error(\"CHECK:seed=FAIL:\"+e.message);process.exit(1)});

@@ -58,16 +58,6 @@ case "${OPENERAL_AGENT:-}" in
     ;;
 esac
 
-# Agent label written into the StringCost presign metadata. The vendor portfolio
-# report in StringCost reads `metadata.labels` to attribute usage to a specific
-# agent (Claude Code vs OpenClaw inside OpenEral). One label per agent kind.
-if [ "$OPENERAL_AGENT" = "openclaw" ]; then
-  STRINGCOST_AGENT_LABEL="openclaw"
-else
-  STRINGCOST_AGENT_LABEL="claude-code"
-fi
-export STRINGCOST_AGENT_LABEL
-
 # StringCost API host. Defaults to the hosted service; override with
 # STRINGCOST_API_BASE=http://<host-ip>:8080 (or similar) to point at a
 # self-hosted control plane during local end-to-end testing.
@@ -117,10 +107,10 @@ esac
 
 # ANTHROPIC_API_KEY file-based delivery for OpenClaw.
 # OpenShell provider credentials arrive as openshell:resolve:env:* placeholders
-# that the HTTP proxy resolves only for Claude Code's binary. OpenClaw's gateway
-# is a separate process; writing the placeholder into openclaw.json causes
+# that the HTTP proxy resolves only for Claude Code's binary. OpenClaw's embedded
+# gateway is a separate Node process; passing the placeholder to it causes
 # Anthropic to reject every API call. Read the real key from an uploaded file
-# instead so the literal value lands in the config.
+# instead so the literal value is exported into ANTHROPIC_API_KEY before exec'ing openclaw.
 case "${ANTHROPIC_API_KEY:-}" in
   ''|openshell:resolve:env:*)
     ANTHROPIC_KEY_FILE=""
@@ -155,13 +145,7 @@ esac
 #   4. STRINGCOST_API_KEY + raw ANTHROPIC_API_KEY present → create a new permanent presign
 #      (expires_in=-1, max_uses=-1, cost_limit=$10), store in workspace, reuse on next launch.
 #
-# Presign storage is per-agent so Claude Code and OpenClaw don't clobber each
-# other when the same workspace is launched with both agents.
-if [ "$OPENERAL_AGENT" = "openclaw" ]; then
-  STRINGCOST_PRESIGN_FILE=/home/agent/.openeral/presign-openclaw.json
-else
-  STRINGCOST_PRESIGN_FILE=/home/agent/.openeral/presign.json
-fi
+STRINGCOST_PRESIGN_FILE=/home/agent/.openeral/presign.json
 
 normalize_stringcost_proxy_url() {
   node -e '
@@ -245,7 +229,7 @@ try {
   fi
 fi
 
-if [ -z "${STRINGCOST_PROXY_URL:-}" ] && [ -n "${STRINGCOST_API_KEY:-}" ] && [ -n "${ANTHROPIC_API_KEY:-}" ]; then
+if [ -z "${STRINGCOST_PROXY_URL:-}" ] && [ -n "${STRINGCOST_API_KEY:-}" ] && [ -n "${ANTHROPIC_API_KEY:-}" ] && [ "$OPENERAL_AGENT" != "openclaw" ]; then
   case "${ANTHROPIC_API_KEY:-}" in
     openshell:resolve:env:*)
       echo "setup.sh: skipping StringCost presign creation because ANTHROPIC_API_KEY is an OpenShell placeholder; upload a host-created presign.json to /sandbox/openeral-input instead" >&2
@@ -263,7 +247,6 @@ const fetch = globalThis.fetch;
   const to = setTimeout(() => controller.abort(), 30000);
   try {
     const apiBase = (process.env.STRINGCOST_API_BASE || 'https://app.stringcost.com').replace(/\/+$/, '');
-    const agentLabel = process.env.STRINGCOST_AGENT_LABEL || 'claude-code';
     const r = await fetch(apiBase + '/v1/presign', {
       method: 'POST',
       headers: {
@@ -282,8 +265,8 @@ const fetch = globalThis.fetch;
         // and would be silently dropped.
         metadata: {
           source: 'openeral-sandbox',
-          client: agentLabel,
-          labels: ['openeral', agentLabel],
+          client: 'claude-code',
+          labels: ['openeral', 'claude-code'],
         },
       }),
       signal: controller.signal,
@@ -435,7 +418,7 @@ node -e "
 
     const agentKind = process.env.OPENERAL_AGENT || 'claude';
     const autoDirs = agentKind === 'openclaw'
-      ? ['/', '/.config', '/.openclaw']
+      ? ['/', '/.config']
       : ['/', '/.claude', '/.claude/projects'];
     const seedFiles = agentKind === 'openclaw'
       ? {}
@@ -577,252 +560,15 @@ if [ "$OPENERAL_AGENT" = "openclaw" ]; then
       exit 1
     fi
   fi
-
-  # Write ~/.openclaw/openclaw.json so openclaw starts with the right model and
-  # API credentials. StringCost proxy takes priority; falls back to a bare API key.
-  #
-  # IMPORTANT: OpenShell placeholder values (openshell:resolve:env:*) are NOT written
-  # to the config for the API key. Unlike Claude Code (a patched binary), OpenClaw's
-  # Node.js gateway uses the Anthropic SDK directly and does not route through
-  # OpenShell's HTTP proxy — so a placeholder in ANTHROPIC_API_KEY would be sent raw
-  # to Anthropic, which rejects it, causing all API calls to hang silently.
-  # Only real (non-placeholder) key values are written.
-  echo "setup.sh: writing openclaw config..."
-  HOME=/home/agent node -e "
-const fs = require('fs');
-const dir = process.env.HOME + '/.openclaw';
-const file = dir + '/openclaw.json';
-let config = {};
-try { config = JSON.parse(fs.readFileSync(file, 'utf8')); } catch(e) {}
-if (!config.env) config.env = {};
-if (!config.gateway) config.gateway = {};
-if (!config.gateway.mode) config.gateway.mode = 'local';
-// 30 s handshake timeout — containers can be slow on cold cache; default is 3 s
-if (!config.gateway.handshakeTimeoutMs) config.gateway.handshakeTimeoutMs = 30000;
-if (!config.agents) config.agents = {};
-if (!config.agents.defaults) config.agents.defaults = {};
-if (!config.agents.defaults.model) config.agents.defaults.model = {};
-config.agents.defaults.model.primary = 'anthropic/claude-sonnet-4-6';
-const proxyUrl = process.env.STRINGCOST_PROXY_URL || '';
-const rawKey = process.env.ANTHROPIC_API_KEY || '';
-const realKey = rawKey.startsWith('openshell:resolve:env:') ? '' : rawKey;
-if (proxyUrl) {
-  config.env.ANTHROPIC_BASE_URL = proxyUrl;
-  config.env.ANTHROPIC_AUTH_TOKEN = 'dummy';
-  // Also configure via OpenClaw's native provider format so the gateway picks up
-  // the proxy endpoint regardless of how it injects env vars.
-  if (!config.models) config.models = {};
-  if (!config.models.providers) config.models.providers = {};
-  if (!config.models.providers.anthropic) config.models.providers.anthropic = {};
-  config.models.providers.anthropic.baseUrl = proxyUrl;
-  config.models.providers.anthropic.apiKey = 'dummy';
-  config.models.providers.anthropic.api = 'anthropic-messages';
-  // Keep the real key when available so OpenClaw doesn't bail before making calls.
-  // StringCost authenticates via the presign token in the URL, not the key header.
-  if (realKey) {
-    config.env.ANTHROPIC_API_KEY = realKey;
-  } else {
-    delete config.env.ANTHROPIC_API_KEY;
-  }
-} else {
-  // Only write a real key — never write a placeholder (see comment above).
-  if (realKey) {
-    config.env.ANTHROPIC_API_KEY = realKey;
-  } else {
-    delete config.env.ANTHROPIC_API_KEY;
-  }
-  delete config.env.ANTHROPIC_BASE_URL;
-  delete config.env.ANTHROPIC_AUTH_TOKEN;
-  if (config.models && config.models.providers && config.models.providers.anthropic) {
-    delete config.models.providers.anthropic.baseUrl;
-    delete config.models.providers.anthropic.apiKey;
-    delete config.models.providers.anthropic.api;
-  }
-}
-fs.mkdirSync(dir, { recursive: true, mode: 0o700 });
-fs.writeFileSync(file, JSON.stringify(config, null, 2), { mode: 0o600 });
-console.log('setup.sh: openclaw config written to ' + file);
-"
-
-  # Warn if OpenClaw has no usable API credentials.
-  # A placeholder (openshell:resolve:env:*) is NOT usable — unlike Claude Code,
-  # OpenClaw's Node.js gateway does not route through OpenShell's HTTP proxy, so
-  # the placeholder would be sent raw to Anthropic and every API call would hang.
-  _openclaw_key_ok=false
-  case "${ANTHROPIC_API_KEY:-}" in
-    ''|openshell:resolve:env:*) ;;
-    *) _openclaw_key_ok=true ;;
-  esac
-  if [ -z "${STRINGCOST_PROXY_URL:-}" ] && [ "$_openclaw_key_ok" = "false" ]; then
-    echo "setup.sh: WARNING: OpenClaw has no usable API credentials." >&2
-    echo "setup.sh:   ANTHROPIC_API_KEY is missing or is an OpenShell placeholder that" >&2
-    echo "setup.sh:   OpenClaw's gateway cannot resolve. Responses will hang." >&2
-    echo "setup.sh:   Fix A — upload a real key file before creating the sandbox:" >&2
-    echo "setup.sh:     echo '<your-anthropic-api-key>' > /tmp/anthropic-api-key" >&2
-    echo "setup.sh:     openshell sandbox create --upload /tmp/anthropic-api-key:/sandbox/anthropic-api-key ..." >&2
-    echo "setup.sh:   Fix B — set STRINGCOST_API_KEY so setup.sh can create a presign automatically." >&2
-  fi
-
-  # OpenClaw uses a gateway/client architecture: the gateway (ws://127.0.0.1:18789)
-  # must be running before the openclaw client is launched.
-  # In containers (no systemd), use `openclaw gateway --port 18789` as a foreground
-  # process launched in the background, rather than `openclaw gateway start`
-  # which requires a systemd user session.
-  #
-  # OPENCLAW_SKIP_ONBOARDING=1 — skip the interactive first-run onboarding wizard
-  #   (config is already written by setup.sh above; without this the doctor check
-  #   blocks even with </dev/null because it inspects TTY state during startup).
-  # OPENCLAW_HANDSHAKE_TIMEOUT_MS=30000 — lengthen the WebSocket pre-auth handshake
-  #   timeout from the default 3 s to 30 s; containers with cold image caches can
-  #   take several seconds between the TCP port opening and WebSocket RPC being live.
-  # OPENCLAW_PLUGIN_STAGE_DIR — keep bundled npm deps OUTSIDE /home/agent.
-  #   /home/agent is synced to workspace_files in the DB; restoring a previous
-  #   session's plugin-runtime-deps directory can leave a corrupt npm cache that
-  #   makes the gateway fail to stage its 35 bundled packages (ENOENT on cache
-  #   entries). /tmp is always writable by the sandbox user and is never synced,
-  #   so the gateway always gets a clean staging area on each sandbox launch.
-  export OPENCLAW_PLUGIN_STAGE_DIR=/tmp/openclaw-plugin-runtime-deps
-  mkdir -p "$OPENCLAW_PLUGIN_STAGE_DIR"
-
-  echo "setup.sh: starting openclaw gateway..."
-  # setsid puts the gateway in a new session with no controlling terminal.
-  # Without this, exiting the openclaw TUI (Ctrl+C) sends SIGHUP to the entire
-  # session including the background gateway, killing it. With setsid the gateway
-  # survives TUI exit, so `openshell sandbox connect` finds it still running.
-  setsid env OPENCLAW_SKIP_ONBOARDING=1 OPENCLAW_HANDSHAKE_TIMEOUT_MS=30000 \
-    HOME=/home/agent openclaw gateway --port 18789 --allow-unconfigured \
-    </dev/null >/tmp/openclaw-gateway.log 2>&1 &
-  _gw_pid=$!
-  echo "$_gw_pid" > /tmp/openclaw-gateway.pid
-  # Wait up to 600s for /readyz (NOT just TCP).
-  # TCP opens well before the WebSocket RPC layer is live; /readyz returns 200
-  # only once the gateway is truly ready to accept client connections.
-  # The gateway stages 35 bundled npm packages on every cold start, which can take
-  # several minutes on slow networks. Wait up to 600s (10 min) before giving up.
-  _gd=0
-  while [ $_gd -lt 600 ]; do
-    curl -fsS http://127.0.0.1:18789/readyz >/dev/null 2>&1 && break
-    [ $_gd -eq 10 ] && echo "setup.sh: waiting for openclaw gateway readiness (/readyz) — this can take a few minutes on first run..." >&2
-    [ $_gd -eq 60 ] && echo "setup.sh: still waiting for gateway (staging bundled deps)..." >&2
-    [ $_gd -eq 120 ] && echo "setup.sh: still waiting for gateway (2 min)..." >&2
-    [ $_gd -eq 180 ] && echo "setup.sh: still waiting for gateway (3 min)..." >&2
-    [ $_gd -eq 240 ] && echo "setup.sh: still waiting for gateway (4 min)..." >&2
-    [ $_gd -eq 300 ] && echo "setup.sh: still waiting for gateway (5 min)..." >&2
-    [ $_gd -eq 420 ] && echo "setup.sh: still waiting for gateway (7 min)..." >&2
-    [ $_gd -eq 540 ] && echo "setup.sh: still waiting for gateway (9 min)..." >&2
-    sleep 1
-    _gd=$((_gd+1))
-  done
-  if curl -fsS http://127.0.0.1:18789/readyz >/dev/null 2>&1; then
-    echo "setup.sh: openclaw gateway ready (pid $_gw_pid)"
-  else
-    echo "setup.sh: warning: openclaw gateway not ready after 600s — check /tmp/openclaw-gateway.log" >&2
-    cat /tmp/openclaw-gateway.log >&2 || true
-  fi
-
-  # Re-apply auth credentials: the gateway modifies openclaw.json during startup
-  # (adds gateway.auth.token, may clobber env settings on first run). Write our
-  # auth settings back now that the gateway has finished its own modifications.
-  # Only real key values are written — never OpenShell placeholders (see first
-  # config-write block for the explanation).
-  echo "setup.sh: re-applying openclaw auth config..."
-  HOME=/home/agent node -e "
-const fs = require('fs');
-const dir = process.env.HOME + '/.openclaw';
-const file = dir + '/openclaw.json';
-// Retry the read: the gateway may still be writing its config. Falling back
-// to {} on a race-condition parse failure would produce a stub file smaller
-// than the gateway's copy, triggering the gateway's backup-restore logic and
-// losing the auth token. Retry up to 5 times with 800 ms between attempts.
-let config = {};
-for (let attempt = 0; attempt < 5; attempt++) {
-  try {
-    const raw = fs.readFileSync(file, 'utf8');
-    const parsed = JSON.parse(raw);
-    if (parsed && typeof parsed === 'object' && Object.keys(parsed).length > 0) {
-      config = parsed;
-      break;
-    }
-  } catch(e) {}
-  if (attempt < 4) {
-    // Busy-wait 800 ms — no async available in sync Node one-liners.
-    const end = Date.now() + 800;
-    while (Date.now() < end) {}
-  }
-}
-if (!config.env) config.env = {};
-const proxyUrl = process.env.STRINGCOST_PROXY_URL || '';
-const rawKey = process.env.ANTHROPIC_API_KEY || '';
-const realKey = rawKey.startsWith('openshell:resolve:env:') ? '' : rawKey;
-if (proxyUrl) {
-  config.env.ANTHROPIC_BASE_URL = proxyUrl;
-  config.env.ANTHROPIC_AUTH_TOKEN = 'dummy';
-  if (!config.models) config.models = {};
-  if (!config.models.providers) config.models.providers = {};
-  if (!config.models.providers.anthropic) config.models.providers.anthropic = {};
-  config.models.providers.anthropic.baseUrl = proxyUrl;
-  config.models.providers.anthropic.apiKey = 'dummy';
-  config.models.providers.anthropic.api = 'anthropic-messages';
-  if (realKey) {
-    config.env.ANTHROPIC_API_KEY = realKey;
-  } else {
-    delete config.env.ANTHROPIC_API_KEY;
-  }
-} else {
-  if (realKey) {
-    config.env.ANTHROPIC_API_KEY = realKey;
-  } else {
-    delete config.env.ANTHROPIC_API_KEY;
-  }
-  delete config.env.ANTHROPIC_BASE_URL;
-  delete config.env.ANTHROPIC_AUTH_TOKEN;
-  if (config.models && config.models.providers && config.models.providers.anthropic) {
-    delete config.models.providers.anthropic.baseUrl;
-    delete config.models.providers.anthropic.apiKey;
-    delete config.models.providers.anthropic.api;
-  }
-}
-fs.writeFileSync(file, JSON.stringify(config, null, 2), { mode: 0o600 });
-console.log('setup.sh: openclaw auth config applied');
-"
-
-  # After the config rewrite the gateway may briefly restart (pre-2026.4.29: spawns a
-  # new child process; 2026.4.29+: in-process reload). Either way, wait for /readyz
-  # again before handing off to openclaw — a TCP check is not sufficient here.
-  _gw_post=0
-  while [ $_gw_post -lt 60 ]; do
-    curl -fsS http://127.0.0.1:18789/readyz >/dev/null 2>&1 && break
-    sleep 1
-    _gw_post=$((_gw_post+1))
-  done
-  if curl -fsS http://127.0.0.1:18789/readyz >/dev/null 2>&1; then
-    echo "setup.sh: gateway stable after auth config"
-  else
-    echo "setup.sh: warning: gateway not responding after config re-apply" >&2
-    cat /tmp/openclaw-gateway.log >&2 || true
-  fi
-
   echo "setup.sh: launching OpenClaw..."
-  # Auth credentials are now in ~/.openclaw/openclaw.json, not env vars.
-  # Strip STRINGCOST_API_KEY (presign-creation only) and any stale auth tokens.
-  # OPENCLAW_PLUGIN_STAGE_DIR is intentionally NOT forwarded: it is for the
-  # gateway process only. Passing it to the TUI/client process causes openclaw
-  # to run its own plugin staging loop on startup, which saturates the Node.js
-  # event loop and makes the terminal completely unresponsive to keyboard input.
-  if [ -n "${STRINGCOST_PROXY_URL:-}" ]; then
-    exec env -u STRINGCOST_API_KEY -u ANTHROPIC_AUTH_TOKEN -u ANTHROPIC_API_KEY \
-      -u OPENCLAW_PLUGIN_STAGE_DIR \
-      HOME=/home/agent \
-      SHELL=/usr/local/bin/openeral-bash \
-      PATH="$PATH" \
-      openclaw "$@"
-  else
-    exec env -u STRINGCOST_API_KEY -u OPENCLAW_PLUGIN_STAGE_DIR \
-      HOME=/home/agent \
-      SHELL=/usr/local/bin/openeral-bash \
-      PATH="$PATH" \
-      openclaw "$@"
-  fi
+  # ANTHROPIC_API_KEY was loaded earlier from the uploaded /sandbox/anthropic-api-key
+  # file (see the file-based delivery block near the top of this script). OpenClaw
+  # picks it up from env and brings up its own embedded gateway as needed.
+  exec env -u STRINGCOST_API_KEY \
+    HOME=/home/agent \
+    SHELL=/usr/local/bin/openeral-bash \
+    PATH="$PATH" \
+    openclaw "$@"
 fi
 
 # Claude Code launch (reached only when OPENERAL_AGENT != openclaw, since openclaw execs above).

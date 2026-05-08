@@ -151,7 +151,7 @@ chmod 600 /tmp/openeral-key
 openshell gateway start
 
 openshell sandbox create --tty \
-  --from ghcr.io/sandys/openeral/sandbox:just-bash \
+  --from ghcr.io/pavitra-programmers/openeral/sandbox:just-bash \
   --upload /tmp/openeral-key:/sandbox/anthropic-api-key \
   --provider openclaw --auto-providers \
   -- openeral
@@ -159,11 +159,9 @@ openshell sandbox create --tty \
 rm -f /tmp/openeral-key
 ```
 
-`setup.sh` reads `/sandbox/anthropic-api-key` and writes the real key value into `~/.openclaw/openclaw.json`. Without the upload, the API key never reaches OpenClaw and every response hangs.
+`setup.sh` reads `/sandbox/anthropic-api-key`, exports it as `ANTHROPIC_API_KEY`, and execs `openclaw`. OpenClaw picks up the key from env and brings up its own embedded gateway. Without the upload, the API key never reaches OpenClaw and every response hangs.
 
 > **If Claude Code launches instead of OpenClaw**, the `openclaw` provider was not created or was not passed. Run the `openshell provider create` command above (one-time) and ensure you pass `--provider openclaw` in the sandbox create command.
-
-To route OpenClaw through StringCost, see [Add StringCost Tracking (OpenClaw)](#add-stringcost-tracking-openclaw).
 
 ## Add PostgreSQL Persistence (OpenClaw)
 
@@ -179,8 +177,8 @@ printf '%s' "$ANTHROPIC_API_KEY" > "$OPENERAL_INPUT/anthropic-api-key"
 printf '%s' "$DATABASE_URL"      > "$OPENERAL_INPUT/db-url"
 chmod -R go-rwx "$OPENERAL_INPUT"
 
-openshell sandbox create --tty \
-  --from ghcr.io/sandys/openeral/sandbox:just-bash \
+openshell sandbox create --tty --name openeral-openclaw \
+  --from ghcr.io/pavitra-programmers/openeral/sandbox:just-bash \
   --upload "$OPENERAL_INPUT:/sandbox/openeral-input" \
   --provider openclaw --auto-providers \
   -- openeral
@@ -190,53 +188,7 @@ rm -rf "$OPENERAL_INPUT"
 
 Reuse `--name openeral-openclaw` on every machine and point it at the same `DATABASE_URL`. OpenEral uses the sandbox name as the workspace ID, so the same PostgreSQL-backed home restores after deletion or on another host.
 
-## Add StringCost Tracking (OpenClaw)
-
-OpenClaw needs **two** files uploaded: the presign for proxy routing, and the raw API key so OpenClaw has a non-empty `ANTHROPIC_API_KEY` before it will attempt any calls. StringCost authenticates via the presign token in the URL, not the Authorization header, so both can coexist.
-
-```bash
-export ANTHROPIC_API_KEY='sk-ant-...'
-export STRINGCOST_API_KEY='sk-st-...'
-
-OPENERAL_INPUT="$(mktemp -d)"
-
-curl -fsS https://app.stringcost.com/v1/presign \
-  -H "Authorization: Bearer $STRINGCOST_API_KEY" \
-  -H "Content-Type: application/json" \
-  -d '{
-    "provider": "anthropic",
-    "client_api_key": "'"$ANTHROPIC_API_KEY"'",
-    "path": ["/v1/messages"],
-    "expires_in": -1,
-    "max_uses": -1,
-    "cost_limit": 10000000,
-    "metadata": { "source": "openeral-sandbox", "client": "openclaw", "labels": ["openeral", "openclaw"] }
-  }' \
-  > "$OPENERAL_INPUT/presign.json"
-
-printf '%s' "$ANTHROPIC_API_KEY" > "$OPENERAL_INPUT/anthropic-api-key"
-
-# Optional: combine PostgreSQL persistence in the same upload.
-export DATABASE_URL="${DATABASE_URL:-${POSTGRES_URL:-}}"
-if [ -n "${DATABASE_URL:-}" ]; then
-  printf '%s' "$DATABASE_URL" > "$OPENERAL_INPUT/db-url"
-fi
-
-chmod -R go-rwx "$OPENERAL_INPUT"
-
-openshell provider create --name stringcost --type generic \
-  --credential "STRINGCOST_API_KEY=$STRINGCOST_API_KEY" \
-  || openshell provider update stringcost \
-    --credential "STRINGCOST_API_KEY=$STRINGCOST_API_KEY"
-
-openshell sandbox create --tty \
-  --from ghcr.io/sandys/openeral/sandbox:just-bash \
-  --upload "$OPENERAL_INPUT:/sandbox/openeral-input" \
-  --provider openclaw --provider stringcost --auto-providers \
-  -- openeral
-
-rm -rf "$OPENERAL_INPUT"
-```
+> **Note:** StringCost cost tracking is supported for Claude Code only. OpenClaw talks to the Anthropic API directly using `ANTHROPIC_API_KEY`.
 
 ## Manage Sandboxes
 
