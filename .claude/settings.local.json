@@ -117,7 +117,8 @@
       "Bash(npx vitest *)",
       "Bash(bash -n tests/test_setup_e2e.sh)",
       "Bash(tr -d '\\\\r')",
-      "Read(//tmp/**)"
+      "Read(//tmp/**)",
+      "Bash(pnpm install *)"
     ]
   }
 }
