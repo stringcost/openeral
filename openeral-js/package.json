@@ -21,7 +21,6 @@
     "check": "npm run typecheck && npm run lint && npm run test"
   },
   "dependencies": {
-    "@electric-sql/pglite": "^0.2.0",
     "just-bash": "^2.0.0",
     "pg": "^8.13.0"
   },
@@ -29,12 +28,5 @@
     "@types/pg": "^8.11.0",
     "typescript": "^5.7.0",
     "vitest": "^3.0.0"
-  },
-  "pnpm": {
-    "ignoredBuiltDependencies": [
-      "@mongodb-js/zstd",
-      "esbuild",
-      "node-liblzma"
-    ]
   }
 }

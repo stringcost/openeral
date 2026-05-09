@@ -47,8 +47,8 @@ Proposal IDs:
   memory-compact       Strip code blocks and duplicates from memory files
 
 Note:
-  Database is embedded PGlite (auto-starts, no Docker needed).
-  Set DATABASE_URL to use an external PostgreSQL instead.
+  DATABASE_URL is required (Supabase, Neon, or any external PostgreSQL).
+  Run \`npx openeral db-url postgresql://...\` to store it once.
   Set STRINGCOST_API_KEY to sync live usage data from StringCost before showing stats.
   Run sessions via 'npx openeral' first so analyze has usage data.
 
@@ -96,41 +96,26 @@ Examples:
       const conn = await getDatabaseConnection();
       const result = await conn.pool.query('SELECT version() AS v');
       const version = (result.rows[0] as any)?.v ?? 'unknown';
-      console.log(`✅ Connected (${conn.isEmbedded ? 'embedded PGlite' : 'external PostgreSQL'})`);
+      console.log('✅ Connected (external PostgreSQL)');
       console.log(`   ${String(version).split('\n')[0]}`);
       await conn.pool.end();
       process.exit(0);
     } catch (err: any) {
       console.error(`❌ Connection failed: ${err.message}`);
-      if (process.env.DATABASE_URL) {
-        console.error('   Check DATABASE_URL and ensure PostgreSQL is running.');
-      } else {
-        console.error('   Embedded PGlite failed to start. Try setting OPENERAL_DATA_DIR.');
-      }
+      console.error('   Check DATABASE_URL and ensure PostgreSQL is reachable.');
       process.exit(1);
     }
   }
 
-  // Get database — embedded PGlite (default) or external via DATABASE_URL
   let pool: import('pg').Pool;
-  let isEmbedded = false;
 
   try {
     const { getDatabaseConnection } = await import('../db/embedded.js');
     const dbConn = await getDatabaseConnection();
     pool = dbConn.pool;
-    isEmbedded = dbConn.isEmbedded;
-
-    if (isEmbedded) {
-      console.log('ℹ️  Using embedded PGlite (no server required)');
-    }
   } catch (err: any) {
     console.error(`❌ Database connection failed: ${err.message}`);
-    if (process.env.DATABASE_URL) {
-      console.error('   Check DATABASE_URL and ensure PostgreSQL is running.');
-    } else {
-      console.error('   Embedded PGlite failed. Try setting OPENERAL_DATA_DIR.');
-    }
+    console.error('   Check DATABASE_URL and ensure PostgreSQL is reachable.');
     process.exit(1);
   }
 

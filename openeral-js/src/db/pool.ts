@@ -14,7 +14,7 @@ export type DbPool = pg.Pool;
  * supabase:5432; the CONNECT tunnel is the only route.
  *
  * Outside an OpenShell sandbox (no HTTPS_PROXY), or for loopback targets
- * (PGlite, local testing), the pool behaves exactly like the previous
+ * (local testing), the pool behaves exactly like the previous
  * implementation — a plain `pg.Pool` with no tunneling.
  */
 export function createPool(connectionString: string): DbPool {

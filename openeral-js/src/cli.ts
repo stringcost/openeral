@@ -20,8 +20,11 @@
  *   If not → set ANTHROPIC_API_KEY + STRINGCOST_API_KEY to create one on first run.
  *   Run `npx openeral presign renew` to replace the stored presign.
  *
+ * Required env:
+ *   DATABASE_URL            PostgreSQL connection string (Supabase, Neon, etc.)
+ *                           Store once with: npx openeral db-url postgresql://...
+ *
  * Optional env:
- *   DATABASE_URL            Database connection string (uses PGlite if not provided)
  *   OPENERAL_WORKSPACE_ID   Workspace ID (default: openeral-claude, normalized to lowercase)
  *   OPENERAL_SANDBOX_IMAGE  Override sandbox image (default: ghcr.io/sandys/openeral/sandbox:just-bash)
  *   OPENERAL_DEV_IMAGE      Override dev sandbox image (default: openeral-sandbox:dev, used with --dev)
@@ -32,7 +35,6 @@
  *   - Automatic sandbox cleanup to prevent duplicate errors
  *   - Kubernetes-compliant workspace name normalization
  *   - Extended startup timeout (8 minutes) for first-time setup
- *   - PGlite support for local development (no PostgreSQL required)
  */
 
 import { spawn, spawnSync } from 'node:child_process';
@@ -269,8 +271,11 @@ Auth (presign-first model):
   The presign is created once and stored permanently — subsequent runs need no keys.
   Run \`npx openeral presign renew\` to replace the stored presign at any time.
 
+Required env:
+  DATABASE_URL             PostgreSQL connection string (Supabase, Neon, etc.)
+                           Store once with: npx openeral db-url postgresql://...
+
 Optional env:
-  DATABASE_URL             Database connection string (uses PGlite if not provided)
   OPENERAL_WORKSPACE_ID    Default workspace ID (will be normalized to lowercase)
   OPENERAL_SANDBOX_IMAGE   Override prod sandbox image (default: ghcr.io/sandys/openeral/sandbox:just-bash)
   OPENERAL_DEV_IMAGE       Override dev sandbox image (default: openeral-sandbox:dev, used with --dev/-d)
@@ -279,7 +284,7 @@ Optional env:
 Features:
   - Presign-first auth — no env vars needed once the presign is stored
   - Claude has automatic access to your home directory and mounted drives
-  - Database persistence with PGlite (or external PostgreSQL)
+  - Persistent /home/agent backed by external PostgreSQL
   - API usage statistics and optimization suggestions
 
 Notes:
@@ -1583,15 +1588,17 @@ if [ -n "\${STRINGCOST_PROXY_URL:-}" ]; then
   echo "setup: using StringCost proxy at \${ANTHROPIC_BASE_URL}"
 fi
 
-mkdir -p /home/agent/.claude /home/agent/.claude/projects /home/agent/.openeral/data
+mkdir -p /home/agent/.claude /home/agent/.claude/projects
 
 # Org skills are written after the workspace restore so syncToFs cannot prune
 # freshly downloaded host-side skills before Claude starts.
 
-# Stable PGlite data directory — must be set before starting the daemon so that
-# getDatabaseConnection() in embedded.js uses /home/agent regardless of what HOME
-# is set to in the sandbox process at daemon startup time.
-export OPENERAL_DATA_DIR="/home/agent/.openeral/data"
+if [ -z "\${DATABASE_URL:-}" ]; then
+  echo "setup: error: DATABASE_URL is required." >&2
+  echo "setup:   Store one with: npx openeral db-url postgresql://user:pass@host/db" >&2
+  echo "setup:   Or set DATABASE_URL in your environment before launching." >&2
+  exit 1
+fi
 
 echo "setup: running migrations..."
 node -e "
@@ -1707,7 +1714,7 @@ DAEMON_PID=$!
 _d=0
 while [ $_d -lt 300 ]; do
   [ -S /tmp/openeral-bash.sock ] && break
-  [ $_d -eq 50 ] && echo "setup: waiting for daemon to initialize (PGlite WASM)..." >&2
+  [ $_d -eq 50 ] && echo "setup: waiting for daemon to initialize..." >&2
   sleep 0.1
   _d=$((_d+1))
 done

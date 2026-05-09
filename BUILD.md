@@ -228,8 +228,8 @@ ANTHROPIC_API_KEY='...' DATABASE_URL='...' bash tests/test_claude_e2e.sh
   │                 file watcher                               │
   │                      │                                     │
   │  openeral-js sync ───▼──────────────────────────────────┐  │
-  │  PGlite (default)  OR  pg.Pool wrapped in a CONNECT-    │  │
-  │                         tunneled Duplex (with --upload) │  │
+  │  pg.Pool wrapped in a CONNECT-tunneled Duplex           │  │
+  │  (DATABASE_URL → Supabase / Neon / external Postgres)   │  │
   │  ───────────────────────────────────────────────────────┘  │
   └────────────────────────┬───────────────────────────────────┘
                            │  (all egress via OpenShell HTTP CONNECT proxy)

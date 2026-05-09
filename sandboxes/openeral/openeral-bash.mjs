@@ -16,8 +16,8 @@
  *
  * Claude Code calls `bash -c '<command>'` — this script intercepts that.
  *
- * Database: uses getDatabaseConnection() which picks up external PostgreSQL
- * when DATABASE_URL is set, or starts embedded PGlite otherwise.
+ * Database: uses getDatabaseConnection() which connects to the external
+ * PostgreSQL instance at DATABASE_URL (required).
  */
 
 import { createServer, createConnection } from 'node:net';
