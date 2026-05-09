@@ -118,7 +118,25 @@
       "Bash(bash -n tests/test_setup_e2e.sh)",
       "Bash(tr -d '\\\\r')",
       "Read(//tmp/**)",
-      "Bash(pnpm install *)"
+      "Bash(pnpm install *)",
+      "Bash(pnpm --version)",
+      "Bash(npx pnpm@9 --version)",
+      "Bash(npx pnpm@9 install)",
+      "Bash(echo \"---EXIT: $?---\")",
+      "Bash(npx pnpm@9 typecheck)",
+      "Bash(echo \"---typecheck EXIT: $?---\")",
+      "Bash(npx pnpm@9 lint)",
+      "Bash(echo \"---lint EXIT: $?---\")",
+      "Bash(npx pnpm@9 test)",
+      "Bash(echo \"---test EXIT: $?---\")",
+      "Bash(CI=true GITHUB_ACTIONS=true pnpm install --frozen-lockfile)",
+      "Bash(npm view *)",
+      "Bash(CI=true npx pnpm@11 install)",
+      "Bash(npx pnpm@11 *)",
+      "Read(//home/linux/**)",
+      "Read(//home/linux/.config/pnpm/**)",
+      "WebFetch(domain:pnpm.io)",
+      "Bash(echo \"---install EXIT: $?---\")"
     ]
   }
 }
