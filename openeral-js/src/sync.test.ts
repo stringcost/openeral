@@ -93,7 +93,19 @@ describe('sync.ts structural checks', () => {
     expect(syncSrc).toContain("'.npmrc'");
     expect(syncSrc).toContain("'.git-credentials'");
     expect(syncSrc).toContain("'.netrc'");
-    expect(syncSrc).toContain("['/.local/share/keyrings']");
+    expect(syncSrc).toContain("'/.local/share/keyrings'");
+  });
+
+  it('home sync policy excludes noisy openclaw subdirs but preserves user state', () => {
+    expect(syncSrc).toContain('HOME_SYNC_EXCLUDE_PATH_PREFIXES');
+    expect(syncSrc).toContain("'/.openclaw/logs'");
+    expect(syncSrc).toContain("'/.openclaw/cache'");
+    expect(syncSrc).toContain("'/.openclaw/plugin-runtime-deps'");
+    expect(syncSrc).toContain("'/.openclaw/gateway'");
+    // openclaw.json, agents/, and memory-core data must remain syncable so
+    // sessions/memory persist across sandbox restarts — verify .openclaw is
+    // NOT in the basename excludeDirs set.
+    expect(syncSrc).not.toMatch(/HOME_SYNC_EXCLUDE_DIRS = new Set\(\[[^\]]*'\.openclaw'/s);
   });
 
   it('home sync policy disables pruning without filtering by file size or type', () => {

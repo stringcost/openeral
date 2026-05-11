@@ -40,7 +40,27 @@ export const HOME_SYNC_EXCLUDE_FILES = new Set([
   '.wget-hsts',
   '.zsh_history',
 ]);
-export const HOME_SYNC_EXCLUDE_PATH_PREFIXES = ['/.local/share/keyrings'];
+// Selective exclusions inside /home/agent/.openclaw — drop the noisy/ephemeral
+// subtrees (logs, npm staging caches, gateway runtime state, scratch dirs) but
+// keep the user-meaningful bits (openclaw.json, agents/, sessions, memory-core
+// data) on the sync path so they persist across sandbox sessions.
+//
+// Rationale: setup.sh's plugin staging already goes to /tmp via
+// OPENCLAW_PLUGIN_STAGE_DIR, and openclaw's gateway writes log/state files
+// under .openclaw at high frequency during startup. Excluding just those
+// subdirs gives openclaw persistent memory + sessions without re-triggering
+// the watcher → walkDir → pooler-timeout cascade.
+export const HOME_SYNC_EXCLUDE_PATH_PREFIXES = [
+  '/.local/share/keyrings',
+  '/.openclaw/logs',
+  '/.openclaw/cache',
+  '/.openclaw/plugin-runtime-deps',
+  '/.openclaw/plugins-runtime',
+  '/.openclaw/gateway',
+  '/.openclaw/runtime',
+  '/.openclaw/tmp',
+  '/.openclaw/var',
+];
 
 export interface SyncOptions {
   excludeDirs?: Set<string>;
@@ -239,9 +259,98 @@ function pruneLocal(
   }
 }
 
+interface FileBatchRow {
+  path: string;
+  parentPath: string;
+  name: string;
+  content: Buffer;
+  mode: number;
+  size: number;
+  mtimeNs: string;
+}
+
+interface DirBatchRow {
+  path: string;
+  parentPath: string;
+  name: string;
+  mode: number;
+  mtimeNs: string;
+}
+
+// Each file row binds 7 params (path, parent_path, name, content, mode, size, mtime_ns)
+// plus the shared workspace_id. Postgres has a 65_535-parameter limit per statement
+// and Supabase's transaction pooler enforces an 8 s statement_timeout — flush before
+// either becomes the bottleneck. Files also flush when accumulated content bytes
+// exceed the byte budget so a single batch never serialises tens of megabytes.
+const FILE_BATCH_ROWS = 64;
+const DIR_BATCH_ROWS = 256;
+const FILE_BATCH_BYTES = 4 * 1024 * 1024;
+
+async function flushDirBatch(
+  pool: pg.Pool,
+  workspaceId: string,
+  batch: DirBatchRow[],
+): Promise<void> {
+  if (batch.length === 0) return;
+  const tuples: string[] = [];
+  const params: unknown[] = [workspaceId];
+  let p = 2;
+  for (const row of batch) {
+    tuples.push(
+      `($1, $${p}, $${p + 1}, $${p + 2}, true, NULL, $${p + 3}, 0, $${p + 4}, $${p + 4}, $${p + 4}, 2, 1000, 1000)`,
+    );
+    params.push(row.path, row.parentPath, row.name, row.mode, row.mtimeNs);
+    p += 5;
+  }
+  await pool.query(
+    `INSERT INTO _openeral.workspace_files
+     (workspace_id, path, parent_path, name, is_dir, content, mode, size, mtime_ns, ctime_ns, atime_ns, nlink, uid, gid)
+     VALUES ${tuples.join(', ')}
+     ON CONFLICT (workspace_id, path) DO UPDATE SET mode = EXCLUDED.mode, mtime_ns = EXCLUDED.mtime_ns`,
+    params,
+  );
+  batch.length = 0;
+}
+
+async function flushFileBatch(
+  pool: pg.Pool,
+  workspaceId: string,
+  batch: FileBatchRow[],
+): Promise<void> {
+  if (batch.length === 0) return;
+  const tuples: string[] = [];
+  const params: unknown[] = [workspaceId];
+  let p = 2;
+  for (const row of batch) {
+    tuples.push(
+      `($1, $${p}, $${p + 1}, $${p + 2}, false, $${p + 3}, $${p + 4}, $${p + 5}, $${p + 6}, $${p + 6}, $${p + 6}, 1, 1000, 1000)`,
+    );
+    params.push(row.path, row.parentPath, row.name, row.content, row.mode, row.size, row.mtimeNs);
+    p += 7;
+  }
+  await pool.query(
+    `INSERT INTO _openeral.workspace_files
+     (workspace_id, path, parent_path, name, is_dir, content, mode, size, mtime_ns, ctime_ns, atime_ns, nlink, uid, gid)
+     VALUES ${tuples.join(', ')}
+     ON CONFLICT (workspace_id, path) DO UPDATE SET content = EXCLUDED.content, mode = EXCLUDED.mode, size = EXCLUDED.size, mtime_ns = EXCLUDED.mtime_ns`,
+    params,
+  );
+  batch.length = 0;
+}
+
 /**
  * Scan a real directory and upsert all files into workspace_files.
  * Optionally deletes DB rows for files that no longer exist on disk.
+ *
+ * Incremental: loads existing (path, mtime_ns, size, is_dir) once, then skips
+ * the upsert for any file whose stat mtime and size match the stored row.
+ * This avoids re-uploading multi-MB bytea content on every walk when nothing
+ * has actually changed.
+ *
+ * Batched: rows are accumulated and flushed as multi-row VALUES INSERTs so a
+ * full /home/agent walk runs in tens of statements rather than thousands —
+ * a hard requirement when the database is behind a pooler with a statement_timeout
+ * and the connection traverses a high-latency tunnel.
  */
 export async function syncFromFs(
   pool: pg.Pool,
@@ -252,6 +361,45 @@ export async function syncFromFs(
   const syncOpts = normalizeSyncOptions(opts);
   const seenPaths = new Set<string>(['/']);
   let count = 0;
+
+  // Snapshot existing rows so we can short-circuit unchanged paths and prune
+  // without a second SELECT pass at the end.
+  const existing = new Map<string, { mtimeNs: bigint; size: bigint; isDir: boolean }>();
+  {
+    const { rows } = await pool.query(
+      `SELECT path, mtime_ns::text AS mtime_ns, size::text AS size, is_dir
+       FROM _openeral.workspace_files WHERE workspace_id = $1`,
+      [workspaceId],
+    );
+    for (const row of rows) {
+      existing.set(row.path as string, {
+        mtimeNs: BigInt(row.mtime_ns as string),
+        size: BigInt(row.size as string),
+        isDir: row.is_dir as boolean,
+      });
+    }
+  }
+
+  const fileBatch: FileBatchRow[] = [];
+  const dirBatch: DirBatchRow[] = [];
+  let fileBatchBytes = 0;
+
+  async function maybeFlushDirs(force = false): Promise<void> {
+    if (dirBatch.length === 0) return;
+    if (force || dirBatch.length >= DIR_BATCH_ROWS) {
+      count += dirBatch.length;
+      await flushDirBatch(pool, workspaceId, dirBatch);
+    }
+  }
+
+  async function maybeFlushFiles(force = false): Promise<void> {
+    if (fileBatch.length === 0) return;
+    if (force || fileBatch.length >= FILE_BATCH_ROWS || fileBatchBytes >= FILE_BATCH_BYTES) {
+      count += fileBatch.length;
+      await flushFileBatch(pool, workspaceId, fileBatch);
+      fileBatchBytes = 0;
+    }
+  }
 
   async function walkDir(dirPath: string, dbParent: string): Promise<void> {
     let entries: string[];
@@ -274,35 +422,39 @@ export async function syncFromFs(
 
       if (st.isDirectory()) {
         if (shouldExcludePath(dbPath, syncOpts, true)) continue;
-        const now = nowNs();
         seenPaths.add(dbPath);
-        await pool.query(
-          `INSERT INTO _openeral.workspace_files
-           (workspace_id, path, parent_path, name, is_dir, content, mode, size, mtime_ns, ctime_ns, atime_ns, nlink, uid, gid)
-           VALUES ($1, $2, $3, $4, true, NULL, $5, 0, $6, $6, $6, 2, 1000, 1000)
-           ON CONFLICT (workspace_id, path) DO UPDATE SET mode = $5, mtime_ns = $6`,
-          [workspaceId, dbPath, dbParent, name, st.mode, now.toString()],
-        );
-        count++;
+        const mtimeNs = BigInt(Math.floor(st.mtimeMs * 1_000_000));
+        const prev = existing.get(dbPath);
+        // Skip the upsert when the directory already exists with the same mtime
+        // and (still) marked as a dir. Mode changes for dirs are rare and the
+        // next real change will refresh the row.
+        if (!prev || !prev.isDir || prev.mtimeNs !== mtimeNs) {
+          dirBatch.push({ path: dbPath, parentPath: dbParent, name, mode: st.mode, mtimeNs: mtimeNs.toString() });
+          await maybeFlushDirs();
+        }
         await walkDir(fullPath, dbPath);
       } else if (st.isFile()) {
         if (shouldExcludePath(dbPath, syncOpts, false)) continue;
-        const content = readFileSync(fullPath);
-        const now = nowNs();
         seenPaths.add(dbPath);
-        await pool.query(
-          `INSERT INTO _openeral.workspace_files
-           (workspace_id, path, parent_path, name, is_dir, content, mode, size, mtime_ns, ctime_ns, atime_ns, nlink, uid, gid)
-           VALUES ($1, $2, $3, $4, false, $5, $6, $7, $8, $8, $8, 1, 1000, 1000)
-           ON CONFLICT (workspace_id, path) DO UPDATE SET content = $5, mode = $6, size = $7, mtime_ns = $8`,
-          [workspaceId, dbPath, dbParent, name, content, st.mode, st.size, now.toString()],
-        );
-        count++;
+        const mtimeNs = BigInt(Math.floor(st.mtimeMs * 1_000_000));
+        const size = BigInt(st.size);
+        const prev = existing.get(dbPath);
+        // Skip when mtime AND size match — content is virtually guaranteed to
+        // be identical. If a tool ever rewrites content without bumping mtime,
+        // the size check catches it; if both somehow match exactly, the stale
+        // copy in the DB lasts at most until the next real change.
+        if (prev && !prev.isDir && prev.mtimeNs === mtimeNs && prev.size === size) {
+          continue;
+        }
+        const content = readFileSync(fullPath);
+        fileBatch.push({ path: dbPath, parentPath: dbParent, name, content, mode: st.mode, size: st.size, mtimeNs: mtimeNs.toString() });
+        fileBatchBytes += content.length;
+        await maybeFlushFiles();
       }
     }
   }
 
-  // Ensure root exists
+  // Ensure root exists (single small INSERT, unchanged shape so tests pass).
   const now = nowNs();
   await pool.query(
     `INSERT INTO _openeral.workspace_files
@@ -313,20 +465,24 @@ export async function syncFromFs(
   );
 
   await walkDir(sourceDir, '/');
+  await maybeFlushDirs(true);
+  await maybeFlushFiles(true);
 
   if (syncOpts.prune) {
-    // Delete DB rows for files that no longer exist on disk
-    const { rows: dbRows } = await pool.query(
-      `SELECT path FROM _openeral.workspace_files WHERE workspace_id = $1 AND path != '/'`,
-      [workspaceId],
-    );
-    for (const row of dbRows) {
-      if (!seenPaths.has(row.path)) {
-        await pool.query(
-          `DELETE FROM _openeral.workspace_files WHERE workspace_id = $1 AND path = $2`,
-          [workspaceId, row.path],
-        );
+    // Use the snapshot we already loaded instead of a second SELECT pass.
+    const toDelete: string[] = [];
+    for (const path of existing.keys()) {
+      if (path !== '/' && !seenPaths.has(path)) {
+        toDelete.push(path);
       }
+    }
+    if (toDelete.length > 0) {
+      // Single batched DELETE FROM _openeral.workspace_files — one round trip
+      // for the whole prune set instead of one per stale row.
+      await pool.query(
+        `DELETE FROM _openeral.workspace_files WHERE workspace_id = $1 AND path = ANY($2::text[])`,
+        [workspaceId, toDelete],
+      );
     }
   }
 
