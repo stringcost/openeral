@@ -23,6 +23,41 @@ RUN apt-get update \
 RUN SHARP_IGNORE_GLOBAL_LIBVIPS=1 npm install -g --loglevel=error openclaw@2026.4.29 \
     && chmod -R a+rX /usr/lib/node_modules/openclaw
 
+# Pre-stage OpenClaw's TUI plugin-runtime-deps at image-build time so end users
+# don't pay the multi-minute npm-install latency on first prompt.
+#
+# Why this is needed:
+#   OpenClaw lazy-loads its TUI plugins on first agent interaction. Some of those
+#   plugins declare deps as `git+ssh://git@github.com/…` (e.g. whiskeysockets/
+#   libsignal-node), which the OpenShell sandbox policy blocks at the network
+#   layer. The user-visible symptom is a ~10 min hang on the very first "hi" and
+#   subsequent npm error 128 failures. Doing the stage here, where the build
+#   environment has full network access, sidesteps both.
+#
+# Steps:
+#   1. Rewrite git+ssh GitHub URLs to https — same fix as setup.sh, applied here
+#      so even if the build's network restricts SSH, deps resolve via HTTPS.
+#   2. Run `openclaw status --deep` under a throwaway HOME to force plugin
+#      discovery and dependency resolution. `|| true` because we don't want
+#      a transient bootstrap warning to fail the whole image build; setup.sh
+#      runs the same step at runtime as a fallback.
+#   3. Copy the resulting plugin-runtime-deps tree to /opt/openclaw-plugin-cache.
+#      setup.sh seeds /home/agent/.openclaw/plugin-runtime-deps from this dir
+#      on every sandbox launch.
+RUN git config --global url."https://github.com/".insteadOf "ssh://git@github.com/" \
+ && git config --global url."https://github.com/".insteadOf "git@github.com:" \
+ && git config --global url."https://github.com/".insteadOf "git+ssh://git@github.com/" \
+ && mkdir -p /tmp/openclaw-bootstrap \
+ && HOME=/tmp/openclaw-bootstrap timeout 900 openclaw status --deep \
+      </dev/null >/tmp/openclaw-bootstrap.log 2>&1 || true \
+ && mkdir -p /opt/openclaw-plugin-cache \
+ && if [ -d /tmp/openclaw-bootstrap/.openclaw/plugin-runtime-deps ]; then \
+        cp -r /tmp/openclaw-bootstrap/.openclaw/plugin-runtime-deps/. \
+              /opt/openclaw-plugin-cache/ 2>/dev/null || true; \
+    fi \
+ && chmod -R a+rX /opt/openclaw-plugin-cache \
+ && rm -rf /tmp/openclaw-bootstrap /tmp/openclaw-bootstrap.log
+
 # Install openeral-js: install all deps (including devDeps for tsc), build, then prune
 COPY openeral-js/ /opt/openeral/
 RUN cd /opt/openeral && npm install && npm run build && npm prune --omit=dev \

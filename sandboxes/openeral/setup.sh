@@ -58,6 +58,18 @@ case "${OPENERAL_AGENT:-}" in
     ;;
 esac
 
+# OpenClaw's runtime npm-via-git installs reference git+ssh://git@github.com/…
+# URLs (e.g. whiskeysockets/libsignal-node). The OpenShell sandbox policy only
+# permits github.com:443 (HTTPS) for /usr/bin/git — port 22 (SSH) is blocked
+# at the network layer and surfaces as "Temporary failure in name resolution"
+# from npm/git. Configure git to rewrite the ssh forms to https so the existing
+# github_ssh_over_https policy stanza handles the traffic.
+if [ "${OPENERAL_AGENT}" = "openclaw" ]; then
+  git config --global url."https://github.com/".insteadOf "ssh://git@github.com/" 2>/dev/null || true
+  git config --global url."https://github.com/".insteadOf "git@github.com:" 2>/dev/null || true
+  git config --global url."https://github.com/".insteadOf "git+ssh://git@github.com/" 2>/dev/null || true
+fi
+
 # StringCost API host. Defaults to the hosted service; override with
 # STRINGCOST_API_BASE=http://<host-ip>:8080 (or similar) to point at a
 # self-hosted control plane during local end-to-end testing.
@@ -737,6 +749,27 @@ console.log('setup.sh: openclaw auth config applied');
     echo "setup.sh: warning: gateway not responding after config re-apply" >&2
     cat /tmp/openclaw-gateway.log >&2 || true
   fi
+
+  # Pre-stage TUI plugin npm deps so the first user prompt doesn't pay the full
+  # plugin-install latency (which was ~10 min in practice without this step).
+  # The TUI's plugin-runtime-deps live under ~/.openclaw/plugin-runtime-deps/
+  # because OPENCLAW_PLUGIN_STAGE_DIR is intentionally unset for the TUI process
+  # (forwarding it caused the TUI to run its own concurrent staging loop and
+  # freeze the terminal). Seed from an image-baked cache first (Dockerfile Fix
+  # 3), then run a deep status probe so any remaining plugins finish staging
+  # while we have a tty-free shell to absorb the wait.
+  if [ -d /opt/openclaw-plugin-cache ] && [ -n "$(ls -A /opt/openclaw-plugin-cache 2>/dev/null)" ]; then
+    echo "setup.sh: seeding TUI plugin cache from image..."
+    mkdir -p /home/agent/.openclaw/plugin-runtime-deps
+    # cp -rn: don't clobber files the workspace restore may have already placed.
+    cp -rn /opt/openclaw-plugin-cache/. /home/agent/.openclaw/plugin-runtime-deps/ 2>/dev/null || true
+  fi
+
+  echo "setup.sh: pre-staging TUI plugin deps (this can take a few minutes on first run)..."
+  HOME=/home/agent timeout 600 openclaw status --deep </dev/null \
+    >/tmp/openclaw-bootstrap.log 2>&1 \
+    && echo "setup.sh: TUI plugin pre-stage complete" \
+    || echo "setup.sh: warning: TUI plugin pre-stage exited non-zero — continuing (see /tmp/openclaw-bootstrap.log)" >&2
 
   echo "setup.sh: launching OpenClaw..."
   # Auth credentials are now in ~/.openclaw/openclaw.json.
