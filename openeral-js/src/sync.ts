@@ -60,6 +60,11 @@ export const HOME_SYNC_EXCLUDE_PATH_PREFIXES = [
   '/.openclaw/runtime',
   '/.openclaw/tmp',
   '/.openclaw/var',
+  // Sessions hold in-progress task state from the previous sandbox run. Persisting
+  // them causes OpenClaw to auto-resume those tasks on the next launch, blocking
+  // new user input for the entire duration. Memory-core data (agent knowledge) is
+  // kept on the sync path so the agent retains context across sessions.
+  '/.openclaw/sessions',
 ];
 
 export interface SyncOptions {

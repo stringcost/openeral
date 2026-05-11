@@ -64,10 +64,19 @@ esac
 # at the network layer and surfaces as "Temporary failure in name resolution"
 # from npm/git. Configure git to rewrite the ssh forms to https so the existing
 # github_ssh_over_https policy stanza handles the traffic.
+#
+# IMPORTANT: Use HOME=/home/agent explicitly — all OpenClaw plugin staging and
+# TUI operations run with HOME=/home/agent. Writing to the default $HOME
+# (the container initial HOME, typically /sandbox) means the rewrites land in
+# the wrong .gitconfig file and are invisible to npm/git when they install
+# plugin deps, causing a ~10 min hang on every "hi" (SSH port 22 blocked).
+# We also re-apply these after syncToFs so a workspace-restored .gitconfig
+# cannot overwrite our additions (see the block after the restore step below).
 if [ "${OPENERAL_AGENT}" = "openclaw" ]; then
-  git config --global url."https://github.com/".insteadOf "ssh://git@github.com/" 2>/dev/null || true
-  git config --global url."https://github.com/".insteadOf "git@github.com:" 2>/dev/null || true
-  git config --global url."https://github.com/".insteadOf "git+ssh://git@github.com/" 2>/dev/null || true
+  mkdir -p /home/agent
+  HOME=/home/agent git config --global url."https://github.com/".insteadOf "ssh://git@github.com/" 2>/dev/null || true
+  HOME=/home/agent git config --global url."https://github.com/".insteadOf "git@github.com:" 2>/dev/null || true
+  HOME=/home/agent git config --global url."https://github.com/".insteadOf "git+ssh://git@github.com/" 2>/dev/null || true
 fi
 
 # StringCost API host. Defaults to the hosted service; override with
@@ -459,6 +468,16 @@ node -e "
     process.exit(1);
   });
 "
+
+# Re-apply git URL rewrites after the workspace restore. syncToFs is authoritative
+# and may overwrite /home/agent/.gitconfig with an older version that lacks the
+# ssh-to-https rewrites. Writing them again here guarantees the pre-stage
+# (openclaw status --deep) and every subsequent npm/git operation finds them.
+if [ "${OPENERAL_AGENT}" = "openclaw" ]; then
+  HOME=/home/agent git config --global url."https://github.com/".insteadOf "ssh://git@github.com/" 2>/dev/null || true
+  HOME=/home/agent git config --global url."https://github.com/".insteadOf "git@github.com:" 2>/dev/null || true
+  HOME=/home/agent git config --global url."https://github.com/".insteadOf "git+ssh://git@github.com/" 2>/dev/null || true
+fi
 
 # Re-apply runtime settings after the restore step. syncToFs intentionally makes
 # PostgreSQL authoritative, so freshly generated settings must be written after it.

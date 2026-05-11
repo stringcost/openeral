@@ -136,7 +136,15 @@
       "Read(//home/linux/**)",
       "Read(//home/linux/.config/pnpm/**)",
       "WebFetch(domain:pnpm.io)",
-      "Bash(echo \"---install EXIT: $?---\")"
+      "Bash(echo \"---install EXIT: $?---\")",
+      "Bash(xargs grep *)",
+      "Bash(find /c/Users/dines/OneDrive/Desktop/work/openeral -type f -name \"*.md\" -exec cat {} \\\\;)",
+      "Bash(xargs cat *)",
+      "Bash(node_modules/.bin/tsc --noEmit)",
+      "Bash(node_modules/.bin/node --experimental-vm-modules node_modules/.bin/jest)",
+      "Bash(node_modules/.bin/tsc)",
+      "Bash(node_modules/.bin/vitest run *)",
+      "Bash(bash -n \"C:/Users/dines/OneDrive/Desktop/work/openeral/sandboxes/openeral/setup.sh\")"
     ]
   }
 }
