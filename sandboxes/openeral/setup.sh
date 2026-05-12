@@ -72,11 +72,17 @@ esac
 # plugin deps, causing a ~10 min hang on every "hi" (SSH port 22 blocked).
 # We also re-apply these after syncToFs so a workspace-restored .gitconfig
 # cannot overwrite our additions (see the block after the restore step below).
+#
+# CRITICAL: use --add. Without it, the three calls collapse onto a single
+# single-value key and only the LAST rewrite (git+ssh://) survives — the
+# ssh:// rewrite that npm-via-git actually needs gets silently dropped, and
+# every plugin install retries SSH:22 (blocked) for ~30 min before failing.
 if [ "${OPENERAL_AGENT}" = "openclaw" ]; then
   mkdir -p /home/agent
-  HOME=/home/agent git config --global url."https://github.com/".insteadOf "ssh://git@github.com/" 2>/dev/null || true
-  HOME=/home/agent git config --global url."https://github.com/".insteadOf "git@github.com:" 2>/dev/null || true
-  HOME=/home/agent git config --global url."https://github.com/".insteadOf "git+ssh://git@github.com/" 2>/dev/null || true
+  HOME=/home/agent git config --global --unset-all url."https://github.com/".insteadOf 2>/dev/null || true
+  HOME=/home/agent git config --global --add url."https://github.com/".insteadOf "ssh://git@github.com/" 2>/dev/null || true
+  HOME=/home/agent git config --global --add url."https://github.com/".insteadOf "git@github.com:" 2>/dev/null || true
+  HOME=/home/agent git config --global --add url."https://github.com/".insteadOf "git+ssh://git@github.com/" 2>/dev/null || true
 fi
 
 # StringCost API host. Defaults to the hosted service; override with
@@ -473,10 +479,12 @@ node -e "
 # and may overwrite /home/agent/.gitconfig with an older version that lacks the
 # ssh-to-https rewrites. Writing them again here guarantees the pre-stage
 # (openclaw status --deep) and every subsequent npm/git operation finds them.
+# --unset-all + --add (see top-of-file block) keeps all three rewrites alive.
 if [ "${OPENERAL_AGENT}" = "openclaw" ]; then
-  HOME=/home/agent git config --global url."https://github.com/".insteadOf "ssh://git@github.com/" 2>/dev/null || true
-  HOME=/home/agent git config --global url."https://github.com/".insteadOf "git@github.com:" 2>/dev/null || true
-  HOME=/home/agent git config --global url."https://github.com/".insteadOf "git+ssh://git@github.com/" 2>/dev/null || true
+  HOME=/home/agent git config --global --unset-all url."https://github.com/".insteadOf 2>/dev/null || true
+  HOME=/home/agent git config --global --add url."https://github.com/".insteadOf "ssh://git@github.com/" 2>/dev/null || true
+  HOME=/home/agent git config --global --add url."https://github.com/".insteadOf "git@github.com:" 2>/dev/null || true
+  HOME=/home/agent git config --global --add url."https://github.com/".insteadOf "git+ssh://git@github.com/" 2>/dev/null || true
 fi
 
 # Re-apply runtime settings after the restore step. syncToFs intentionally makes

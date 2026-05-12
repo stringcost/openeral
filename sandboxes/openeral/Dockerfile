@@ -44,10 +44,10 @@ RUN SHARP_IGNORE_GLOBAL_LIBVIPS=1 npm install -g --loglevel=error openclaw@2026.
 #   3. Copy the resulting plugin-runtime-deps tree to /opt/openclaw-plugin-cache.
 #      setup.sh seeds /home/agent/.openclaw/plugin-runtime-deps from this dir
 #      on every sandbox launch.
-RUN git config --global url."https://github.com/".insteadOf "ssh://git@github.com/" \
- && git config --global url."https://github.com/".insteadOf "git@github.com:" \
- && git config --global url."https://github.com/".insteadOf "git+ssh://git@github.com/" \
- && mkdir -p /tmp/openclaw-bootstrap \
+RUN mkdir -p /tmp/openclaw-bootstrap \
+ && HOME=/tmp/openclaw-bootstrap git config --global --add url."https://github.com/".insteadOf "ssh://git@github.com/" \
+ && HOME=/tmp/openclaw-bootstrap git config --global --add url."https://github.com/".insteadOf "git@github.com:" \
+ && HOME=/tmp/openclaw-bootstrap git config --global --add url."https://github.com/".insteadOf "git+ssh://git@github.com/" \
  && HOME=/tmp/openclaw-bootstrap timeout 900 openclaw status --deep \
       </dev/null >/tmp/openclaw-bootstrap.log 2>&1 || true \
  && mkdir -p /opt/openclaw-plugin-cache \
