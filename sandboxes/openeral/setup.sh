@@ -83,6 +83,12 @@ if [ "${OPENERAL_AGENT}" = "openclaw" ]; then
   HOME=/home/agent git config --global --add url."https://github.com/".insteadOf "ssh://git@github.com/" 2>/dev/null || true
   HOME=/home/agent git config --global --add url."https://github.com/".insteadOf "git@github.com:" 2>/dev/null || true
   HOME=/home/agent git config --global --add url."https://github.com/".insteadOf "git+ssh://git@github.com/" 2>/dev/null || true
+  # After the rewrite, git tunnels through OpenShell's TLS-terminating proxy
+  # which presents a self-signed CA cert git does not trust ("server certificate
+  # verification failed. CAfile: none"). The sandbox network policy already
+  # gates which hosts are reachable, so leaving verify on adds no protection
+  # but blocks every plugin install.
+  HOME=/home/agent git config --global http.sslVerify false 2>/dev/null || true
 fi
 
 # StringCost API host. Defaults to the hosted service; override with
@@ -485,6 +491,7 @@ if [ "${OPENERAL_AGENT}" = "openclaw" ]; then
   HOME=/home/agent git config --global --add url."https://github.com/".insteadOf "ssh://git@github.com/" 2>/dev/null || true
   HOME=/home/agent git config --global --add url."https://github.com/".insteadOf "git@github.com:" 2>/dev/null || true
   HOME=/home/agent git config --global --add url."https://github.com/".insteadOf "git+ssh://git@github.com/" 2>/dev/null || true
+  HOME=/home/agent git config --global http.sslVerify false 2>/dev/null || true
 fi
 
 # Re-apply runtime settings after the restore step. syncToFs intentionally makes
@@ -527,6 +534,13 @@ if [ "$SANDBOX_USER_HOME" != "/home/agent" ] && [ -n "$SANDBOX_USER_HOME" ]; the
   CONNECT_BASHRC="$SANDBOX_USER_HOME/.bashrc"
   if ! grep -q 'openeral-connect' "$CONNECT_BASHRC" 2>/dev/null; then
     printf '\n# openeral-connect: set agent HOME for sandbox connect sessions\nexport HOME=/home/agent\n[ -f /home/agent/.openeral/env.sh ] && . /home/agent/.openeral/env.sh\n' \
+      >> "$CONNECT_BASHRC"
+  fi
+  # Apply the same openclaw runtime env to reconnect sessions so manual
+  # `openclaw` invocations don't re-pay startup overhead or hit TLS-verify
+  # failures during plugin staging.
+  if ! grep -q 'openeral-openclaw-env' "$CONNECT_BASHRC" 2>/dev/null; then
+    printf '\n# openeral-openclaw-env: runtime env for manual openclaw invocations\nexport OPENCLAW_NO_RESPAWN=1\nexport NODE_COMPILE_CACHE=/tmp/openclaw-compile-cache\nexport GIT_SSL_NO_VERIFY=true\nexport npm_config_strict_ssl=false\n' \
       >> "$CONNECT_BASHRC"
   fi
 fi
@@ -680,12 +694,32 @@ console.log('setup.sh: openclaw config written to ' + file);
   export OPENCLAW_PLUGIN_STAGE_DIR=/tmp/openclaw-plugin-runtime-deps
   mkdir -p "$OPENCLAW_PLUGIN_STAGE_DIR"
 
+  # Shared env for gateway + TUI. Set once here, applied at every openclaw exec
+  # below so they all behave consistently.
+  #
+  # GIT_SSL_NO_VERIFY / npm_config_strict_ssl=false — npm-via-git uses its own
+  #   TLS stack and ignores git's http.sslVerify config; without these, the
+  #   plugin-install shell-outs still fail at the OpenShell terminating proxy.
+  # OPENCLAW_NO_RESPAWN=1 — skip openclaw's self-respawn boot path (the doctor
+  #   "Startup optimization" panel flags this; saves 1–2 s per invocation).
+  # NODE_COMPILE_CACHE — V8 bytecode cache; makes the second+ runs of every
+  #   openclaw subprocess (and there are many during plugin staging) noticeably
+  #   faster, especially on slow disks. /tmp is sandbox-writable and not synced.
+  mkdir -p /tmp/openclaw-compile-cache
+  export GIT_SSL_NO_VERIFY=true
+  export npm_config_strict_ssl=false
+  export OPENCLAW_NO_RESPAWN=1
+  export NODE_COMPILE_CACHE=/tmp/openclaw-compile-cache
+
   echo "setup.sh: starting openclaw gateway..."
   # setsid puts the gateway in a new session with no controlling terminal.
   # Without this, exiting the openclaw TUI (Ctrl+C) sends SIGHUP to the entire
   # session including the background gateway, killing it. With setsid the gateway
   # survives TUI exit, so `openshell sandbox connect` finds it still running.
   setsid env OPENCLAW_SKIP_ONBOARDING=1 OPENCLAW_HANDSHAKE_TIMEOUT_MS=30000 \
+    OPENCLAW_NO_RESPAWN=1 \
+    NODE_COMPILE_CACHE=/tmp/openclaw-compile-cache \
+    GIT_SSL_NO_VERIFY=true npm_config_strict_ssl=false \
     HOME=/home/agent openclaw gateway --port 18789 --allow-unconfigured \
     </dev/null >/tmp/openclaw-gateway.log 2>&1 &
   _gw_pid=$!
@@ -793,10 +827,23 @@ console.log('setup.sh: openclaw auth config applied');
   fi
 
   echo "setup.sh: pre-staging TUI plugin deps (this can take a few minutes on first run)..."
-  HOME=/home/agent timeout 600 openclaw status --deep </dev/null \
+  # Same env (GIT_SSL_NO_VERIFY, npm_config_strict_ssl, OPENCLAW_NO_RESPAWN,
+  # NODE_COMPILE_CACHE) was exported above, so this inherits it. The timeout
+  # is shorter than gateway pre-stage because if it fails here, the TUI will
+  # retry on demand — we don't want setup to block forever on a slow stage.
+  HOME=/home/agent timeout 300 openclaw status --deep </dev/null \
     >/tmp/openclaw-bootstrap.log 2>&1 \
     && echo "setup.sh: TUI plugin pre-stage complete" \
     || echo "setup.sh: warning: TUI plugin pre-stage exited non-zero — continuing (see /tmp/openclaw-bootstrap.log)" >&2
+
+  # Consolidate the plugin registry. After staging, the doctor often reports
+  # "Persisted plugin registry is missing or stale" — `openclaw doctor --fix`
+  # rebuilds ~/.openclaw/plugins/installs.json from what is actually present.
+  # Without this, every TUI launch re-runs plugin discovery and partial install.
+  HOME=/home/agent timeout 60 openclaw doctor --fix </dev/null \
+    >>/tmp/openclaw-bootstrap.log 2>&1 \
+    && echo "setup.sh: plugin registry consolidated" \
+    || echo "setup.sh: note: doctor --fix exited non-zero — continuing" >&2
 
   echo "setup.sh: launching OpenClaw..."
   # Auth credentials are now in ~/.openclaw/openclaw.json.
@@ -808,6 +855,10 @@ console.log('setup.sh: openclaw auth config applied');
     HOME=/home/agent \
     SHELL=/usr/local/bin/openeral-bash \
     PATH="$PATH" \
+    OPENCLAW_NO_RESPAWN=1 \
+    NODE_COMPILE_CACHE=/tmp/openclaw-compile-cache \
+    GIT_SSL_NO_VERIFY=true \
+    npm_config_strict_ssl=false \
     openclaw "$@"
 fi
 

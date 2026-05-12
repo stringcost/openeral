@@ -48,7 +48,10 @@ RUN mkdir -p /tmp/openclaw-bootstrap \
  && HOME=/tmp/openclaw-bootstrap git config --global --add url."https://github.com/".insteadOf "ssh://git@github.com/" \
  && HOME=/tmp/openclaw-bootstrap git config --global --add url."https://github.com/".insteadOf "git@github.com:" \
  && HOME=/tmp/openclaw-bootstrap git config --global --add url."https://github.com/".insteadOf "git+ssh://git@github.com/" \
- && HOME=/tmp/openclaw-bootstrap timeout 900 openclaw status --deep \
+ && HOME=/tmp/openclaw-bootstrap git config --global http.sslVerify false \
+ && HOME=/tmp/openclaw-bootstrap GIT_SSL_NO_VERIFY=true npm_config_strict_ssl=false \
+      OPENCLAW_NO_RESPAWN=1 \
+      timeout 900 openclaw status --deep \
       </dev/null >/tmp/openclaw-bootstrap.log 2>&1 || true \
  && mkdir -p /opt/openclaw-plugin-cache \
  && if [ -d /tmp/openclaw-bootstrap/.openclaw/plugin-runtime-deps ]; then \
