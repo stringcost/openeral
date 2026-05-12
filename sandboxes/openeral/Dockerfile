@@ -107,7 +107,14 @@ RUN set -e \
  && chmod -R a+rX /opt/openclaw-plugin-cache /opt/openclaw-compile-cache \
  && echo "--- compile cache size ---" >>/tmp/openclaw-bootstrap.log \
  && du -sh /opt/openclaw-compile-cache 2>&1 | tee -a /tmp/openclaw-bootstrap.log || true \
- && rm -rf /tmp/openclaw-bootstrap /tmp/openclaw-bootstrap.log
+ # Kill any openclaw background processes left over from the pre-warm `agent
+ # --local` run (MCP loopback / plugin daemons can briefly outlive the foreground
+ # process and race with rm). Then clean up the throwaway dirs. The rm is
+ # best-effort — we already copied everything we need to /opt, so a couple of
+ # leftover MB in /tmp is harmless if the rm partially fails.
+ && pkill -9 -f openclaw 2>/dev/null || true \
+ && sleep 2 \
+ && rm -rf /tmp/openclaw-bootstrap /tmp/openclaw-bootstrap.log 2>/dev/null || true
 
 # Install openeral-js: install all deps (including devDeps for tsc), build, then prune
 COPY openeral-js/ /opt/openeral/

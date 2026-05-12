@@ -149,7 +149,8 @@
       "Bash(tar xzf *)",
       "Bash(docker --version)",
       "Bash(docker buildx *)",
-      "Bash(docker context *)"
+      "Bash(docker context *)",
+      "Bash(bash *)"
     ]
   }
 }
