@@ -611,8 +611,48 @@ if [ "$OPENERAL_AGENT" = "openclaw" ]; then
     fi
   fi
 
-  # Write ~/.openclaw/openclaw.json so openclaw starts with the right model and
-  # API credentials.
+  # Run OpenClaw's non-interactive onboarding to create the proper auth profile.
+  #
+  # Writing only env.ANTHROPIC_API_KEY to openclaw.json is enough for Crestodian's
+  # planner (it reads env vars directly), but the main agent's inference path
+  # resolves credentials through auth-profiles.json — without that file, the TUI
+  # surfaces "auth or provider access failed for anthropic" on the first prompt
+  # and /auth opens an interactive OAuth flow that cannot complete in the sandbox.
+  #
+  # `openclaw onboard --non-interactive --auth-choice apiKey --anthropic-api-key`
+  # is the documented automation entry point (see openclaw's docs/start/
+  # wizard-cli-automation.md). It writes the auth profile to
+  # ~/.openclaw/agents/main/agent/auth-profiles.json in the shape the agent runtime
+  # expects, and is safe to re-run on each sandbox launch (idempotent merge).
+  #
+  # Skip --install-daemon: we launch the gateway manually below (no systemd).
+  # --skip-bootstrap / --skip-skills: we seed workspace files ourselves via syncToFs.
+  # --accept-risk: required when storing the key in plaintext mode.
+  _openclaw_key_ok=false
+  case "${ANTHROPIC_API_KEY:-}" in
+    ''|openshell:resolve:env:*) ;;
+    *) _openclaw_key_ok=true ;;
+  esac
+  if [ "$_openclaw_key_ok" = "true" ]; then
+    echo "setup.sh: running openclaw onboard to create auth profile..."
+    HOME=/home/agent timeout 120 openclaw onboard --non-interactive \
+      --mode local \
+      --auth-choice apiKey \
+      --anthropic-api-key "$ANTHROPIC_API_KEY" \
+      --secret-input-mode plaintext \
+      --gateway-port 18789 \
+      --gateway-bind loopback \
+      --skip-bootstrap \
+      --skip-skills \
+      --accept-risk \
+      </dev/null >/tmp/openclaw-onboard.log 2>&1 \
+      && echo "setup.sh: openclaw onboard complete (auth profile written)" \
+      || echo "setup.sh: warning: openclaw onboard exited non-zero — see /tmp/openclaw-onboard.log" >&2
+  fi
+
+  # Write ~/.openclaw/openclaw.json to set our model defaults and handshake timeout.
+  # This runs AFTER onboard so we layer our overrides on top of whatever onboard
+  # wrote. Merge logic below uses `if (!config.x.y)` so existing fields are preserved.
   #
   # IMPORTANT: OpenShell placeholder values (openshell:resolve:env:*) are NOT written
   # to the config for the API key. Unlike Claude Code (a patched binary), OpenClaw's
@@ -659,11 +699,7 @@ console.log('setup.sh: openclaw config written to ' + file);
   # A placeholder (openshell:resolve:env:*) is NOT usable — unlike Claude Code,
   # OpenClaw's Node.js gateway does not route through OpenShell's HTTP proxy, so
   # the placeholder would be sent raw to Anthropic and every API call would hang.
-  _openclaw_key_ok=false
-  case "${ANTHROPIC_API_KEY:-}" in
-    ''|openshell:resolve:env:*) ;;
-    *) _openclaw_key_ok=true ;;
-  esac
+  # $_openclaw_key_ok is set by the onboarding block above.
   if [ "$_openclaw_key_ok" = "false" ]; then
     echo "setup.sh: WARNING: OpenClaw has no usable API credentials." >&2
     echo "setup.sh:   ANTHROPIC_API_KEY is missing or is an OpenShell placeholder that" >&2
@@ -705,7 +741,20 @@ console.log('setup.sh: openclaw config written to ' + file);
   # NODE_COMPILE_CACHE — V8 bytecode cache; makes the second+ runs of every
   #   openclaw subprocess (and there are many during plugin staging) noticeably
   #   faster, especially on slow disks. /tmp is sandbox-writable and not synced.
+  #
+  # Seed from the image-baked cache (Dockerfile populates /opt/openclaw-compile-cache
+  # by running status --deep + agent --local at build time with a fake API key).
+  # Without this seed, every sandbox launch repeats the full JIT compile of the
+  # agent-embedded-run path — the gateway trace shows that costs ~54s on the
+  # first user prompt (model-resolution:6.8s + auth:4.1s + core-plugin-tools:14.1s
+  # + system-prompt:8.7s + stream-setup:9.0s + attempt-dispatch:7.7s). The bake
+  # converts most of that into a near-instant cache hit.
   mkdir -p /tmp/openclaw-compile-cache
+  if [ -d /opt/openclaw-compile-cache ] && [ -n "$(ls -A /opt/openclaw-compile-cache 2>/dev/null)" ]; then
+    echo "setup.sh: seeding V8 compile cache from image..."
+    # cp -rn: do not clobber any entry the running gateway has already written.
+    cp -rn /opt/openclaw-compile-cache/. /tmp/openclaw-compile-cache/ 2>/dev/null || true
+  fi
   export GIT_SSL_NO_VERIFY=true
   export npm_config_strict_ssl=false
   export OPENCLAW_NO_RESPAWN=1

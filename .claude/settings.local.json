@@ -144,7 +144,12 @@
       "Bash(node_modules/.bin/node --experimental-vm-modules node_modules/.bin/jest)",
       "Bash(node_modules/.bin/tsc)",
       "Bash(node_modules/.bin/vitest run *)",
-      "Bash(bash -n \"C:/Users/dines/OneDrive/Desktop/work/openeral/sandboxes/openeral/setup.sh\")"
+      "Bash(bash -n \"C:/Users/dines/OneDrive/Desktop/work/openeral/sandboxes/openeral/setup.sh\")",
+      "Bash(tar tzf *)",
+      "Bash(tar xzf *)",
+      "Bash(docker --version)",
+      "Bash(docker buildx *)",
+      "Bash(docker context *)"
     ]
   }
 }
