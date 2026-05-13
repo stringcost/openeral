@@ -1,0 +1,29 @@
+[package]
+name = "openeral-csi"
+version = "0.1.0"
+edition = "2021"
+
+[[bin]]
+name = "openeral-csi"
+path = "src/main.rs"
+
+[lints]
+workspace = true
+
+[dependencies]
+clap = { version = "4", features = ["derive"] }
+openeral-core = { path = "../openeral-core" }
+prost = "0.13"
+prost-types = "0.13"
+serde_json = "1"
+sha2 = "0.10"
+tokio = { version = "1", features = ["full"] }
+tokio-postgres = "0.7"
+tokio-stream = { version = "0.1", features = ["net"] }
+tonic = { version = "0.12", features = ["transport", "tls"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+[build-dependencies]
+protoc-bin-vendored = "3"
+tonic-build = "0.12"

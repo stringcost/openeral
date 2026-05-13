@@ -1,0 +1,202 @@
+syntax = "proto3";
+
+package csi.v1;
+
+import "google/protobuf/wrappers.proto";
+
+service Identity {
+  rpc GetPluginInfo(GetPluginInfoRequest) returns (GetPluginInfoResponse) {}
+  rpc GetPluginCapabilities(GetPluginCapabilitiesRequest) returns (GetPluginCapabilitiesResponse) {}
+  rpc Probe(ProbeRequest) returns (ProbeResponse) {}
+}
+
+service Controller {
+  rpc CreateVolume(CreateVolumeRequest) returns (CreateVolumeResponse) {}
+  rpc DeleteVolume(DeleteVolumeRequest) returns (DeleteVolumeResponse) {}
+  rpc ControllerGetCapabilities(ControllerGetCapabilitiesRequest)
+      returns (ControllerGetCapabilitiesResponse) {}
+}
+
+service Node {
+  rpc NodePublishVolume(NodePublishVolumeRequest) returns (NodePublishVolumeResponse) {}
+  rpc NodeUnpublishVolume(NodeUnpublishVolumeRequest) returns (NodeUnpublishVolumeResponse) {}
+  rpc NodeGetCapabilities(NodeGetCapabilitiesRequest) returns (NodeGetCapabilitiesResponse) {}
+  rpc NodeGetInfo(NodeGetInfoRequest) returns (NodeGetInfoResponse) {}
+}
+
+message GetPluginInfoRequest {}
+
+message GetPluginInfoResponse {
+  string name = 1;
+  string vendor_version = 2;
+  map<string, string> manifest = 3;
+}
+
+message GetPluginCapabilitiesRequest {}
+
+message GetPluginCapabilitiesResponse {
+  repeated PluginCapability capabilities = 1;
+}
+
+message PluginCapability {
+  message Service {
+    enum Type {
+      UNKNOWN = 0;
+      CONTROLLER_SERVICE = 1;
+    }
+
+    Type type = 1;
+  }
+
+  oneof type {
+    Service service = 1;
+  }
+}
+
+message ProbeRequest {}
+
+message ProbeResponse {
+  google.protobuf.BoolValue ready = 1;
+}
+
+message CapacityRange {
+  int64 required_bytes = 1;
+  int64 limit_bytes = 2;
+}
+
+message VolumeCapability {
+  message BlockVolume {}
+
+  message MountVolume {
+    string fs_type = 1;
+    repeated string mount_flags = 2;
+    string volume_mount_group = 3;
+  }
+
+  message AccessMode {
+    enum Mode {
+      UNKNOWN = 0;
+      SINGLE_NODE_WRITER = 1;
+      SINGLE_NODE_READER_ONLY = 2;
+      MULTI_NODE_READER_ONLY = 3;
+      MULTI_NODE_SINGLE_WRITER = 4;
+      MULTI_NODE_MULTI_WRITER = 5;
+      SINGLE_NODE_SINGLE_WRITER = 6;
+      SINGLE_NODE_MULTI_WRITER = 7;
+    }
+
+    Mode mode = 1;
+  }
+
+  oneof access_type {
+    BlockVolume block = 1;
+    MountVolume mount = 2;
+  }
+
+  AccessMode access_mode = 3;
+}
+
+message Topology {
+  map<string, string> segments = 1;
+}
+
+message Volume {
+  int64 capacity_bytes = 1;
+  string volume_id = 2;
+  map<string, string> volume_context = 3;
+  repeated Topology accessible_topology = 5;
+}
+
+message CreateVolumeRequest {
+  string name = 1;
+  CapacityRange capacity_range = 2;
+  repeated VolumeCapability volume_capabilities = 3;
+  map<string, string> parameters = 4;
+  map<string, string> secrets = 5;
+}
+
+message CreateVolumeResponse {
+  Volume volume = 1;
+}
+
+message DeleteVolumeRequest {
+  string volume_id = 1;
+  map<string, string> secrets = 2;
+}
+
+message DeleteVolumeResponse {}
+
+message ControllerGetCapabilitiesRequest {}
+
+message ControllerGetCapabilitiesResponse {
+  repeated ControllerServiceCapability capabilities = 1;
+}
+
+message ControllerServiceCapability {
+  message RPC {
+    enum Type {
+      UNKNOWN = 0;
+      CREATE_DELETE_VOLUME = 1;
+    }
+
+    Type type = 1;
+  }
+
+  oneof type {
+    RPC rpc = 1;
+  }
+}
+
+message NodePublishVolumeRequest {
+  string volume_id = 1;
+  map<string, string> publish_context = 2;
+  string staging_target_path = 3;
+  string target_path = 4;
+  VolumeCapability volume_capability = 5;
+  bool readonly = 6;
+  map<string, string> secrets = 7;
+  map<string, string> volume_context = 8;
+}
+
+message NodePublishVolumeResponse {}
+
+message NodeUnpublishVolumeRequest {
+  string volume_id = 1;
+  string target_path = 2;
+}
+
+message NodeUnpublishVolumeResponse {}
+
+message NodeGetCapabilitiesRequest {}
+
+message NodeGetCapabilitiesResponse {
+  repeated NodeServiceCapability capabilities = 1;
+}
+
+message NodeServiceCapability {
+  message RPC {
+    enum Type {
+      UNKNOWN = 0;
+      STAGE_UNSTAGE_VOLUME = 1;
+      GET_VOLUME_STATS = 2;
+      EXPAND_VOLUME = 3;
+      VOLUME_CONDITION = 4;
+      SINGLE_NODE_MULTI_WRITER = 5;
+      VOLUME_MOUNT_GROUP = 6;
+    }
+
+    Type type = 1;
+  }
+
+  oneof type {
+    RPC rpc = 1;
+  }
+}
+
+message NodeGetInfoRequest {}
+
+message NodeGetInfoResponse {
+  string node_id = 1;
+  int64 max_volumes_per_node = 2;
+  Topology accessible_topology = 3;
+}

@@ -99,6 +99,9 @@ const WORKSPACE_DEFAULT_STORAGE: &str = "2Gi";
 /// `/sandbox` contents.  Subsequent pod starts skip the copy.
 const WORKSPACE_SENTINEL: &str = ".workspace-initialized";
 
+/// When true, skip seeding `/sandbox` contents into the workspace PVC.
+const SKIP_WORKSPACE_SEED_ENV: &str = "OPENSHELL_K8S_SKIP_WORKSPACE_SEED";
+
 #[derive(Clone)]
 pub struct KubernetesComputeDriver {
     client: Client,
@@ -862,12 +865,16 @@ fn apply_workspace_persistence(
         }
     }
 
+    let skip_workspace_seed = std::env::var(SKIP_WORKSPACE_SEED_ENV)
+        .ok()
+        .is_some_and(|value| matches!(value.trim(), "1" | "true" | "TRUE" | "yes" | "on"));
+
     // 3. Add the init container that seeds the PVC from the image
     let init_containers = spec
         .entry("initContainers")
         .or_insert_with(|| serde_json::json!([]))
         .as_array_mut();
-    if let Some(init_containers) = init_containers {
+    if !skip_workspace_seed && let Some(init_containers) = init_containers {
         // The init container mounts the PVC at a temp path so it can still
         // read the image's original /sandbox contents.  It copies them into
         // the PVC only when the sentinel file is absent.
@@ -877,13 +884,20 @@ fn apply_workspace_persistence(
         // fail while seeding the PVC even though preserving the symlink as-is
         // is valid. `tar` copies the tree without dereferencing those links.
         //
+        // Downstream storage backends may not implement symlink creation yet.
+        // In that case the tar extract can report a small number of benign
+        // symlink-copy failures (for example `/sandbox/.venv/bin/python3` in
+        // the community base image). For the default Claude workflow those
+        // links are not required for the initial shell/agent startup, so we
+        // treat extract errors as best-effort and still write the sentinel.
+        //
         // The inner `[ -d ... ]` guard handles custom images that don't have
         // a /sandbox directory — the copy is skipped but the sentinel is
         // still written so subsequent starts are instant.
         let copy_cmd = format!(
             "if [ ! -f {WORKSPACE_INIT_MOUNT_PATH}/{WORKSPACE_SENTINEL} ]; then \
                if [ -d {WORKSPACE_MOUNT_PATH} ]; then \
-                 tar -C {WORKSPACE_MOUNT_PATH} -cf - . | tar -C {WORKSPACE_INIT_MOUNT_PATH} -xpf -; \
+                 tar -C {WORKSPACE_MOUNT_PATH} -cf - . | tar -C {WORKSPACE_INIT_MOUNT_PATH} -xpf - || true; \
                fi && \
                touch {WORKSPACE_INIT_MOUNT_PATH}/{WORKSPACE_SENTINEL}; \
              fi"

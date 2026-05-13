@@ -43,7 +43,8 @@ securityContext:
       - ALL
 
 service:
-  type: ClusterIP
+  type: NodePort
+  nodePort: 30051
   port: 8080
   healthPort: 8081
   metricsPort: 9090
@@ -81,6 +82,8 @@ server:
   logLevel: info
   sandboxNamespace: openshell
   dbUrl: "sqlite:/var/openshell/openshell.db"
+  dataStorageClassName: "local-path"
+  skipWorkspaceSeed: false
   sandboxImage: "ghcr.io/nvidia/openshell-community/sandboxes/base:latest"
   # Kubernetes imagePullPolicy for sandbox pods.  Empty = Kubernetes default
   # (Always for :latest, IfNotPresent otherwise).  Set to "Always" for dev

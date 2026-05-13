@@ -23,16 +23,23 @@ spec:
   targetNamespace: openshell
   createNamespace: true
   valuesContent: |-
+    fullnameOverride: openshell
     chartChecksum: __CHART_CHECKSUM__
     image:
       repository: ghcr.io/nvidia/openshell/gateway
       tag: latest
       pullPolicy: __IMAGE_PULL_POLICY__
+    supervisor:
+      image:
+        repository: ghcr.io/nvidia/openshell/supervisor
+        tag: latest
+        pullPolicy: ""
     server:
       sandboxImage: ghcr.io/nvidia/openshell-community/sandboxes/base:latest
       sandboxImagePullPolicy: __SANDBOX_IMAGE_PULL_POLICY__
       supervisorImage: ghcr.io/nvidia/openshell/supervisor:latest
       dbUrl: __DB_URL__
+      skipWorkspaceSeed: true
       sshGatewayHost: __SSH_GATEWAY_HOST__
       sshGatewayPort: __SSH_GATEWAY_PORT__
       grpcEndpoint: "https://openshell.openshell.svc.cluster.local:8080"

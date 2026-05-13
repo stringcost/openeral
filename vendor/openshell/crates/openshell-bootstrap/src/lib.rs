@@ -617,7 +617,12 @@ where
                 )
                 .await?;
 
-                restart_openshell_deployment(&target_docker, &name).await?;
+                if openshell_workload_exists(&target_docker, &name).await? {
+                    restart_openshell_deployment(&target_docker, &name).await?;
+                } else {
+                    log("[progress] Skipping deployment restart until the initial workload exists"
+                        .to_string());
+                }
             }
         }
 
@@ -633,6 +638,9 @@ where
             };
             wait_for_gateway_ready(&target_docker, &name, &mut gateway_log).await?;
         }
+
+        apply_openeral_csi_manifest_if_present(&target_docker, &name).await?;
+        wait_for_openeral_csi_ready_if_present(&target_docker, &name).await?;
 
         // Create and store gateway metadata. On resume, preserve existing
         // OIDC fields so a bare `gateway start` without `--oidc-*` flags
@@ -1285,6 +1293,89 @@ async fn wait_for_namespace(
     }
 
     unreachable!()
+}
+
+async fn apply_openeral_csi_manifest_if_present(docker: &Docker, name: &str) -> Result<()> {
+    let cname = container_name(name);
+    let kubeconfig = constants::KUBECONFIG_PATH;
+    let manifest_path = "/opt/openeral/manifests/openshell-openeral-csi.yaml";
+
+    let (exists_output, exists_code) = exec_capture_with_exit(
+        docker,
+        &cname,
+        vec![
+            "sh".to_string(),
+            "-c".to_string(),
+            format!("test -f {manifest_path} && echo present || echo absent"),
+        ],
+    )
+    .await?;
+
+    if exists_code != 0 || !exists_output.contains("present") {
+        return Ok(());
+    }
+
+    let (output, exit_code) = exec_capture_with_exit(
+        docker,
+        &cname,
+        vec![
+            "sh".to_string(),
+            "-c".to_string(),
+            format!("KUBECONFIG={kubeconfig} kubectl apply -f {manifest_path} 2>&1"),
+        ],
+    )
+    .await?;
+
+    if exit_code != 0 {
+        return Err(miette::miette!(
+            "failed to apply Openeral CSI manifest (exit {exit_code}): {output}"
+        ));
+    }
+
+    Ok(())
+}
+
+async fn wait_for_openeral_csi_ready_if_present(docker: &Docker, name: &str) -> Result<()> {
+    let cname = container_name(name);
+    let kubeconfig = constants::KUBECONFIG_PATH;
+    let manifest_path = "/opt/openeral/manifests/openshell-openeral-csi.yaml";
+
+    let (exists_output, exists_code) = exec_capture_with_exit(
+        docker,
+        &cname,
+        vec![
+            "sh".to_string(),
+            "-c".to_string(),
+            format!("test -f {manifest_path} && echo present || echo absent"),
+        ],
+    )
+    .await?;
+
+    if exists_code != 0 || !exists_output.contains("present") {
+        return Ok(());
+    }
+
+    let wait_cmd = format!(
+        "set -e; \
+         KUBECONFIG={kubeconfig} kubectl get storageclass openeral >/dev/null; \
+         KUBECONFIG={kubeconfig} kubectl -n openshell wait --for=condition=Available deployment/openeral-csi-controller --timeout=180s >/dev/null; \
+         KUBECONFIG={kubeconfig} kubectl -n openshell rollout status daemonset/openeral-csi-node --timeout=180s >/dev/null"
+    );
+
+    let (output, exit_code) = exec_capture_with_exit(
+        docker,
+        &cname,
+        vec!["sh".to_string(), "-c".to_string(), wait_cmd],
+    )
+    .await?;
+
+    if exit_code != 0 {
+        return Err(miette::miette!(
+            "Openeral CSI resources did not become ready (exit {exit_code}): {output}"
+        ));
+    }
+
+    Ok(())
 }
 
 #[cfg(test)]

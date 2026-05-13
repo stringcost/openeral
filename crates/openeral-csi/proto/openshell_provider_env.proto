@@ -1,0 +1,17 @@
+syntax = "proto3";
+
+package openshell.v1;
+
+service OpenShell {
+  rpc GetSandboxProviderEnvironment(GetSandboxProviderEnvironmentRequest)
+      returns (GetSandboxProviderEnvironmentResponse) {}
+}
+
+message GetSandboxProviderEnvironmentRequest {
+  string sandbox_id = 1;
+}
+
+message GetSandboxProviderEnvironmentResponse {
+  map<string, string> environment = 1;
+  uint64 provider_env_revision = 2;
+}

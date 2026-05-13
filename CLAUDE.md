@@ -77,6 +77,11 @@ call that validation.
 
 - Never delete, move, or overwrite user files without explicit permission.
 - If a file appears risky, secret-bearing, or security-critical, stop and ask before changing it.
+- Never run `sudo`, `su`, `doas`, `pkexec`, or any equivalent privilege-escalation command.
+- Never place privilege-escalation command names inside double-quoted shell strings when backticks or command substitution could execute them; use single quotes or escaped literals.
+- User-invoked `docker`, `act`, `buildx`, and similar container-engine commands are allowed when run as the current user, even if they talk to a rootful daemon or that daemon creates root-owned processes or containers.
+- Never use privilege escalation or direct root-targeted host actions. Do not run commands explicitly as root, and do not use elevated cleanup for stuck processes or containers.
+- If root-owned processes or containers already exist, interact with them only through normal user-level tools. If user-level commands are insufficient and privilege escalation would be required, stop and report the blocker.
 - Keep the user-facing flow command-composed; do not add wrapper scripts for normal usage.
 - The supported OpenShell runtime path is Docker compute driver with gateway, supervisor, and sandbox images.
 - Do not validate OpenShell by bypassing the supervisor; FUSE mounts must come from `/etc/fstab`.

@@ -675,6 +675,7 @@ pub async fn ensure_container(
     let mut cmd = vec![
         "server".to_string(),
         "--disable=traefik".to_string(),
+        "--disable-cloud-controller".to_string(),
         "--tls-san=127.0.0.1".to_string(),
         "--tls-san=localhost".to_string(),
         "--tls-san=host.docker.internal".to_string(),

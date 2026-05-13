@@ -54,6 +54,7 @@ network_policies:
             match_headers: [x-api-key]
       - { host: statsig.anthropic.com, port: 443 }
       - { host: sentry.io, port: 443 }
+      - { host: http-intake.logs.us5.datadoghq.com, port: 443 }
       - { host: raw.githubusercontent.com, port: 443 }
       - { host: platform.claude.com, port: 443 }
     binaries:

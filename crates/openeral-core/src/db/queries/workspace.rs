@@ -152,6 +152,30 @@ pub async fn list_children(
     Ok(rows.iter().map(row_to_workspace_file).collect())
 }
 
+/// Normalize the recorded uid/gid for every persisted row in a workspace.
+///
+/// This is used when the mounting environment differs from the sandbox
+/// runtime image. The k3s-side CSI node plugin runs as root and may not have
+/// the sandbox user in `/etc/passwd`, but the workload itself expects the
+/// workspace tree to belong to the sandbox uid/gid.
+pub async fn normalize_workspace_owner(
+    pool: &deadpool_postgres::Pool,
+    workspace_id: &str,
+    uid: i32,
+    gid: i32,
+) -> Result<(), FsError> {
+    let client = get_client(pool).await?;
+    client
+        .execute(
+            "UPDATE _openeral.workspace_files \
+             SET uid = $2, gid = $3 \
+             WHERE workspace_id = $1 AND (uid <> $2 OR gid <> $3)",
+            &[&workspace_id, &uid, &gid],
+        )
+        .await?;
+    Ok(())
+}
+
 /// Create a new file or directory.
 pub async fn create_file(
     pool: &deadpool_postgres::Pool,

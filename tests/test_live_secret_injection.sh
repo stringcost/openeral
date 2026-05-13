@@ -43,9 +43,9 @@ db_provider="openeral-db-${tag}"
 claude_provider="openeral-claude-${tag}"
 db_container="openeral-secret-${tag}"
 
-gateway_image="${OPENERAL_GATEWAY_IMAGE:-ghcr.io/sandys/openeral/gateway:latest}"
-supervisor_image="${OPENERAL_SUPERVISOR_IMAGE:-ghcr.io/sandys/openeral/supervisor:latest}"
-sandbox_image="${OPENERAL_SANDBOX_IMAGE:-ghcr.io/sandys/openeral/sandbox:latest}"
+gateway_image="${OPENERAL_GATEWAY_IMAGE:-ghcr.io/stringcost/openeral/gateway:latest}"
+supervisor_image="${OPENERAL_SUPERVISOR_IMAGE:-ghcr.io/stringcost/openeral/supervisor:latest}"
+sandbox_image="${OPENERAL_SANDBOX_IMAGE:-ghcr.io/stringcost/openeral/sandbox:latest}"
 
 result_file="$repo_root/.omx/logs/live-secret-${stamp}.env"
 summary_file="$repo_root/.omx/logs/live-secret-${stamp}.summary.txt"

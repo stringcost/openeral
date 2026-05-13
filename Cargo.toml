@@ -2,6 +2,7 @@
 members = [
     "crates/openeral",
     "crates/openeral-core",
+    "crates/openeral-csi",
 ]
 resolver = "2"
 

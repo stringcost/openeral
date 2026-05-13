@@ -5,6 +5,7 @@ pub mod memory;
 pub mod migrate;
 pub mod mount;
 pub mod optimize;
+pub mod session;
 pub mod unmount;
 pub mod version;
 pub mod workspace;
@@ -36,6 +37,8 @@ pub enum Commands {
     Memory(memory::MemoryArgs),
     /// Inspect optimization metrics stored in PostgreSQL
     Optimize(optimize::OptimizeArgs),
+    /// Prepare /sandbox and exec the requested agent command
+    Session(session::SessionArgs),
     /// Unmount a previously mounted database
     Unmount(unmount::UnmountArgs),
     /// List active mounts
@@ -54,6 +57,7 @@ pub async fn run() -> Result<(), FsError> {
         Commands::Migrate(args) => migrate::execute(args).await,
         Commands::Memory(args) => memory::execute(args).await,
         Commands::Optimize(args) => optimize::execute(args).await,
+        Commands::Session(args) => session::execute(args).await,
         Commands::Unmount(args) => unmount::execute(args).await,
         Commands::List => list::execute().await,
         Commands::Version => {

@@ -78,6 +78,10 @@ spec:
             {{- end }}
             - name: OPENSHELL_GRPC_ENDPOINT
               value: {{ if .Values.server.disableTls }}{{ .Values.server.grpcEndpoint | replace "https://" "http://" | quote }}{{ else }}{{ .Values.server.grpcEndpoint | quote }}{{ end }}
+            {{- if .Values.server.skipWorkspaceSeed }}
+            - name: OPENSHELL_K8S_SKIP_WORKSPACE_SEED
+              value: "true"
+            {{- end }}
             {{- if .Values.server.sshGatewayHost }}
             - name: OPENSHELL_SSH_GATEWAY_HOST
               value: {{ .Values.server.sshGatewayHost | quote }}
@@ -191,7 +195,7 @@ spec:
             secretName: {{ .Values.server.tls.certSecretName }}
         - name: tls-client-ca
           secret:
-            {{- if or .Values.pkiInitJob.enabled (and .Values.certManager.enabled .Values.certManager.clientCaFromServerTlsSecret) }}
+            {{- if and .Values.certManager.enabled .Values.certManager.clientCaFromServerTlsSecret }}
             secretName: {{ .Values.server.tls.certSecretName }}
             items:
               - key: ca.crt
@@ -217,6 +221,9 @@ spec:
         name: openshell-data
       spec:
         accessModes: ["ReadWriteOnce"]
+        {{- if .Values.server.dataStorageClassName }}
+        storageClassName: {{ .Values.server.dataStorageClassName | quote }}
+        {{- end }}
         resources:
           requests:
             storage: 1Gi

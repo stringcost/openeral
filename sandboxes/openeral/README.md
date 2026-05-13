@@ -138,6 +138,10 @@ OPENERAL_AGENT=openclaw openshell provider create \
 
 Then launch with `--provider openclaw -- env HOME=/home/agent openclaw`.
 
+Creating an optional provider does not activate it for every sandbox by
+itself. Include the matching `--provider` flag on `openshell sandbox create`
+when you want Socket.dev, StringCost, or OpenClaw behavior in that sandbox.
+
 ## Policy
 
 This image replaces the base OpenShell policy with:

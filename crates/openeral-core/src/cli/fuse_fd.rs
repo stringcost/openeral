@@ -31,6 +31,7 @@ const KNOWN_SUBCOMMANDS: &[&str] = &[
     "mount",
     "migrate",
     "optimize",
+    "session",
     "unmount",
     "list",
     "version",

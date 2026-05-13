@@ -101,6 +101,7 @@ pub async fn execute(args: MountArgs) -> Result<(), FsError> {
         fuser::MountOption::Subtype("openeral".to_string()),
         fuser::MountOption::DefaultPermissions,
     ];
+    fuse_config.acl = fuser::SessionACL::All;
     // fuser::mount2 blocks, so run in a blocking thread
     let handle = tokio::task::spawn_blocking(move || {
         fuser::mount2(fs, &mount_point, &fuse_config).map_err(FsError::IoError)

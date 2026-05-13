@@ -425,7 +425,8 @@ HELMCHART="/var/lib/rancher/k3s/server/manifests/openshell-helmchart.yaml"
 
 if [ -n "${IMAGE_REPO_BASE:-}" ] && [ -f "$HELMCHART" ]; then
     echo "Setting image repository base: ${IMAGE_REPO_BASE}"
-    sed -i -E "s|repository:[[:space:]]*[^[:space:]]+|repository: ${IMAGE_REPO_BASE}/gateway|" "$HELMCHART"
+    sed -i -E "0,/repository:[[:space:]]*[^[:space:]]+/s|repository:[[:space:]]*[^[:space:]]+|repository: ${IMAGE_REPO_BASE}/gateway|" "$HELMCHART"
+    sed -i -E "0,/repository:[[:space:]]*ghcr\\.io\\/nvidia\\/openshell\\/supervisor/s|repository:[[:space:]]*ghcr\\.io\\/nvidia\\/openshell\\/supervisor|repository: ${IMAGE_REPO_BASE}/supervisor|" "$HELMCHART"
     # Sandbox images come from the community registry — do not override
 fi
 
@@ -451,11 +452,15 @@ if [ -n "${PUSH_IMAGE_REFS:-}" ] && [ -f "$HELMCHART" ]; then
         server_tag="${server_image##*:}"
         echo "Setting server image repository: ${server_repo}"
         echo "Setting server image tag: ${server_tag}"
-        sed -i -E "s|repository:[[:space:]]*[^[:space:]]+|repository: ${server_repo}|" "$HELMCHART"
-        sed -i -E "s|tag:[[:space:]]*\"?[^\"[:space:]]+\"?|tag: \"${server_tag}\"|" "$HELMCHART"
+        sed -i -E "/^    image:/,/^    supervisor:/{s|^      repository:[[:space:]]*[^[:space:]]+|      repository: ${server_repo}|; s|^      tag:[[:space:]]*\"?[^\"[:space:]]+\"?|      tag: \"${server_tag}\"|}" "$HELMCHART"
     fi
 
     if [ -n "$supervisor_image" ]; then
+        supervisor_repo="${supervisor_image%:*}"
+        supervisor_tag="${supervisor_image##*:}"
+        echo "Setting supervisor image repository: ${supervisor_repo}"
+        echo "Setting supervisor image tag: ${supervisor_tag}"
+        sed -i -E "/^    supervisor:/,/^    server:/{s|^        repository:[[:space:]]*[^[:space:]]+|        repository: ${supervisor_repo}|; s|^        tag:[[:space:]]*\"?[^\"[:space:]]+\"?|        tag: \"${supervisor_tag}\"|}" "$HELMCHART"
         echo "Setting supervisor image: ${supervisor_image}"
         sed -i -E "s|supervisorImage:[[:space:]]*\"?[^\"]+\"?|supervisorImage: ${supervisor_image}|" "$HELMCHART"
     fi
@@ -465,7 +470,8 @@ if [ -n "${IMAGE_TAG:-}" ] && [ -f "$HELMCHART" ]; then
     echo "Overriding gateway and supervisor image tags to: ${IMAGE_TAG}"
     # server image tag (standalone value field)
     # Handle both quoted and unquoted defaults: tag: "latest" / tag: latest
-    sed -i -E "s|tag:[[:space:]]*\"?latest\"?|tag: \"${IMAGE_TAG}\"|" "$HELMCHART"
+    sed -i -E "/^    image:/,/^    supervisor:/{s|^      tag:[[:space:]]*\"?latest\"?|      tag: \"${IMAGE_TAG}\"|}" "$HELMCHART"
+    sed -i -E "/^    supervisor:/,/^    server:/{s|^        tag:[[:space:]]*\"?latest\"?|        tag: \"${IMAGE_TAG}\"|}" "$HELMCHART"
     # supervisor image is a full image ref under server.supervisorImage
     sed -i -E "s|(supervisorImage:[[:space:]]*\"?[^\"]*:)[^\"[:space:]]+(\"?)|\\1${IMAGE_TAG}\\2|" "$HELMCHART"
 fi

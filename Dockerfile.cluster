@@ -1,0 +1,49 @@
+# syntax=docker/dockerfile:1.4
+
+ARG OPENSHELL_CLUSTER_BASE=openshell/cluster:dev
+
+FROM rust:1.95-bookworm AS builder
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    build-essential \
+    cmake \
+    pkg-config \
+    libfuse3-dev \
+    ca-certificates \
+    && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /build
+COPY Cargo.toml Cargo.lock ./
+COPY crates/ crates/
+
+RUN --mount=type=cache,target=/usr/local/cargo/registry \
+    --mount=type=cache,target=/build/target \
+    cargo build --release -p openeral-csi \
+    && mkdir -p /build/out \
+    && install -m 0755 /build/target/release/openeral-csi /build/out/openeral-csi
+
+FROM ubuntu:24.04 AS fuse-runtime
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    fuse3 \
+    ca-certificates \
+    && rm -rf /var/lib/apt/lists/* \
+    && mkdir -p /export/etc \
+    && cp /usr/bin/fusermount3 /export/fusermount3 \
+    && cp /etc/fuse.conf /export/etc/fuse.conf
+
+FROM ${OPENSHELL_CLUSTER_BASE}
+
+USER root
+
+COPY --from=fuse-runtime /export/fusermount3 /usr/local/bin/fusermount3
+COPY --from=fuse-runtime /export/etc/fuse.conf /etc/fuse.conf
+RUN printf '\nuser_allow_other\n' >> /etc/fuse.conf
+
+COPY --from=builder /build/out/openeral-csi /usr/local/bin/openeral-csi
+COPY deploy/docker/openeral-cluster-entrypoint.sh /usr/local/bin/openeral-cluster-entrypoint.sh
+COPY deploy/kube/manifests/openshell-openeral-csi.yaml /opt/openeral/manifests/openshell-openeral-csi.yaml
+
+RUN chmod +x /usr/local/bin/openeral-cluster-entrypoint.sh
+
+ENTRYPOINT ["/usr/local/bin/openeral-cluster-entrypoint.sh"]
