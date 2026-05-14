@@ -122,7 +122,9 @@ case "${DATABASE_URL:-}" in
       DB_URL_FILE="$(find /sandbox/openeral-input -type f -name db-url | head -1)"
     fi
     if [ -n "$DB_URL_FILE" ]; then
-      DATABASE_URL="$(cat "$DB_URL_FILE")"
+      # Trim leading/trailing whitespace and CR (Windows line endings) — defensive
+      # against `echo "$URL" > file` adding a trailing newline that Postgres rejects.
+      DATABASE_URL="$(tr -d '\r' < "$DB_URL_FILE" | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//')"
       export DATABASE_URL
       echo "setup.sh: loaded DATABASE_URL from uploaded $DB_URL_FILE"
     fi
@@ -159,7 +161,11 @@ case "${ANTHROPIC_API_KEY:-}" in
       ANTHROPIC_KEY_FILE=/sandbox/openeral-input/anthropic-api-key
     fi
     if [ -n "$ANTHROPIC_KEY_FILE" ]; then
-      ANTHROPIC_API_KEY="$(cat "$ANTHROPIC_KEY_FILE")"
+      # Trim leading/trailing whitespace and CR (Windows line endings) — defensive
+      # against `echo "$KEY" > file` adding a trailing newline. A key with a stray
+      # newline is sent literally to Anthropic, which rejects it with 401; openclaw
+      # then surfaces this as a generic "run aborted / timeout" in the TUI.
+      ANTHROPIC_API_KEY="$(tr -d '\r' < "$ANTHROPIC_KEY_FILE" | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//')"
       export ANTHROPIC_API_KEY
       echo "setup.sh: loaded ANTHROPIC_API_KEY from uploaded $ANTHROPIC_KEY_FILE"
     fi
@@ -611,6 +617,81 @@ if [ "$OPENERAL_AGENT" = "openclaw" ]; then
     fi
   fi
 
+  # Set up the runtime env that every openclaw invocation in this block
+  # depends on. This MUST happen before `openclaw onboard` runs — otherwise
+  # onboard pays the full cold-start V8 JIT cost (~54s on first prompt per the
+  # gateway trace) and frequently exceeds its timeout, leaving auth-profiles.json
+  # half-written. Symptom: onboard exits non-zero, the TUI loads, but every
+  # "hi" comes back as "run aborted / decision=surface_error reason=timeout".
+  #
+  # GIT_SSL_NO_VERIFY / npm_config_strict_ssl=false — npm-via-git uses its own
+  #   TLS stack and ignores git's http.sslVerify config; without these, the
+  #   plugin-install shell-outs still fail at the OpenShell terminating proxy.
+  # OPENCLAW_NO_RESPAWN=1 — skip openclaw's self-respawn boot path (the doctor
+  #   "Startup optimization" panel flags this; saves 1–2 s per invocation).
+  # NODE_COMPILE_CACHE — V8 bytecode cache; makes the second+ runs of every
+  #   openclaw subprocess (and there are many during onboard + plugin staging)
+  #   noticeably faster.
+  # OPENCLAW_PLUGIN_STAGE_DIR — keep bundled npm deps OUTSIDE /home/agent.
+  #   /home/agent is synced to workspace_files in the DB; restoring a previous
+  #   session's plugin-runtime-deps directory can leave a corrupt npm cache that
+  #   makes the gateway fail to stage its 35 bundled packages (ENOENT on cache
+  #   entries). /tmp is always writable by the sandbox user and is never synced.
+  export GIT_SSL_NO_VERIFY=true
+  export npm_config_strict_ssl=false
+  export OPENCLAW_NO_RESPAWN=1
+  export NODE_COMPILE_CACHE=/tmp/openclaw-compile-cache
+  export OPENCLAW_PLUGIN_STAGE_DIR=/tmp/openclaw-plugin-runtime-deps
+  mkdir -p "$OPENCLAW_PLUGIN_STAGE_DIR" /tmp/openclaw-compile-cache
+
+  # Seed the V8 compile cache from the image-baked copy. The Dockerfile primes
+  # /opt/openclaw-compile-cache at build time by running the slow path
+  # (status --deep + agent --local). Without this seed, onboard would JIT-compile
+  # the entire openclaw codebase from cold every launch.
+  if [ -d /opt/openclaw-compile-cache ] && [ -n "$(ls -A /opt/openclaw-compile-cache 2>/dev/null)" ]; then
+    echo "setup.sh: seeding V8 compile cache from image..."
+    # cp -rn: do not clobber any entry the running gateway has already written.
+    cp -rn /opt/openclaw-compile-cache/. /tmp/openclaw-compile-cache/ 2>/dev/null || true
+  fi
+
+  # Install a diagnose script the user can run if openclaw misbehaves. Dumps
+  # everything relevant: config, auth profile, gateway log tail, onboard log
+  # tail, /readyz status, env vars. Lives in /home/agent so reconnect sessions
+  # also find it.
+  mkdir -p /home/agent/.openeral
+  cat > /home/agent/.openeral/diagnose-openclaw.sh <<'DIAG_EOF'
+#!/bin/bash
+# OpenClaw diagnostic dump — run this if the TUI shows "run aborted" or hangs.
+echo "=== openclaw version ==="
+openclaw --version 2>&1 || true
+echo
+echo "=== env (relevant only) ==="
+env | grep -E '^(HOME|ANTHROPIC_|OPENCLAW_|NODE_COMPILE_CACHE|GIT_SSL_NO_VERIFY|npm_config_)' | sed 's/\(ANTHROPIC_API_KEY=\).*/\1***REDACTED***/'
+echo
+echo "=== ~/.openclaw/openclaw.json ==="
+if [ -f /home/agent/.openclaw/openclaw.json ]; then
+  sed 's/\("ANTHROPIC_API_KEY":[[:space:]]*"\)[^"]*/\1***REDACTED***/' /home/agent/.openclaw/openclaw.json
+else
+  echo "(missing)"
+fi
+echo
+echo "=== auth-profiles.json (exists?) ==="
+ls -la /home/agent/.openclaw/agents/main/agent/auth-profiles.json 2>&1 || echo "(missing — onboard did not complete)"
+echo
+echo "=== /readyz ==="
+curl -fsS -o /dev/null -w "HTTP %{http_code}\n" http://127.0.0.1:18789/readyz 2>&1 || echo "(unreachable)"
+echo
+echo "=== last 50 lines of gateway log ==="
+tail -50 /tmp/openclaw-gateway.log 2>/dev/null || echo "(no log)"
+echo
+echo "=== last 50 lines of onboard log ==="
+tail -50 /tmp/openclaw-onboard.log 2>/dev/null || echo "(no log)"
+echo
+echo "=== last 50 lines of bootstrap log ==="
+tail -50 /tmp/openclaw-bootstrap.log 2>/dev/null || echo "(no log)"
+DIAG_EOF
+  chmod +x /home/agent/.openeral/diagnose-openclaw.sh
+
   # Run OpenClaw's non-interactive onboarding to create the proper auth profile.
   #
   # Writing only env.ANTHROPIC_API_KEY to openclaw.json is enough for Crestodian's
@@ -635,7 +716,13 @@ if [ "$OPENERAL_AGENT" = "openclaw" ]; then
   esac
   if [ "$_openclaw_key_ok" = "true" ]; then
     echo "setup.sh: running openclaw onboard to create auth profile..."
-    HOME=/home/agent timeout 120 openclaw onboard --non-interactive \
+    # 600s timeout: onboard does plugin discovery + dep resolution + auth-profile
+    # write. With the V8 cache and PLUGIN_STAGE_DIR primed above, this typically
+    # finishes in 60-180s, but cold network + dep download can push past 5 min.
+    # The previous 120s was too aggressive — onboard was being SIGKILL'd by the
+    # `timeout` command mid-write, leaving auth-profiles.json corrupt or absent
+    # and every subsequent embedded run timing out as a result.
+    HOME=/home/agent timeout 600 openclaw onboard --non-interactive \
       --mode local \
       --auth-choice apiKey \
       --anthropic-api-key "$ANTHROPIC_API_KEY" \
@@ -645,9 +732,52 @@ if [ "$OPENERAL_AGENT" = "openclaw" ]; then
       --skip-bootstrap \
       --skip-skills \
       --accept-risk \
-      </dev/null >/tmp/openclaw-onboard.log 2>&1 \
-      && echo "setup.sh: openclaw onboard complete (auth profile written)" \
-      || echo "setup.sh: warning: openclaw onboard exited non-zero — see /tmp/openclaw-onboard.log" >&2
+      </dev/null >/tmp/openclaw-onboard.log 2>&1
+    _onboard_rc=$?
+    if [ $_onboard_rc -eq 0 ]; then
+      echo "setup.sh: openclaw onboard complete (auth profile written)"
+    else
+      echo "setup.sh: warning: openclaw onboard exited $_onboard_rc — last 30 lines of log:" >&2
+      tail -30 /tmp/openclaw-onboard.log >&2 || true
+      echo "setup.sh: (full log at /tmp/openclaw-onboard.log)" >&2
+    fi
+
+    # Verify auth-profiles.json was actually written. The embedded-run path
+    # resolves credentials through this file specifically; without it, every
+    # main-agent prompt returns "run aborted / decision=surface_error reason=timeout".
+    AUTH_PROFILE_FILE=/home/agent/.openclaw/agents/main/agent/auth-profiles.json
+    if [ ! -s "$AUTH_PROFILE_FILE" ]; then
+      echo "setup.sh: warning: $AUTH_PROFILE_FILE is missing/empty after onboard." >&2
+      echo "setup.sh:   Writing a minimal fallback auth profile so the embedded run path can" >&2
+      echo "setup.sh:   resolve credentials. If this fallback does not work, run" >&2
+      echo "setup.sh:   /home/agent/.openeral/diagnose-openclaw.sh inside the sandbox." >&2
+      mkdir -p "$(dirname "$AUTH_PROFILE_FILE")"
+      # Profile schema: openclaw resolves the profile by its content hash, so the
+      # shape must match what `openclaw onboard` writes. Keep this minimal — only
+      # the apiKey provider+secret are required for the embedded run path.
+      HOME=/home/agent node -e "
+const fs = require('fs');
+const file = process.argv[1];
+const key = process.env.ANTHROPIC_API_KEY || '';
+if (!key) { process.stderr.write('no ANTHROPIC_API_KEY — cannot write fallback profile\n'); process.exit(1); }
+const profile = {
+  version: 1,
+  profiles: {
+    anthropic: {
+      provider: 'anthropic',
+      authType: 'apiKey',
+      apiKey: key,
+      createdAt: new Date().toISOString(),
+      source: 'openeral-setup-fallback',
+    },
+  },
+  defaultProfile: 'anthropic',
+};
+fs.mkdirSync(require('path').dirname(file), { recursive: true, mode: 0o700 });
+fs.writeFileSync(file, JSON.stringify(profile, null, 2), { mode: 0o600 });
+process.stdout.write('setup.sh: fallback auth profile written to ' + file + '\n');
+" "$AUTH_PROFILE_FILE" || echo "setup.sh: fallback profile write failed" >&2
+    fi
   fi
 
   # Write ~/.openclaw/openclaw.json to set our model defaults and handshake timeout.
@@ -721,44 +851,11 @@ console.log('setup.sh: openclaw config written to ' + file);
   # OPENCLAW_HANDSHAKE_TIMEOUT_MS=30000 — lengthen the WebSocket pre-auth handshake
   #   timeout from the default 3 s to 30 s; containers with cold image caches can
   #   take several seconds between the TCP port opening and WebSocket RPC being live.
-  # OPENCLAW_PLUGIN_STAGE_DIR — keep bundled npm deps OUTSIDE /home/agent.
-  #   /home/agent is synced to workspace_files in the DB; restoring a previous
-  #   session's plugin-runtime-deps directory can leave a corrupt npm cache that
-  #   makes the gateway fail to stage its 35 bundled packages (ENOENT on cache
-  #   entries). /tmp is always writable by the sandbox user and is never synced,
-  #   so the gateway always gets a clean staging area on each sandbox launch.
-  export OPENCLAW_PLUGIN_STAGE_DIR=/tmp/openclaw-plugin-runtime-deps
-  mkdir -p "$OPENCLAW_PLUGIN_STAGE_DIR"
-
-  # Shared env for gateway + TUI. Set once here, applied at every openclaw exec
-  # below so they all behave consistently.
   #
-  # GIT_SSL_NO_VERIFY / npm_config_strict_ssl=false — npm-via-git uses its own
-  #   TLS stack and ignores git's http.sslVerify config; without these, the
-  #   plugin-install shell-outs still fail at the OpenShell terminating proxy.
-  # OPENCLAW_NO_RESPAWN=1 — skip openclaw's self-respawn boot path (the doctor
-  #   "Startup optimization" panel flags this; saves 1–2 s per invocation).
-  # NODE_COMPILE_CACHE — V8 bytecode cache; makes the second+ runs of every
-  #   openclaw subprocess (and there are many during plugin staging) noticeably
-  #   faster, especially on slow disks. /tmp is sandbox-writable and not synced.
-  #
-  # Seed from the image-baked cache (Dockerfile populates /opt/openclaw-compile-cache
-  # by running status --deep + agent --local at build time with a fake API key).
-  # Without this seed, every sandbox launch repeats the full JIT compile of the
-  # agent-embedded-run path — the gateway trace shows that costs ~54s on the
-  # first user prompt (model-resolution:6.8s + auth:4.1s + core-plugin-tools:14.1s
-  # + system-prompt:8.7s + stream-setup:9.0s + attempt-dispatch:7.7s). The bake
-  # converts most of that into a near-instant cache hit.
-  mkdir -p /tmp/openclaw-compile-cache
-  if [ -d /opt/openclaw-compile-cache ] && [ -n "$(ls -A /opt/openclaw-compile-cache 2>/dev/null)" ]; then
-    echo "setup.sh: seeding V8 compile cache from image..."
-    # cp -rn: do not clobber any entry the running gateway has already written.
-    cp -rn /opt/openclaw-compile-cache/. /tmp/openclaw-compile-cache/ 2>/dev/null || true
-  fi
-  export GIT_SSL_NO_VERIFY=true
-  export npm_config_strict_ssl=false
-  export OPENCLAW_NO_RESPAWN=1
-  export NODE_COMPILE_CACHE=/tmp/openclaw-compile-cache
+  # OPENCLAW_PLUGIN_STAGE_DIR, NODE_COMPILE_CACHE, GIT_SSL_NO_VERIFY,
+  # npm_config_strict_ssl, OPENCLAW_NO_RESPAWN are all exported earlier in this
+  # block (before `openclaw onboard`) so onboard, the gateway, and the doctor
+  # subcommands all see consistent env. See the runtime-env block above.
 
   echo "setup.sh: starting openclaw gateway..."
   # setsid puts the gateway in a new session with no controlling terminal.
@@ -895,6 +992,8 @@ console.log('setup.sh: openclaw auth config applied');
     || echo "setup.sh: note: doctor --fix exited non-zero — continuing" >&2
 
   echo "setup.sh: launching OpenClaw..."
+  echo "setup.sh: if the TUI shows 'run aborted', exit and run:"
+  echo "setup.sh:   bash /home/agent/.openeral/diagnose-openclaw.sh"
   # Auth credentials are now in ~/.openclaw/openclaw.json.
   # OPENCLAW_PLUGIN_STAGE_DIR is intentionally NOT forwarded: it is for the
   # gateway process only. Passing it to the TUI/client process causes openclaw

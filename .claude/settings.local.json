@@ -150,7 +150,9 @@
       "Bash(docker --version)",
       "Bash(docker buildx *)",
       "Bash(docker context *)",
-      "Bash(bash *)"
+      "Bash(bash *)",
+      "Bash(command -v openclaw)",
+      "Read(//usr/**)"
     ]
   }
 }
