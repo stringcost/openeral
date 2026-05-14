@@ -61,6 +61,17 @@ impl FsError {
 
 impl From<tokio_postgres::Error> for FsError {
     fn from(err: tokio_postgres::Error) -> Self {
-        FsError::DatabaseError(err.to_string())
+        if let Some(db) = err.as_db_error() {
+            let mut message = format!("{} (sqlstate {})", db.message(), db.code().code());
+            if let Some(detail) = db.detail() {
+                message.push_str(&format!(" detail: {}", detail));
+            }
+            if let Some(hint) = db.hint() {
+                message.push_str(&format!(" hint: {}", hint));
+            }
+            FsError::DatabaseError(message)
+        } else {
+            FsError::DatabaseError(err.to_string())
+        }
     }
 }

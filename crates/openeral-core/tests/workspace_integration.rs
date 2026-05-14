@@ -31,7 +31,7 @@ async fn get_pool() -> deadpool_postgres::Pool {
 /// Generate a unique workspace ID for each test to avoid races.
 fn unique_ws_id(prefix: &str) -> String {
     let n = COUNTER.fetch_add(1, Ordering::Relaxed);
-    format!("{}-{}", prefix, n)
+    format!("{}-{}-{}-{}", prefix, std::process::id(), now_ns(), n)
 }
 
 fn now_ns() -> i64 {
@@ -232,6 +232,54 @@ async fn test_update_file_content() {
         .unwrap();
     assert_eq!(fetched.content, Some(b"updated content".to_vec()));
     assert_eq!(fetched.size, 15);
+
+    ws_queries::delete_workspace(&pool, &ws_id).await.unwrap();
+}
+
+#[tokio::test]
+async fn test_update_file_attrs_truncate_and_overwrite_sequence() {
+    let pool = get_pool().await;
+    let ws_id = unique_ws_id("ws-truncate");
+    let layout = WorkspaceLayout::default();
+    ws_queries::create_workspace(&pool, &ws_id, None, &layout)
+        .await
+        .unwrap();
+    ws_queries::seed_from_config(&pool, &ws_id, &layout)
+        .await
+        .unwrap();
+
+    let file = test_file(&ws_id, "/truncate.txt", "/", "truncate.txt", b"persist-ok");
+    ws_queries::create_file(&pool, &file).await.unwrap();
+
+    let truncated = ws_queries::update_file_attrs(
+        &pool,
+        &ws_id,
+        "/truncate.txt",
+        None,
+        Some(0),
+        None,
+        None,
+    )
+    .await
+    .unwrap();
+    assert_eq!(truncated.size, 0);
+    assert_eq!(truncated.content, Some(Vec::new()));
+
+    ws_queries::update_file_content(
+        &pool,
+        &ws_id,
+        "/truncate.txt",
+        b"overwrite-ok",
+        now_ns(),
+    )
+    .await
+    .unwrap();
+
+    let overwritten = ws_queries::get_file(&pool, &ws_id, "/truncate.txt")
+        .await
+        .unwrap();
+    assert_eq!(overwritten.size, 12);
+    assert_eq!(overwritten.content, Some(b"overwrite-ok".to_vec()));
 
     ws_queries::delete_workspace(&pool, &ws_id).await.unwrap();
 }

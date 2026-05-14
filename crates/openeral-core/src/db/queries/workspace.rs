@@ -117,6 +117,14 @@ pub async fn get_file(
     path: &str,
 ) -> Result<WorkspaceFile, FsError> {
     let client = get_client(pool).await?;
+    get_file_with_client(&client, workspace_id, path).await
+}
+
+async fn get_file_with_client(
+    client: &tokio_postgres::Client,
+    workspace_id: &str,
+    path: &str,
+) -> Result<WorkspaceFile, FsError> {
     let row = client
         .query_opt(
             "SELECT workspace_id, path, parent_path, name, is_dir, content, mode, size, \
@@ -272,16 +280,21 @@ pub async fn update_file_attrs(
     }
 
     if let Some(s) = size {
+        let truncate_len = i32::try_from(s).map_err(|_| {
+            FsError::InvalidArgument(format!(
+                "truncate size {s} exceeds PostgreSQL substring integer limit"
+            ))
+        })?;
         // Truncation: if new size < current size, trim content
         client
             .execute(
                 "UPDATE _openeral.workspace_files \
                  SET size = $3, \
-                     content = CASE WHEN $3 = 0 THEN '\\x'::bytea \
-                               ELSE substring(COALESCE(content, '\\x'::bytea) FROM 1 FOR $3::integer) END, \
-                     mtime_ns = $4, ctime_ns = $4 \
+                     content = CASE WHEN $4 = 0 THEN '\\x'::bytea \
+                               ELSE substring(COALESCE(content, '\\x'::bytea) FROM 1 FOR $4) END, \
+                     mtime_ns = $5, ctime_ns = $5 \
                  WHERE workspace_id = $1 AND path = $2",
-                &[&workspace_id, &path, &s, &now_ns],
+                &[&workspace_id, &path, &s, &truncate_len, &now_ns],
             )
             .await?;
     }
@@ -306,7 +319,7 @@ pub async fn update_file_attrs(
             .await?;
     }
 
-    get_file(pool, workspace_id, path).await
+    get_file_with_client(&client, workspace_id, path).await
 }
 
 /// Delete a file.
