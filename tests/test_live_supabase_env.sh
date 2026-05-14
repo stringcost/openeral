@@ -54,15 +54,16 @@ db_provider="${OPENERAL_SUPABASE_DB_PROVIDER:-openeral-db-${gateway_name}}"
 claude_provider="${OPENERAL_SUPABASE_CLAUDE_PROVIDER:-openeral-claude-${gateway_name}}"
 sandbox_image="${OPENERAL_SUPABASE_SANDBOX_IMAGE:-ghcr.io/nvidia/openshell-community/sandboxes/base:latest}"
 policy_path="${OPENERAL_SUPABASE_POLICY_PATH:-$repo_root/sandboxes/openeral/policy.yaml}"
-policy_path_runner="$policy_path"
-case "$policy_path_runner" in
+policy_path_arg="$policy_path"
+case "$policy_path_arg" in
   "$repo_root"/*)
-    policy_path_runner="/workspace${policy_path_runner#$repo_root}"
+    policy_path_arg="/workspace${policy_path_arg#$repo_root}"
     ;;
 esac
 local_registry_container="${OPENERAL_LOCAL_REGISTRY_CONTAINER:-openeral-registry}"
 
 cluster_image="${OPENSHELL_CLUSTER_IMAGE:-127.0.0.1:5000/openeral/cluster:dev}"
+cluster_source_image="${OPENERAL_CLUSTER_SOURCE_IMAGE:-openeral/cluster:dev}"
 registry_host="${OPENSHELL_REGISTRY_HOST:-127.0.0.1:5000}"
 registry_endpoint="${OPENSHELL_REGISTRY_ENDPOINT:-172.17.0.1:5000}"
 registry_insecure="${OPENSHELL_REGISTRY_INSECURE:-true}"
@@ -107,7 +108,6 @@ check_local_image() {
   }
 }
 
-check_local_image "$cluster_image"
 if [ -n "$push_images" ]; then
   old_ifs="$IFS"
   IFS=','
@@ -121,8 +121,12 @@ if [ -n "$push_images" ]; then
 fi
 case "$registry_host" in
   127.0.0.1:5000|localhost:5000)
+    check_local_image "$cluster_source_image"
     check_local_image "$gateway_source_image"
     check_local_image "$supervisor_source_image"
+    ;;
+  *)
+    check_local_image "$cluster_image"
     ;;
 esac
 
@@ -156,9 +160,10 @@ for _ in range(30):
 raise SystemExit(f"Local registry did not become ready: {last_error}")
 PY
 
-      docker push "$cluster_image" >/dev/null
+      docker tag "$cluster_source_image" "$cluster_image"
       docker tag "$gateway_source_image" "$gateway_registry_image"
       docker tag "$supervisor_source_image" "$supervisor_registry_image"
+      docker push "$cluster_image" >/dev/null
       docker push "$gateway_registry_image" >/dev/null
       docker push "$supervisor_registry_image" >/dev/null
       ;;
@@ -193,7 +198,7 @@ run_cli() {
       -e ANTHROPIC_API_KEY="${ANTHROPIC_API_KEY:-}" \
       -e OPENERAL_DATABASE_URL="${OPENERAL_DATABASE_URL:-}" \
       -e DATABASE_URL="${DATABASE_URL:-}" \
-      -e OPENERAL_SUPABASE_POLICY_PATH="$policy_path_runner" \
+      -e OPENERAL_SUPABASE_POLICY_PATH="$policy_path_arg" \
       "$RUNNER_IMAGE" \
       "$runner_bin" "$@"
   else
@@ -260,6 +265,28 @@ stabilize_gateway_runtime() {
         kubectl -n openshell rollout status statefulset/openshell --timeout=180s >/dev/null
       ;;
   esac
+
+  gateway_pod_image="$(
+    docker exec "$cluster_container" \
+      kubectl -n openshell get pod openshell-0 -o jsonpath='{.spec.containers[0].image}'
+  )"
+  [ "$gateway_pod_image" = "$gateway_registry_image" ] || {
+    echo "Gateway pod is using unexpected image: $gateway_pod_image" >&2
+    exit 1
+  }
+
+  gateway_env="$(
+    docker exec "$cluster_container" \
+      kubectl -n openshell get pod openshell-0 -o jsonpath='{range .spec.containers[0].env[*]}{.name}={.value}{"\n"}{end}'
+  )"
+  printf '%s\n' "$gateway_env" | grep -F "OPENSHELL_SUPERVISOR_IMAGE=${supervisor_registry_image}" >/dev/null || {
+    echo "Gateway pod is missing OPENSHELL_SUPERVISOR_IMAGE=${supervisor_registry_image}" >&2
+    exit 1
+  }
+  printf '%s\n' "$gateway_env" | grep -F "OPENSHELL_K8S_SKIP_WORKSPACE_SEED=true" >/dev/null || {
+    echo "Gateway pod is missing OPENSHELL_K8S_SKIP_WORKSPACE_SEED=true" >&2
+    exit 1
+  }
 }
 
 preload_sandbox_image() {
@@ -315,12 +342,21 @@ if ! DATABASE_URL="$OPENERAL_DATABASE_URL" ANTHROPIC_API_KEY="$ANTHROPIC_API_KEY
     --from "$sandbox_image" \
     --provider "$db_provider" \
     --provider "$claude_provider" \
-    --policy "${OPENERAL_SUPABASE_POLICY_PATH:-$policy_path}" \
+    --policy "$policy_path_arg" \
     --no-auto-providers \
     --no-tty -- env HOME=/sandbox sleep infinity >"$create_log" 2>&1; then
   cat "$create_log" >&2
 fi
 rm -f "$create_log"
+
+sandbox_yaml="$(
+  docker exec "$cluster_container" \
+    kubectl -n openshell get "sandboxes.agents.x-k8s.io/${sandbox_name}" -o yaml
+)"
+printf '%s\n' "$sandbox_yaml" | grep -q 'name: workspace-init' && {
+  echo "Sandbox CR still contains workspace-init" >&2
+  exit 1
+}
 
 wait_for_sandbox_ready
 wait_for_exec_ready
@@ -385,7 +421,7 @@ if ! DATABASE_URL="$OPENERAL_DATABASE_URL" ANTHROPIC_API_KEY="$ANTHROPIC_API_KEY
     --from "$sandbox_image" \
     --provider "$db_provider" \
     --provider "$claude_provider" \
-    --policy "${OPENERAL_SUPABASE_POLICY_PATH:-$policy_path}" \
+    --policy "$policy_path_arg" \
     --no-auto-providers \
     --no-tty -- env HOME=/sandbox sleep infinity >"$recreate_log" 2>&1; then
   cat "$recreate_log" >&2
