@@ -722,6 +722,13 @@ DIAG_EOF
     # The previous 120s was too aggressive — onboard was being SIGKILL'd by the
     # `timeout` command mid-write, leaving auth-profiles.json corrupt or absent
     # and every subsequent embedded run timing out as a result.
+    #
+    # IMPORTANT: `set -e` is active. The naive `cmd; rc=$?` pattern trips set -e
+    # when onboard exits non-zero and aborts setup.sh entirely (symptom: setup
+    # output stops at "running openclaw onboard..." and the sandbox session
+    # exits). Wrap the call in `set +e` / `set -e` so a non-zero onboard is
+    # surfaced as a warning instead of a fatal error.
+    set +e
     HOME=/home/agent timeout 600 openclaw onboard --non-interactive \
       --mode local \
       --auth-choice apiKey \
@@ -734,7 +741,8 @@ DIAG_EOF
       --accept-risk \
       </dev/null >/tmp/openclaw-onboard.log 2>&1
     _onboard_rc=$?
-    if [ $_onboard_rc -eq 0 ]; then
+    set -e
+    if [ "$_onboard_rc" -eq 0 ]; then
       echo "setup.sh: openclaw onboard complete (auth profile written)"
     else
       echo "setup.sh: warning: openclaw onboard exited $_onboard_rc — last 30 lines of log:" >&2

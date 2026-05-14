@@ -152,7 +152,8 @@
       "Bash(docker context *)",
       "Bash(bash *)",
       "Bash(command -v openclaw)",
-      "Read(//usr/**)"
+      "Read(//usr/**)",
+      "Bash(grep -n '_rc=\\\\$?\\\\|=\\\\$?' /mnt/c/Users/dines/OneDrive/Desktop/work/openeral/sandboxes/openeral/setup.sh)"
     ]
   }
 }
