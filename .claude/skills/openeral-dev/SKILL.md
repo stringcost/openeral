@@ -1,6 +1,6 @@
 ---
 name: openeral-dev
-description: Develop and verify the current Openeral/OpenShell k3s flow with persistent /sandbox backed by PostgreSQL
+description: Develop and verify the current Openeral/OpenShell k3s flow with durable /sandbox backed by PostgreSQL
 disable-model-invocation: false
 user-invocable: true
 allowed-tools: Read, Grep, Glob, Bash
@@ -13,17 +13,31 @@ Optimize for one product result:
 
 - OpenShell runs through the embedded-k3s path
 - Openeral storage is mounted at `/sandbox`
-- `/.db` is exposed as read-only database context under `/sandbox/.db`
-- Claude runs with `HOME=/sandbox`
-- workspace files and `.claude` state persist in PostgreSQL
+- `/.db` is read-only database context under `/sandbox/.db`
+- workspace rows persist in PostgreSQL
+
+## Current Verified State
+
+Verified:
+
+- `OPENERAL_DATABASE_URL` works when shell-sourced from `.env`
+- `/sandbox` and `/.db` behave correctly
+- same-name recreate preserves workspace state
+- the truncate/overwrite storage bug against Supabase is fixed
+
+Still open:
+
+- clean final `claude -p` completion through `openshell sandbox exec`
+
+Do not collapse those into one “everything is green” story.
 
 ## Environment Contract
 
-The supported external database variable is:
+The supported external DB variable is:
 
 - `OPENERAL_DATABASE_URL`
 
-The shell must source `.env` explicitly before any live run:
+The shell must source `.env` explicitly:
 
 ```bash
 set -a
@@ -31,23 +45,25 @@ set -a
 set +a
 ```
 
-Do not add dotenv loading inside the binaries.
+No dotenv loading belongs inside the binaries.
 
 ## Verification Order
 
-External database preflight:
+Preflight:
 
 ```bash
 psql "$OPENERAL_DATABASE_URL" -Atqc 'select 1'
 ```
 
-Current live external-DB proof:
+Regression for the fixed truncate path:
 
 ```bash
-bash tests/test_live_supabase_env.sh
+TEST_DATABASE_URL="$OPENERAL_DATABASE_URL" \
+  cargo test -p openeral-core \
+  test_update_file_attrs_truncate_and_overwrite_sequence -- --nocapture
 ```
 
-Deterministic lower-level checks remain:
+Deterministic local checks:
 
 ```bash
 cargo test -p openeral-core
@@ -55,17 +71,24 @@ bash tests/test_fuse_mount.sh
 bash tests/test_live_secret_injection.sh
 ```
 
+Current live external-DB check:
+
+```bash
+bash tests/test_live_supabase_env.sh
+```
+
 ## Files That Matter Most
 
-- `tests/test_live_supabase_env.sh` — live external-DB validation
-- `crates/openeral-csi/src/main.rs` — CSI node/controller behavior and database env consumption
-- `crates/openeral-core/src/fs/sandbox.rs` — `/sandbox` plus `/.db` filesystem shape
-- `crates/openeral-core/src/db/queries/workspace.rs` — persisted workspace rows
-- `README.md` — shell-sourced external DB contract
+- `crates/openeral-core/src/fs/sandbox.rs`
+- `crates/openeral-core/src/db/queries/workspace.rs`
+- `crates/openeral-csi/src/main.rs`
+- `tests/test_live_supabase_env.sh`
+- `sandboxes/openeral/policy.yaml`
 
 ## Hard Rules
 
-- Do not switch the supported external DB variable back to `POSTGRES_URL`.
-- Do not document `/home/agent` or top-level `/db` as the current runtime.
-- Do not treat a failing `psql "$OPENERAL_DATABASE_URL"` preflight as an Openeral bug.
-- Keep CI/local deterministic tests separate from the real Supabase validation path.
+- Do not switch the docs back to `/home/agent`.
+- Do not reintroduce `POSTGRES_URL` as the supported external contract.
+- Do not treat a failing `psql` preflight as an Openeral runtime bug.
+- Keep the known Claude completion gap explicit until it is actually fixed and
+  reverified.
