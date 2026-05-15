@@ -149,3 +149,72 @@ impl MetadataCache {
         self.row_counts.clear();
     }
 }
+
+pub struct WorkspaceCache {
+    ttl: Duration,
+    files: DashMap<String, CacheEntry<Option<WorkspaceFile>>>,
+    children: DashMap<String, CacheEntry<Vec<WorkspaceFile>>>,
+}
+
+impl WorkspaceCache {
+    pub fn new(ttl: Duration) -> Self {
+        Self {
+            ttl,
+            files: DashMap::new(),
+            children: DashMap::new(),
+        }
+    }
+
+    pub fn get_file(&self, path: &str) -> Option<Option<WorkspaceFile>> {
+        self.files.get(path).and_then(|entry| {
+            if entry.is_valid(self.ttl) {
+                Some(entry.data.clone())
+            } else {
+                None
+            }
+        })
+    }
+
+    pub fn set_file(&self, path: &str, file: Option<WorkspaceFile>) {
+        self.files.insert(
+            path.to_string(),
+            CacheEntry {
+                data: file,
+                inserted_at: Instant::now(),
+            },
+        );
+    }
+
+    pub fn invalidate_file(&self, path: &str) {
+        self.files.remove(path);
+    }
+
+    pub fn get_children(&self, parent_path: &str) -> Option<Vec<WorkspaceFile>> {
+        self.children.get(parent_path).and_then(|entry| {
+            if entry.is_valid(self.ttl) {
+                Some(entry.data.clone())
+            } else {
+                None
+            }
+        })
+    }
+
+    pub fn set_children(&self, parent_path: &str, children: Vec<WorkspaceFile>) {
+        self.children.insert(
+            parent_path.to_string(),
+            CacheEntry {
+                data: children,
+                inserted_at: Instant::now(),
+            },
+        );
+    }
+
+    pub fn invalidate_children(&self, parent_path: &str) {
+        self.children.remove(parent_path);
+    }
+
+    pub fn invalidate_all(&self) {
+        self.files.clear();
+        self.children.clear();
+    }
+}

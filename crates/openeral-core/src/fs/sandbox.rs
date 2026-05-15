@@ -16,7 +16,7 @@ use crate::db::queries::workspace as ws_queries;
 use crate::db::types::WorkspaceFile;
 use crate::error::FsError;
 use crate::fs::attr::BLOCK_SIZE;
-use crate::fs::cache::MetadataCache;
+use crate::fs::cache::{MetadataCache, WorkspaceCache};
 use crate::fs::inode::{InodeTable, NodeIdentity};
 use crate::fs::nodes::{self, NodeContext};
 use crate::fs::workspace_inode::WorkspaceInodeTable;
@@ -63,6 +63,7 @@ pub struct SandboxFilesystem {
     db_nodes: DashMap<String, NodeIdentity>,
     db_inode_table: InodeTable,
     db_cache: MetadataCache,
+    workspace_cache: WorkspaceCache,
     db_config: MountConfig,
     open_files: DashMap<u64, OpenFileHandle>,
     next_fh: std::sync::atomic::AtomicU64,
@@ -91,6 +92,7 @@ impl SandboxFilesystem {
             db_nodes,
             db_inode_table: InodeTable::new(),
             db_cache: MetadataCache::new(db_config.cache_ttl),
+            workspace_cache: WorkspaceCache::new(Duration::from_secs(1)),
             db_config,
             open_files: DashMap::new(),
             next_fh: std::sync::atomic::AtomicU64::new(1),
@@ -196,6 +198,69 @@ impl SandboxFilesystem {
         self.db_nodes.get(path).map(|entry| entry.clone())
     }
 
+    fn parent_path(path: &str) -> Option<String> {
+        if path == "/" {
+            return None;
+        }
+
+        let (parent, _) = path.rsplit_once('/')?;
+        if parent.is_empty() {
+            Some("/".to_string())
+        } else {
+            Some(parent.to_string())
+        }
+    }
+
+    fn workspace_get_file(&self, path: &str) -> Result<WorkspaceFile, FsError> {
+        if let Some(cached) = self.workspace_cache.get_file(path) {
+            return cached.ok_or(FsError::NotFound);
+        }
+
+        match self
+            .rt
+            .block_on(ws_queries::get_file(&self.pool, &self.workspace_id, path))
+        {
+            Ok(file) => {
+                self.workspace_cache.set_file(path, Some(file.clone()));
+                Ok(file)
+            }
+            Err(FsError::NotFound) => {
+                self.workspace_cache.set_file(path, None);
+                Err(FsError::NotFound)
+            }
+            Err(err) => Err(err),
+        }
+    }
+
+    fn workspace_list_children(&self, parent_path: &str) -> Result<Vec<WorkspaceFile>, FsError> {
+        if let Some(cached) = self.workspace_cache.get_children(parent_path) {
+            return Ok(cached);
+        }
+
+        let children = self
+            .rt
+            .block_on(ws_queries::list_children(
+                &self.pool,
+                &self.workspace_id,
+                parent_path,
+            ))?;
+
+        for child in &children {
+            self.workspace_cache.set_file(&child.path, Some(child.clone()));
+        }
+        self.workspace_cache
+            .set_children(parent_path, children.clone());
+        Ok(children)
+    }
+
+    fn invalidate_workspace_path(&self, path: &str) {
+        self.workspace_cache.invalidate_file(path);
+        self.workspace_cache.invalidate_children(path);
+        if let Some(parent_path) = Self::parent_path(path) {
+            self.workspace_cache.invalidate_children(&parent_path);
+        }
+    }
+
     fn db_attr_for_path(&self, path: &str) -> Result<FileAttr, FsError> {
         if path == DB_ROOT {
             return Ok(crate::fs::attr::dir_attr(self.inodes.get_or_insert(DB_ROOT)));
@@ -213,11 +278,7 @@ impl SandboxFilesystem {
 
     fn readdir_root(&self, offset: u64, mut reply: ReplyDirectory) {
         let path = "/".to_string();
-        let children = match self.rt.block_on(ws_queries::list_children(
-            &self.pool,
-            &self.workspace_id,
-            &path,
-        )) {
+        let children = match self.workspace_list_children(&path) {
             Ok(c) => c,
             Err(e) => {
                 debug!("sandbox readdir root failed: {}", e);
@@ -294,6 +355,7 @@ impl SandboxFilesystem {
                 &content,
                 now_ns,
             ))?;
+            self.invalidate_workspace_path(&path);
 
             if let Some(mut h) = self.open_files.get_mut(&fh_u64) {
                 h.dirty = false;
@@ -321,6 +383,7 @@ pub fn mount_at<P: AsRef<Path>>(
             .map(|parallelism| parallelism.get().clamp(4, 16))
             .unwrap_or(4),
     );
+    fuse_config.clone_fd = true;
     fuse_config.mount_options = vec![
         fuser::MountOption::FSName("openeral-sandbox".to_string()),
         fuser::MountOption::Subtype("openeral".to_string()),
@@ -408,11 +471,7 @@ impl Filesystem for SandboxFilesystem {
             return;
         }
 
-        match self.rt.block_on(ws_queries::get_file(
-            &self.pool,
-            &self.workspace_id,
-            &child_path,
-        )) {
+        match self.workspace_get_file(&child_path) {
             Ok(file) => {
                 let child_ino = self.inodes.get_or_insert(&child_path);
                 let attr = Self::file_to_attr(child_ino, &file);
@@ -445,10 +504,7 @@ impl Filesystem for SandboxFilesystem {
             return;
         }
 
-        match self
-            .rt
-            .block_on(ws_queries::get_file(&self.pool, &self.workspace_id, &path))
-        {
+        match self.workspace_get_file(&path) {
             Ok(file) => reply.attr(&TTL, &Self::file_to_attr(ino_u64, &file)),
             Err(e) => reply.error(e.to_errno()),
         }
@@ -518,7 +574,10 @@ impl Filesystem for SandboxFilesystem {
             mtime_ns,
             atime_ns,
         )) {
-            Ok(file) => reply.attr(&TTL, &Self::file_to_attr(ino_u64, &file)),
+            Ok(file) => {
+                self.workspace_cache.set_file(&path, Some(file.clone()));
+                reply.attr(&TTL, &Self::file_to_attr(ino_u64, &file))
+            }
             Err(e) => reply.error(e.to_errno()),
         }
     }
@@ -589,11 +648,7 @@ impl Filesystem for SandboxFilesystem {
             return;
         }
 
-        let children = match self.rt.block_on(ws_queries::list_children(
-            &self.pool,
-            &self.workspace_id,
-            &path,
-        )) {
+        let children = match self.workspace_list_children(&path) {
             Ok(c) => c,
             Err(e) => {
                 reply.error(e.to_errno());
@@ -683,10 +738,7 @@ impl Filesystem for SandboxFilesystem {
             return;
         }
 
-        match self
-            .rt
-            .block_on(ws_queries::get_file(&self.pool, &self.workspace_id, &path))
-        {
+        match self.workspace_get_file(&path) {
             Ok(file) => {
                 if file.is_dir {
                     reply.error(Errno::EISDIR);
@@ -868,6 +920,8 @@ impl Filesystem for SandboxFilesystem {
 
         match self.rt.block_on(ws_queries::create_file(&self.pool, &file)) {
             Ok(()) => {
+                self.workspace_cache.set_file(&child_path, Some(file.clone()));
+                self.workspace_cache.invalidate_children(&parent_path);
                 let child_ino = self.inodes.get_or_insert(&child_path);
                 let attr = Self::file_to_attr(child_ino, &file);
                 let fh = self.alloc_fh();
@@ -951,6 +1005,8 @@ impl Filesystem for SandboxFilesystem {
 
         match self.rt.block_on(ws_queries::create_file(&self.pool, &dir)) {
             Ok(()) => {
+                self.workspace_cache.set_file(&child_path, Some(dir.clone()));
+                self.workspace_cache.invalidate_children(&parent_path);
                 let child_ino = self.inodes.get_or_insert(&child_path);
                 let attr = Self::file_to_attr(child_ino, &dir);
                 reply.entry(&TTL, &attr, Generation(0));
@@ -995,6 +1051,7 @@ impl Filesystem for SandboxFilesystem {
             &child_path,
         )) {
             Ok(()) => {
+                self.invalidate_workspace_path(&child_path);
                 self.inodes.remove(&child_path);
                 reply.ok();
             }
@@ -1038,6 +1095,7 @@ impl Filesystem for SandboxFilesystem {
             &child_path,
         )) {
             Ok(()) => {
+                self.invalidate_workspace_path(&child_path);
                 self.inodes.remove(&child_path);
                 reply.ok();
             }
@@ -1101,11 +1159,7 @@ impl Filesystem for SandboxFilesystem {
             return;
         }
 
-        let is_dir = match self.rt.block_on(ws_queries::get_file(
-            &self.pool,
-            &self.workspace_id,
-            &old_path,
-        )) {
+        let is_dir = match self.workspace_get_file(&old_path) {
             Ok(f) => f.is_dir,
             Err(e) => {
                 reply.error(e.to_errno());
@@ -1136,6 +1190,7 @@ impl Filesystem for SandboxFilesystem {
             }
         }
 
+        self.workspace_cache.invalidate_all();
         self.inodes.rename(&old_path, &new_path);
         reply.ok();
     }
