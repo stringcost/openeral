@@ -835,12 +835,12 @@ if (realKey) {
 }
 // StringCost integration: when ANTHROPIC_BASE_URL is exported (because a
 // StringCost presign resolved earlier in setup.sh), route Anthropic traffic
-// through the proxy. Pi-ai's anthropic provider passes baseURL explicitly to
-// the Anthropic SDK from model.baseUrl (which defaults to api.anthropic.com
-// in pi-ai's static catalog), so ANTHROPIC_BASE_URL env is ignored. The only
-// override pi-ai honors is the per-model baseUrl under
-// agents.defaults.models.<provider>/<id>. We still write the env entry so
-// child processes that use the bare @anthropic-ai/sdk inherit it.
+// through the proxy by overriding the anthropic provider's baseUrl. Per
+// openclaw's schema, baseUrl lives at models.providers.<provider>.baseUrl —
+// NOT at agents.defaults.models.<id>.baseUrl (which only accepts alias/params
+// and is rejected as "out of place" by the gateway's config validator).
+// We also write env.ANTHROPIC_BASE_URL so any child process using the bare
+// @anthropic-ai/sdk inherits it.
 const baseUrl = process.env.ANTHROPIC_BASE_URL || '';
 if (baseUrl) {
   config.env.ANTHROPIC_BASE_URL = baseUrl;
@@ -848,20 +848,17 @@ if (baseUrl) {
   delete config.env.ANTHROPIC_BASE_URL;
 }
 delete config.env.ANTHROPIC_AUTH_TOKEN;
-if (!config.agents.defaults.models) config.agents.defaults.models = {};
-const anthropicModelIds = [
-  'anthropic/claude-sonnet-4-6',
-  'anthropic/claude-opus-4-7',
-];
-for (const mid of anthropicModelIds) {
-  if (!config.agents.defaults.models[mid]) config.agents.defaults.models[mid] = {};
-  if (baseUrl) {
-    config.agents.defaults.models[mid].baseUrl = baseUrl;
-  } else {
-    delete config.agents.defaults.models[mid].baseUrl;
-  }
-}
-if (config.models && config.models.providers && config.models.providers.anthropic) {
+if (baseUrl) {
+  if (!config.models) config.models = {};
+  if (!config.models.mode) config.models.mode = 'merge';
+  if (!config.models.providers) config.models.providers = {};
+  if (!config.models.providers.anthropic) config.models.providers.anthropic = {};
+  config.models.providers.anthropic.baseUrl = baseUrl;
+  // Strip stale fields — apiKey lives in env.ANTHROPIC_API_KEY, and api is
+  // implicit for the built-in anthropic provider.
+  delete config.models.providers.anthropic.apiKey;
+  delete config.models.providers.anthropic.api;
+} else if (config.models && config.models.providers && config.models.providers.anthropic) {
   delete config.models.providers.anthropic.baseUrl;
   delete config.models.providers.anthropic.apiKey;
   delete config.models.providers.anthropic.api;
@@ -979,8 +976,9 @@ if (realKey) {
 }
 // StringCost integration — same logic as the initial openclaw config write
 // above. Re-apply after the gateway's own config rewrite so the proxy URL
-// survives the gateway's startup-time merges. Pi-ai reads baseUrl from
-// agents.defaults.models.<id>.baseUrl, not from env, so we set it there.
+// survives the gateway's startup-time merges. baseUrl lives at
+// models.providers.anthropic.baseUrl (per openclaw's schema); writing it
+// under agents.defaults.models.<id> is rejected by the gateway validator.
 const baseUrl = process.env.ANTHROPIC_BASE_URL || '';
 if (baseUrl) {
   config.env.ANTHROPIC_BASE_URL = baseUrl;
@@ -988,22 +986,15 @@ if (baseUrl) {
   delete config.env.ANTHROPIC_BASE_URL;
 }
 delete config.env.ANTHROPIC_AUTH_TOKEN;
-if (!config.agents) config.agents = {};
-if (!config.agents.defaults) config.agents.defaults = {};
-if (!config.agents.defaults.models) config.agents.defaults.models = {};
-const anthropicModelIds = [
-  'anthropic/claude-sonnet-4-6',
-  'anthropic/claude-opus-4-7',
-];
-for (const mid of anthropicModelIds) {
-  if (!config.agents.defaults.models[mid]) config.agents.defaults.models[mid] = {};
-  if (baseUrl) {
-    config.agents.defaults.models[mid].baseUrl = baseUrl;
-  } else {
-    delete config.agents.defaults.models[mid].baseUrl;
-  }
-}
-if (config.models && config.models.providers && config.models.providers.anthropic) {
+if (baseUrl) {
+  if (!config.models) config.models = {};
+  if (!config.models.mode) config.models.mode = 'merge';
+  if (!config.models.providers) config.models.providers = {};
+  if (!config.models.providers.anthropic) config.models.providers.anthropic = {};
+  config.models.providers.anthropic.baseUrl = baseUrl;
+  delete config.models.providers.anthropic.apiKey;
+  delete config.models.providers.anthropic.api;
+} else if (config.models && config.models.providers && config.models.providers.anthropic) {
   delete config.models.providers.anthropic.baseUrl;
   delete config.models.providers.anthropic.apiKey;
   delete config.models.providers.anthropic.api;
