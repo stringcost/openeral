@@ -4,9 +4,10 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use dashmap::DashMap;
 use fuser::{
-    Errno, FileAttr, FileHandle, FileType, Filesystem, FopenFlags, Generation, INodeNo, OpenFlags,
-    RenameFlags, ReplyAttr, ReplyCreate, ReplyData, ReplyDirectory, ReplyEmpty, ReplyEntry,
-    ReplyOpen, ReplyWrite, Request, TimeOrNow, WriteFlags,
+    Errno, FileAttr, FileHandle, FileType, Filesystem, FopenFlags, Generation, INodeNo,
+    InitFlags, KernelConfig, OpenFlags, RenameFlags, ReplyAttr, ReplyCreate, ReplyData,
+    ReplyDirectory, ReplyEmpty, ReplyEntry, ReplyOpen, ReplyWrite, Request, TimeOrNow,
+    WriteFlags,
 };
 use tracing::{debug, warn};
 
@@ -21,7 +22,10 @@ use crate::fs::inode::{InodeTable, NodeIdentity};
 use crate::fs::nodes::{self, NodeContext};
 use crate::fs::workspace_inode::WorkspaceInodeTable;
 
-const TTL: Duration = Duration::from_secs(1);
+// The sandbox daemon is the only writer to workspace state, so kernel-side
+// dentry/attr caches can live effectively forever. Userspace invalidation
+// handles the mutation paths we control.
+const TTL: Duration = Duration::from_secs(60 * 60 * 24 * 365);
 const DB_ROOT: &str = "/.db";
 
 const SENSITIVE_DIR_NAMES: &[&str] = &[
@@ -416,6 +420,16 @@ pub fn mount_at<P: AsRef<Path>>(
 }
 
 impl Filesystem for SandboxFilesystem {
+    fn init(&mut self, _req: &Request, config: &mut KernelConfig) -> std::io::Result<()> {
+        let _ = config.add_capabilities(
+            InitFlags::FUSE_ASYNC_READ
+                | InitFlags::FUSE_WRITEBACK_CACHE
+                | InitFlags::FUSE_PARALLEL_DIROPS
+                | InitFlags::FUSE_NO_OPENDIR_SUPPORT,
+        );
+        Ok(())
+    }
+
     fn lookup(&self, _req: &Request, parent: INodeNo, name: &OsStr, reply: ReplyEntry) {
         let name_str = match name.to_str() {
             Some(s) => s.to_string(),
