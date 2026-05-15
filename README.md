@@ -141,7 +141,7 @@ chmod -R go-rwx "$OPENERAL_INPUT"
 openshell gateway start
 
 openshell sandbox create --tty --name openeral-openclaw \
-  --from ghcr.io/pavitra-programmers/openeral/sandbox:just-bash \
+  --from ghcr.io/sandys/openeral/sandbox:just-bash \
   --upload "$OPENERAL_INPUT:/sandbox/openeral-input" \
   --provider openclaw --auto-providers \
   -- openeral
@@ -190,7 +190,7 @@ openshell provider create --name openclaw --type generic \
   || openshell provider update openclaw \
     --credential "OPENERAL_AGENT=openclaw"
 
-openshell sandbox create --tty --name openeral-openclaw \
+openshell sandbox create --tty --name openeral-openclaw-stringcost23 \
   --from ghcr.io/sandys/openeral/sandbox:just-bash \
   --upload "$OPENERAL_INPUT:/sandbox/openeral-input" \
   --provider openclaw --auto-providers \
