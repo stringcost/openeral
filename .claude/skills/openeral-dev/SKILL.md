@@ -22,12 +22,15 @@ Verified:
 
 - `OPENERAL_DATABASE_URL` works when shell-sourced from `.env`
 - `/sandbox` and `/.db` behave correctly
+- provider placeholders are visible on the real `sandbox exec` path
 - same-name recreate preserves workspace state
 - the truncate/overwrite storage bug against Supabase is fixed
 
 Still open:
 
 - clean final `claude -p` completion through `openshell sandbox exec`
+- the latest live failure is after storage, provider env, and Anthropic access
+  are already working
 
 Do not collapse those into one “everything is green” story.
 
@@ -76,6 +79,18 @@ Current live external-DB check:
 ```bash
 bash tests/test_live_supabase_env.sh
 ```
+
+Current smoke mechanics:
+
+- repo-built `openshell` is expected to run in a containerized runner
+- the runner can be `openeral/openshell-cli-runner:dev` or `openshell/ci:dev`
+- source images are `openshell/gateway:dev`, `openshell/supervisor:dev`,
+  `openshell/cluster:dev`, plus `openeral/cluster:dev`
+- the stock community base sandbox image is mirrored into the local registry
+- `sandbox create` uses a short-lived initial command so the create call
+  returns before later `sandbox exec` checks
+- `OPENERAL_KEEP_CLUSTER_ON_FAILURE=1` preserves the live cluster for
+  inspection
 
 ## Files That Matter Most
 

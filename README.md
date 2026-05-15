@@ -17,6 +17,8 @@ What is already verified on the current stack:
 - `OPENERAL_DATABASE_URL` from a shell-sourced `.env` works with plain `psql`
 - `/sandbox` mounts successfully on the k3s/CSI path
 - `/.db` exists and rejects writes
+- `sandbox exec` child processes see provider placeholders such as
+  `ANTHROPIC_API_KEY=openshell:resolve:env:ANTHROPIC_API_KEY`
 - workspace writes persist to `_openeral.workspace_files`
 - deleting and recreating the same sandbox name on the same database preserves
   `/sandbox` state
@@ -31,10 +33,11 @@ The remaining known issue is the final `claude -p ...` completion path through
 Current understanding:
 
 - the storage path is working
+- the provider-env placeholder path is working
 - the policy path for Claude traffic is working
-- Claude starts and makes allowed Anthropic requests
-- but the outer `sandbox exec` / SSH completion path still does not return a
-  clean final result consistently
+- Claude starts and reaches Claude Code / Anthropic endpoints
+- but the final `claude -p ...` completion still does not return cleanly within
+  the current smoke timeout
 
 Do not read the current docs as claiming a fully clean “READY / READY-AGAIN”
 Supabase smoke yet.
@@ -115,13 +118,21 @@ not end users. It validates:
 
 - `psql` preflight
 - gateway/cluster startup
+- provider placeholder projection on the real `sandbox exec` path
 - `/sandbox` mount
 - `/.db` existence and write denial
 - Postgres-backed workspace persistence
 - same-name recreate persistence
 
-It also exercises the current Claude path, but the final `claude -p` completion
-is still the known gap.
+Implementation details that matter for the live harness:
+
+- it prefers a repo-built `openshell` binary run inside a containerized runner
+- it stages the stock community sandbox image through the local registry
+- it uses a short-lived initial create command so `sandbox create` returns
+- it keeps the cluster on failure when `OPENERAL_KEEP_CLUSTER_ON_FAILURE=1`
+
+It also exercises the current Claude path, but the final `claude -p`
+completion is still the known gap.
 
 ## OpenShell CLI
 
@@ -130,6 +141,9 @@ Use a matching `openshell` binary. For repo work, prefer a repo-built CLI:
 ```bash
 export OPENSHELL_BIN="$PWD/.tmp/openshell-target/release/openshell"
 ```
+
+In this repo, the host `PATH` may still point at an older `openshell`. The
+live harness prefers a repo-built binary inside a runner image when available.
 
 If `OPENSHELL_BIN` is unset, the live script falls back to:
 
@@ -144,12 +158,14 @@ registry. In the default path it expects these images to exist locally:
 
 - `openshell/cluster:dev`
 - `openeral/cluster:dev`
-- `openeral/gateway:dev`
-- `openeral/supervisor:dev`
-- `openeral/openshell-cli-runner:dev`
+- `openshell/gateway:dev`
+- `openshell/supervisor:dev`
+- either `openeral/openshell-cli-runner:dev` or `openshell/ci:dev`
+- `ghcr.io/nvidia/openshell-community/sandboxes/base:latest` is pulled
+  locally and mirrored to `127.0.0.1:5000/openeral/sandbox-base:latest`
 
-The script will tag and push the cluster/gateway/supervisor images into the
-local registry path it uses for the run.
+The script mirrors the cluster, gateway, supervisor, and sandbox base images
+into the local registry path it uses for the run.
 
 ## Related Docs
 

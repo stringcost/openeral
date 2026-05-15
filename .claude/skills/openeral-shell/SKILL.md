@@ -35,14 +35,15 @@ Verified now:
 
 - `/sandbox` mounts
 - `/.db` exists and is read-only
+- `sandbox exec` children see provider placeholders
 - workspace writes persist to `_openeral.workspace_files`
 - same-name recreate on the same database restores state
 - Claude starts and reaches Anthropic
 
 Known gap:
 
-- the final `claude -p ...` completion path through `openshell sandbox exec`
-  still does not return cleanly in every run
+- the final `claude -p ...` completion path still does not return cleanly
+  within the current smoke timeout
 
 ## Live Validation
 
@@ -56,6 +57,14 @@ Treat that as the current live harness for the shell-sourced Supabase flow. It
 is the best storage/persistence proof, but it should not yet be described as a
 fully green Claude smoke.
 
+Current harness behavior that matters:
+
+- it prefers a repo-built `openshell` binary inside a runner image
+- it can fall back from `openeral/openshell-cli-runner:dev` to
+  `openshell/ci:dev`
+- it mirrors the stock community base sandbox image into the local registry
+- it uses a short-lived initial create command so `sandbox create` returns
+
 ## OpenShell CLI
 
 Prefer a repo-built `openshell` binary:
@@ -63,6 +72,9 @@ Prefer a repo-built `openshell` binary:
 ```bash
 export OPENSHELL_BIN="$PWD/.tmp/openshell-target/release/openshell"
 ```
+
+Do not assume the host `openshell` on `PATH` is the right binary for repo
+validation. The shell path may still point at an older install.
 
 The validation path expects the current local dev images and local registry
 mirror to exist or be built first.
