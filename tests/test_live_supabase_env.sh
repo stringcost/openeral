@@ -39,20 +39,28 @@ resolve_openshell_bin() {
 
 OPENSHELL_BIN="$(resolve_openshell_bin)"
 DOCKER_GID="$(stat -c '%g' /var/run/docker.sock)"
-RUNNER_IMAGE="${OPENSHELL_RUNNER_IMAGE:-openeral/openshell-cli-runner:dev}"
+if [ -n "${OPENSHELL_RUNNER_IMAGE:-}" ]; then
+  RUNNER_IMAGE="$OPENSHELL_RUNNER_IMAGE"
+elif docker image inspect openeral/openshell-cli-runner:dev >/dev/null 2>&1; then
+  RUNNER_IMAGE="openeral/openshell-cli-runner:dev"
+else
+  RUNNER_IMAGE="openshell/ci:dev"
+fi
 runner_state_dir="$repo_root/.tmp/openshell-cli"
 mkdir -p "$runner_state_dir"
 
 : "${OPENERAL_DATABASE_URL:?Missing OPENERAL_DATABASE_URL in environment or .env}"
 : "${ANTHROPIC_API_KEY:?Missing ANTHROPIC_API_KEY in environment or .env}"
 
-gateway_name="${OPENSHELL_GATEWAY_NAME:-openeral-supabase-$(date -u +%Y%m%d%H%M%S)}"
+run_id="$(date -u +%Y%m%d%H%M%S)"
+gateway_name="${OPENSHELL_GATEWAY_NAME:-openeral-supabase-${run_id}}"
 gateway_host="${OPENSHELL_GATEWAY_HOST:-host.docker.internal}"
 cluster_container="openshell-cluster-${gateway_name}"
-sandbox_name="${OPENERAL_SUPABASE_SANDBOX_NAME:-openeral-supabase}"
+sandbox_name="${OPENERAL_SUPABASE_SANDBOX_NAME:-openeral-supabase-${run_id}}"
 db_provider="${OPENERAL_SUPABASE_DB_PROVIDER:-openeral-db-${gateway_name}}"
 claude_provider="${OPENERAL_SUPABASE_CLAUDE_PROVIDER:-openeral-claude-${gateway_name}}"
-sandbox_image="${OPENERAL_SUPABASE_SANDBOX_IMAGE:-ghcr.io/nvidia/openshell-community/sandboxes/base:latest}"
+sandbox_source_image="${OPENERAL_SUPABASE_SANDBOX_SOURCE_IMAGE:-ghcr.io/nvidia/openshell-community/sandboxes/base:latest}"
+sandbox_image="${OPENERAL_SUPABASE_SANDBOX_IMAGE:-$sandbox_source_image}"
 policy_path="${OPENERAL_SUPABASE_POLICY_PATH:-$repo_root/sandboxes/openeral/policy.yaml}"
 policy_path_arg="$policy_path"
 case "$policy_path_arg" in
@@ -72,8 +80,45 @@ image_tag="${IMAGE_TAG:-dev}"
 push_images="${OPENSHELL_PUSH_IMAGES:-}"
 gateway_registry_image="${OPENERAL_GATEWAY_REGISTRY_IMAGE:-${image_repo_base}/gateway:${image_tag}}"
 supervisor_registry_image="${OPENERAL_SUPERVISOR_REGISTRY_IMAGE:-${image_repo_base}/supervisor:${image_tag}}"
-gateway_source_image="${OPENERAL_GATEWAY_SOURCE_IMAGE:-openeral/gateway:dev}"
-supervisor_source_image="${OPENERAL_SUPERVISOR_SOURCE_IMAGE:-openeral/supervisor:dev}"
+sandbox_registry_image="${OPENERAL_SUPABASE_SANDBOX_REGISTRY_IMAGE:-${image_repo_base}/sandbox-base:latest}"
+gateway_source_image="${OPENERAL_GATEWAY_SOURCE_IMAGE:-openshell/gateway:dev}"
+supervisor_source_image="${OPENERAL_SUPERVISOR_SOURCE_IMAGE:-openshell/supervisor:dev}"
+claude_exec_timeout="${OPENERAL_CLAUDE_EXEC_TIMEOUT_SECS:-240}"
+keep_cluster_on_failure="${OPENERAL_KEEP_CLUSTER_ON_FAILURE:-0}"
+preload_timeout_secs="${OPENERAL_PRELOAD_TIMEOUT_SECS:-180}"
+
+dump_failure_state() {
+  echo "== failure dump: cluster/container state ==" >&2
+  docker ps --format '{{.Names}}\t{{.Status}}' | rg 'openshell|openeral-registry' -n >&2 || true
+
+  if ! docker ps --format '{{.Names}}' | grep -qx "$cluster_container"; then
+    echo "Cluster container ${cluster_container} is not running; skipping kubectl dumps" >&2
+    return 0
+  fi
+
+  echo "== failure dump: pods ==" >&2
+  docker exec "$cluster_container" kubectl -n openshell get pods -o wide >&2 || true
+
+  echo "== failure dump: sandbox CR ==" >&2
+  docker exec "$cluster_container" \
+    kubectl -n openshell get "sandboxes.agents.x-k8s.io/${sandbox_name}" -o yaml >&2 || true
+
+  echo "== failure dump: openshell-0 logs ==" >&2
+  docker exec "$cluster_container" \
+    kubectl -n openshell logs pod/openshell-0 --tail=200 >&2 || true
+
+  echo "== failure dump: sandbox pod logs ==" >&2
+  docker exec "$cluster_container" \
+    kubectl -n openshell logs "pod/${sandbox_name}" --all-containers=true --tail=200 >&2 || true
+
+  echo "== failure dump: csi controller logs ==" >&2
+  docker exec "$cluster_container" \
+    kubectl -n openshell logs deploy/openeral-csi-controller --all-containers=true --tail=200 >&2 || true
+
+  echo "== failure dump: csi node logs ==" >&2
+  docker exec "$cluster_container" \
+    kubectl -n openshell logs daemonset/openeral-csi-node --all-containers=true --tail=200 >&2 || true
+}
 
 pick_port() {
   python3 - "$@" <<'PY'
@@ -163,6 +208,12 @@ PY
       docker tag "$cluster_source_image" "$cluster_image"
       docker tag "$gateway_source_image" "$gateway_registry_image"
       docker tag "$supervisor_source_image" "$supervisor_registry_image"
+      if [ "$sandbox_image" = "$sandbox_source_image" ]; then
+        docker image inspect "$sandbox_source_image" >/dev/null 2>&1 || docker pull "$sandbox_source_image" >/dev/null
+        docker tag "$sandbox_source_image" "$sandbox_registry_image"
+        docker push "$sandbox_registry_image" >/dev/null
+        sandbox_image="$sandbox_registry_image"
+      fi
       docker push "$cluster_image" >/dev/null
       docker push "$gateway_registry_image" >/dev/null
       docker push "$supervisor_registry_image" >/dev/null
@@ -214,7 +265,15 @@ run_cli() {
 }
 
 cleanup() {
+  local status=$?
   set +e
+  if [ "$status" -ne 0 ]; then
+    dump_failure_state || true
+    if [ "$keep_cluster_on_failure" = "1" ]; then
+      echo "Preserving gateway ${gateway_name} and sandbox ${sandbox_name} for inspection" >&2
+      return
+    fi
+  fi
   run_cli sandbox delete --gateway "$gateway_name" "$sandbox_name" >/dev/null 2>&1 || true
   run_cli gateway destroy --name "$gateway_name" >/dev/null 2>&1 || true
 }
@@ -290,8 +349,12 @@ stabilize_gateway_runtime() {
 }
 
 preload_sandbox_image() {
-  docker exec "$cluster_container" \
-    sh -lc "crictl pull '$sandbox_image' >/dev/null"
+  if timeout "${preload_timeout_secs}" \
+    docker exec "$cluster_container" sh -lc "crictl pull '$sandbox_image' >/dev/null"; then
+    return 0
+  fi
+
+  echo "Sandbox image preload did not finish within ${preload_timeout_secs}s; continuing without preload" >&2
 }
 
 echo "== preflight psql =="
@@ -344,7 +407,7 @@ if ! DATABASE_URL="$OPENERAL_DATABASE_URL" ANTHROPIC_API_KEY="$ANTHROPIC_API_KEY
     --provider "$claude_provider" \
     --policy "$policy_path_arg" \
     --no-auto-providers \
-    --no-tty -- env HOME=/sandbox sleep infinity >"$create_log" 2>&1; then
+    --no-tty -- /usr/bin/env HOME=/sandbox /bin/true >"$create_log" 2>&1; then
   cat "$create_log" >&2
 fi
 rm -f "$create_log"
@@ -366,6 +429,13 @@ run_cli sandbox exec --gateway "$gateway_name" --name "$sandbox_name" --no-tty /
 
 echo "== verify /.db exists =="
 run_cli sandbox exec --gateway "$gateway_name" --name "$sandbox_name" --no-tty /usr/bin/test -d /sandbox/.db
+
+echo "== verify provider env placeholder =="
+provider_env="$(
+  run_cli sandbox exec --gateway "$gateway_name" --name "$sandbox_name" --no-tty /usr/bin/env
+)"
+printf '%s\n' "$provider_env"
+printf '%s\n' "$provider_env" | grep -q '^ANTHROPIC_API_KEY=openshell:resolve:env:ANTHROPIC_API_KEY$'
 
 echo "== write workspace file =="
 run_cli sandbox exec --gateway "$gateway_name" --name "$sandbox_name" --no-tty \
@@ -392,12 +462,21 @@ printf '%s\n' "$workspace_row"
 printf '%s\n' "$workspace_row" | grep -q '|/e2e.txt|persist-ok'
 
 echo "== claude =="
-claude_output="$(
-  run_cli sandbox exec --gateway "$gateway_name" --name "$sandbox_name" --no-tty \
-    /usr/bin/env HOME=/sandbox claude -p 'Reply with READY and nothing else.'
-)"
-printf '%s\n' "$claude_output"
-printf '%s\n' "$claude_output" | grep -q 'READY'
+claude_stdout="$(mktemp)"
+claude_stderr="$(mktemp)"
+if ! run_cli sandbox exec --gateway "$gateway_name" --name "$sandbox_name" \
+  --timeout "$claude_exec_timeout" --no-tty \
+  /bin/sh -lc "claude -p 'Reply with READY and nothing else.' < /dev/null" \
+  >"$claude_stdout" 2>"$claude_stderr"; then
+  cat "$claude_stdout"
+  cat "$claude_stderr" >&2
+  rm -f "$claude_stdout" "$claude_stderr"
+  exit 1
+fi
+cat "$claude_stdout"
+cat "$claude_stderr" >&2
+grep -q 'READY' "$claude_stdout"
+rm -f "$claude_stdout" "$claude_stderr"
 
 echo "== claude row count =="
 claude_rows="$(
@@ -423,7 +502,7 @@ if ! DATABASE_URL="$OPENERAL_DATABASE_URL" ANTHROPIC_API_KEY="$ANTHROPIC_API_KEY
     --provider "$claude_provider" \
     --policy "$policy_path_arg" \
     --no-auto-providers \
-    --no-tty -- env HOME=/sandbox sleep infinity >"$recreate_log" 2>&1; then
+    --no-tty -- /usr/bin/env HOME=/sandbox /bin/true >"$recreate_log" 2>&1; then
   cat "$recreate_log" >&2
 fi
 rm -f "$recreate_log"
@@ -445,11 +524,20 @@ printf '%s\n' "$persisted_claude_rows"
 [ "${persisted_claude_rows:-0}" -gt 0 ]
 
 echo "== claude after recreate =="
-claude_again="$(
-  run_cli sandbox exec --gateway "$gateway_name" --name "$sandbox_name" --no-tty \
-    /usr/bin/env HOME=/sandbox claude -p 'Reply with READY-AGAIN and nothing else.'
-)"
-printf '%s\n' "$claude_again"
-printf '%s\n' "$claude_again" | grep -q 'READY-AGAIN'
+claude_stdout="$(mktemp)"
+claude_stderr="$(mktemp)"
+if ! run_cli sandbox exec --gateway "$gateway_name" --name "$sandbox_name" \
+  --timeout "$claude_exec_timeout" --no-tty \
+  /bin/sh -lc "claude -p 'Reply with READY-AGAIN and nothing else.' < /dev/null" \
+  >"$claude_stdout" 2>"$claude_stderr"; then
+  cat "$claude_stdout"
+  cat "$claude_stderr" >&2
+  rm -f "$claude_stdout" "$claude_stderr"
+  exit 1
+fi
+cat "$claude_stdout"
+cat "$claude_stderr" >&2
+grep -q 'READY-AGAIN' "$claude_stdout"
+rm -f "$claude_stdout" "$claude_stderr"
 
 echo "Supabase .env validation passed"

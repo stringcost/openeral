@@ -312,6 +312,15 @@ pub fn mount_at<P: AsRef<Path>>(
 ) -> Result<(), FsError> {
     let fs = SandboxFilesystem::new(pool, config, rt);
     let mut fuse_config = fuser::Config::default();
+    // Claude startup fans out many metadata and open calls across /sandbox.
+    // With fuser's default single-thread event loop, one slow lookup against
+    // the PostgreSQL-backed workspace can stall the whole mount. Use a small
+    // multi-thread pool on Linux so unrelated requests can progress.
+    fuse_config.n_threads = Some(
+        std::thread::available_parallelism()
+            .map(|parallelism| parallelism.get().clamp(4, 16))
+            .unwrap_or(4),
+    );
     fuse_config.mount_options = vec![
         fuser::MountOption::FSName("openeral-sandbox".to_string()),
         fuser::MountOption::Subtype("openeral".to_string()),
