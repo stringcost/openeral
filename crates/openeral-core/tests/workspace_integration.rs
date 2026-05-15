@@ -208,6 +208,53 @@ async fn test_list_children() {
 }
 
 #[tokio::test]
+async fn test_metadata_queries_omit_content() {
+    let pool = get_pool().await;
+    let ws_id = unique_ws_id("ws-meta");
+    let layout = WorkspaceLayout::default();
+    ws_queries::create_workspace(&pool, &ws_id, None, &layout)
+        .await
+        .unwrap();
+    ws_queries::seed_from_config(&pool, &ws_id, &layout)
+        .await
+        .unwrap();
+
+    let dir = test_dir(&ws_id, "/meta", "/", "meta");
+    ws_queries::create_file(&pool, &dir).await.unwrap();
+
+    let file = test_file(
+        &ws_id,
+        "/meta/blob.txt",
+        "/meta",
+        "blob.txt",
+        b"metadata-should-not-fetch-content",
+    );
+    ws_queries::create_file(&pool, &file).await.unwrap();
+
+    let metadata = ws_queries::get_file_metadata(&pool, &ws_id, "/meta/blob.txt")
+        .await
+        .unwrap();
+    assert_eq!(metadata.name, "blob.txt");
+    assert_eq!(metadata.size, file.size);
+    assert_eq!(metadata.content, None);
+
+    let children = ws_queries::list_children_metadata(&pool, &ws_id, "/meta")
+        .await
+        .unwrap();
+    assert_eq!(children.len(), 1);
+    assert_eq!(children[0].name, "blob.txt");
+    assert_eq!(children[0].size, file.size);
+    assert_eq!(children[0].content, None);
+
+    let full = ws_queries::get_file(&pool, &ws_id, "/meta/blob.txt")
+        .await
+        .unwrap();
+    assert_eq!(full.content, Some(b"metadata-should-not-fetch-content".to_vec()));
+
+    ws_queries::delete_workspace(&pool, &ws_id).await.unwrap();
+}
+
+#[tokio::test]
 async fn test_update_file_content() {
     let pool = get_pool().await;
     let ws_id = unique_ws_id("ws-update");

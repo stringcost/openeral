@@ -218,10 +218,14 @@ impl SandboxFilesystem {
 
         match self
             .rt
-            .block_on(ws_queries::get_file(&self.pool, &self.workspace_id, path))
-        {
+            .block_on(ws_queries::get_file_metadata(
+                &self.pool,
+                &self.workspace_id,
+                path,
+            )) {
             Ok(file) => {
-                self.workspace_cache.set_file(path, Some(file.clone()));
+                self.workspace_cache
+                    .set_file(path, Some(Self::metadata_only(&file)));
                 Ok(file)
             }
             Err(FsError::NotFound) => {
@@ -239,18 +243,34 @@ impl SandboxFilesystem {
 
         let children = self
             .rt
-            .block_on(ws_queries::list_children(
+            .block_on(ws_queries::list_children_metadata(
                 &self.pool,
                 &self.workspace_id,
                 parent_path,
             ))?;
 
         for child in &children {
-            self.workspace_cache.set_file(&child.path, Some(child.clone()));
+            self.workspace_cache
+                .set_file(&child.path, Some(Self::metadata_only(child)));
         }
         self.workspace_cache
             .set_children(parent_path, children.clone());
         Ok(children)
+    }
+
+    fn workspace_get_file_full(&self, path: &str) -> Result<WorkspaceFile, FsError> {
+        let file = self
+            .rt
+            .block_on(ws_queries::get_file(&self.pool, &self.workspace_id, path))?;
+        self.workspace_cache
+            .set_file(path, Some(Self::metadata_only(&file)));
+        Ok(file)
+    }
+
+    fn metadata_only(file: &WorkspaceFile) -> WorkspaceFile {
+        let mut file = file.clone();
+        file.content = None;
+        file
     }
 
     fn invalidate_workspace_path(&self, path: &str) {
@@ -575,7 +595,8 @@ impl Filesystem for SandboxFilesystem {
             atime_ns,
         )) {
             Ok(file) => {
-                self.workspace_cache.set_file(&path, Some(file.clone()));
+                self.workspace_cache
+                    .set_file(&path, Some(Self::metadata_only(&file)));
                 reply.attr(&TTL, &Self::file_to_attr(ino_u64, &file))
             }
             Err(e) => reply.error(e.to_errno()),
@@ -738,7 +759,7 @@ impl Filesystem for SandboxFilesystem {
             return;
         }
 
-        match self.workspace_get_file(&path) {
+        match self.workspace_get_file_full(&path) {
             Ok(file) => {
                 if file.is_dir {
                     reply.error(Errno::EISDIR);
@@ -920,7 +941,8 @@ impl Filesystem for SandboxFilesystem {
 
         match self.rt.block_on(ws_queries::create_file(&self.pool, &file)) {
             Ok(()) => {
-                self.workspace_cache.set_file(&child_path, Some(file.clone()));
+                self.workspace_cache
+                    .set_file(&child_path, Some(Self::metadata_only(&file)));
                 self.workspace_cache.invalidate_children(&parent_path);
                 let child_ino = self.inodes.get_or_insert(&child_path);
                 let attr = Self::file_to_attr(child_ino, &file);
@@ -1005,7 +1027,8 @@ impl Filesystem for SandboxFilesystem {
 
         match self.rt.block_on(ws_queries::create_file(&self.pool, &dir)) {
             Ok(()) => {
-                self.workspace_cache.set_file(&child_path, Some(dir.clone()));
+                self.workspace_cache
+                    .set_file(&child_path, Some(Self::metadata_only(&dir)));
                 self.workspace_cache.invalidate_children(&parent_path);
                 let child_ino = self.inodes.get_or_insert(&child_path);
                 let attr = Self::file_to_attr(child_ino, &dir);

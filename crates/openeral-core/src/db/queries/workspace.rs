@@ -120,6 +120,16 @@ pub async fn get_file(
     get_file_with_client(&client, workspace_id, path).await
 }
 
+/// Get file or directory metadata without fetching file content.
+pub async fn get_file_metadata(
+    pool: &deadpool_postgres::Pool,
+    workspace_id: &str,
+    path: &str,
+) -> Result<WorkspaceFile, FsError> {
+    let client = get_client(pool).await?;
+    get_file_metadata_with_client(&client, workspace_id, path).await
+}
+
 async fn get_file_with_client(
     client: &tokio_postgres::Client,
     workspace_id: &str,
@@ -128,6 +138,26 @@ async fn get_file_with_client(
     let row = client
         .query_opt(
             "SELECT workspace_id, path, parent_path, name, is_dir, content, mode, size, \
+             mtime_ns, ctime_ns, atime_ns, nlink, uid, gid \
+             FROM _openeral.workspace_files \
+             WHERE workspace_id = $1 AND path = $2",
+            &[&workspace_id, &path],
+        )
+        .await?
+        .ok_or(FsError::NotFound)?;
+
+    Ok(row_to_workspace_file(&row))
+}
+
+async fn get_file_metadata_with_client(
+    client: &tokio_postgres::Client,
+    workspace_id: &str,
+    path: &str,
+) -> Result<WorkspaceFile, FsError> {
+    let row = client
+        .query_opt(
+            "SELECT workspace_id, path, parent_path, name, is_dir, \
+             NULL::bytea AS content, mode, size, \
              mtime_ns, ctime_ns, atime_ns, nlink, uid, gid \
              FROM _openeral.workspace_files \
              WHERE workspace_id = $1 AND path = $2",
@@ -149,6 +179,28 @@ pub async fn list_children(
     let rows = client
         .query(
             "SELECT workspace_id, path, parent_path, name, is_dir, content, mode, size, \
+             mtime_ns, ctime_ns, atime_ns, nlink, uid, gid \
+             FROM _openeral.workspace_files \
+             WHERE workspace_id = $1 AND parent_path = $2 \
+             ORDER BY name",
+            &[&workspace_id, &parent_path],
+        )
+        .await?;
+
+    Ok(rows.iter().map(row_to_workspace_file).collect())
+}
+
+/// List child metadata without fetching file content.
+pub async fn list_children_metadata(
+    pool: &deadpool_postgres::Pool,
+    workspace_id: &str,
+    parent_path: &str,
+) -> Result<Vec<WorkspaceFile>, FsError> {
+    let client = get_client(pool).await?;
+    let rows = client
+        .query(
+            "SELECT workspace_id, path, parent_path, name, is_dir, \
+             NULL::bytea AS content, mode, size, \
              mtime_ns, ctime_ns, atime_ns, nlink, uid, gid \
              FROM _openeral.workspace_files \
              WHERE workspace_id = $1 AND parent_path = $2 \
