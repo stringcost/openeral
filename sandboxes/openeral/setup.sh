@@ -269,13 +269,13 @@ try {
   fi
 fi
 
-if [ -z "${STRINGCOST_PROXY_URL:-}" ] && [ -n "${STRINGCOST_API_KEY:-}" ] && [ -n "${ANTHROPIC_API_KEY:-}" ] && [ "$OPENERAL_AGENT" != "openclaw" ]; then
+if [ -z "${STRINGCOST_PROXY_URL:-}" ] && [ -n "${STRINGCOST_API_KEY:-}" ] && [ -n "${ANTHROPIC_API_KEY:-}" ]; then
   case "${ANTHROPIC_API_KEY:-}" in
     openshell:resolve:env:*)
       echo "setup.sh: skipping StringCost presign creation because ANTHROPIC_API_KEY is an OpenShell placeholder; upload a host-created presign.json to /sandbox/openeral-input instead" >&2
       ;;
     *)
-  echo "setup.sh: creating a permanent StringCost presign..."
+  echo "setup.sh: creating a permanent StringCost presign for $OPENERAL_AGENT..."
   mkdir -p "$(dirname "$STRINGCOST_PRESIGN_FILE")"
   STRINGCOST_PRESIGN_ERR=/tmp/openeral-stringcost-presign.err
   rm -f "$STRINGCOST_PRESIGN_ERR"
@@ -287,6 +287,7 @@ const fetch = globalThis.fetch;
   const to = setTimeout(() => controller.abort(), 30000);
   try {
     const apiBase = (process.env.STRINGCOST_API_BASE || 'https://app.stringcost.com').replace(/\/+$/, '');
+    const agent = process.env.OPENERAL_AGENT === 'openclaw' ? 'openclaw' : 'claude-code';
     const r = await fetch(apiBase + '/v1/presign', {
       method: 'POST',
       headers: {
@@ -305,8 +306,8 @@ const fetch = globalThis.fetch;
         // and would be silently dropped.
         metadata: {
           source: 'openeral-sandbox',
-          client: 'claude-code',
-          labels: ['openeral', 'claude-code'],
+          client: agent,
+          labels: ['openeral', agent],
         },
       }),
       signal: controller.signal,
@@ -352,6 +353,17 @@ const fetch = globalThis.fetch;
   rm -f "$STRINGCOST_PRESIGN_ERR"
       ;;
   esac
+fi
+
+# Export ANTHROPIC_BASE_URL once the proxy URL is resolved so every downstream
+# child process inherits it: the openclaw gateway started via `setsid env ...`,
+# the openclaw / claude exec at the end of this script, and any node -e blocks
+# that read process.env.ANTHROPIC_BASE_URL while writing config files.
+# Claude Code ALSO has it explicitly passed in its exec; OpenClaw needs it set
+# in the parent shell because its gateway is launched as a background process
+# that inherits this env.
+if [ -n "${STRINGCOST_PROXY_URL:-}" ]; then
+  export ANTHROPIC_BASE_URL="$STRINGCOST_PROXY_URL"
 fi
 
 # Apply proxy to Claude Code settings if we have one. OpenClaw has no
@@ -821,7 +833,17 @@ if (realKey) {
 } else {
   delete config.env.ANTHROPIC_API_KEY;
 }
-delete config.env.ANTHROPIC_BASE_URL;
+// StringCost integration: when ANTHROPIC_BASE_URL is exported (because a
+// StringCost presign resolved earlier in setup.sh), inject it into openclaw's
+// env block so the gateway and any spawned child processes route Anthropic
+// traffic through the proxy. Without StringCost, this stays unset so traffic
+// goes direct to api.anthropic.com as before.
+const baseUrl = process.env.ANTHROPIC_BASE_URL || '';
+if (baseUrl) {
+  config.env.ANTHROPIC_BASE_URL = baseUrl;
+} else {
+  delete config.env.ANTHROPIC_BASE_URL;
+}
 delete config.env.ANTHROPIC_AUTH_TOKEN;
 if (config.models && config.models.providers && config.models.providers.anthropic) {
   delete config.models.providers.anthropic.baseUrl;
@@ -939,7 +961,15 @@ if (realKey) {
 } else {
   delete config.env.ANTHROPIC_API_KEY;
 }
-delete config.env.ANTHROPIC_BASE_URL;
+// StringCost integration — same logic as the initial openclaw config write
+// above. Re-apply after the gateway's own config rewrite so the proxy URL
+// survives the gateway's startup-time merges.
+const baseUrl = process.env.ANTHROPIC_BASE_URL || '';
+if (baseUrl) {
+  config.env.ANTHROPIC_BASE_URL = baseUrl;
+} else {
+  delete config.env.ANTHROPIC_BASE_URL;
+}
 delete config.env.ANTHROPIC_AUTH_TOKEN;
 if (config.models && config.models.providers && config.models.providers.anthropic) {
   delete config.models.providers.anthropic.baseUrl;
@@ -1007,15 +1037,33 @@ console.log('setup.sh: openclaw auth config applied');
   # gateway process only. Passing it to the TUI/client process causes openclaw
   # to run its own plugin staging loop on startup, which saturates the Node.js
   # event loop and makes the terminal completely unresponsive to keyboard input.
-  exec env -u STRINGCOST_API_KEY -u OPENCLAW_PLUGIN_STAGE_DIR \
-    HOME=/home/agent \
-    SHELL=/usr/local/bin/openeral-bash \
-    PATH="$PATH" \
-    OPENCLAW_NO_RESPAWN=1 \
-    NODE_COMPILE_CACHE=/tmp/openclaw-compile-cache \
-    GIT_SSL_NO_VERIFY=true \
-    npm_config_strict_ssl=false \
-    openclaw "$@"
+  #
+  # When StringCost is active, pass ANTHROPIC_BASE_URL explicitly into the exec
+  # env (mirroring the Claude Code launch below). The export earlier in setup.sh
+  # already covers the gateway-inherit case; this line guarantees the TUI also
+  # sees it even if anything between the export and here has touched the env.
+  if [ -n "${STRINGCOST_PROXY_URL:-}" ]; then
+    exec env -u STRINGCOST_API_KEY -u OPENCLAW_PLUGIN_STAGE_DIR \
+      HOME=/home/agent \
+      SHELL=/usr/local/bin/openeral-bash \
+      PATH="$PATH" \
+      OPENCLAW_NO_RESPAWN=1 \
+      NODE_COMPILE_CACHE=/tmp/openclaw-compile-cache \
+      GIT_SSL_NO_VERIFY=true \
+      npm_config_strict_ssl=false \
+      ANTHROPIC_BASE_URL="$STRINGCOST_PROXY_URL" \
+      openclaw "$@"
+  else
+    exec env -u STRINGCOST_API_KEY -u OPENCLAW_PLUGIN_STAGE_DIR \
+      HOME=/home/agent \
+      SHELL=/usr/local/bin/openeral-bash \
+      PATH="$PATH" \
+      OPENCLAW_NO_RESPAWN=1 \
+      NODE_COMPILE_CACHE=/tmp/openclaw-compile-cache \
+      GIT_SSL_NO_VERIFY=true \
+      npm_config_strict_ssl=false \
+      openclaw "$@"
+  fi
 fi
 
 # Claude Code launch (reached only when OPENERAL_AGENT != openclaw, since openclaw execs above).

@@ -63,7 +63,7 @@ Reuse the same sandbox name on every machine, and point it at the same `DATABASE
 
 Do not pass the database URL through an OpenShell generic provider. PostgreSQL is raw TCP, so the credential must be delivered by `--upload`.
 
-## Add StringCost Tracking
+## Add StringCost Tracking for Claude Code
 
 StringCost is optional. It routes Claude Code API calls through a presigned proxy URL for token and cost metering.
 
@@ -153,7 +153,55 @@ rm -rf "$OPENERAL_INPUT"
 
 > **If Claude Code launches instead of OpenClaw**, the `openclaw` provider was not created or was not passed. Run the `openshell provider create` command above (one-time) and ensure you pass `--provider openclaw` in the sandbox create command.
 
-> **Note:** StringCost cost tracking is supported for Claude Code only. OpenClaw talks to the Anthropic API directly using `ANTHROPIC_API_KEY`.
+> **Note:** For StringCost cost tracking on OpenClaw, see [Add StringCost Tracking for OpenClaw](#add-stringcost-tracking-for-openclaw).
+
+## Add StringCost Tracking for OpenClaw
+
+StringCost is optional. It routes OpenClaw's Anthropic API calls through a presigned proxy URL so token spend, COGS, and revenue land in your StringCost vendor portfolio under the `openclaw` label.
+
+```bash
+export ANTHROPIC_API_KEY='sk-ant-...'
+export STRINGCOST_API_KEY='sk-st-...'
+export DATABASE_URL='postgresql://...'
+export DATABASE_URL="${DATABASE_URL:-${POSTGRES_URL:-}}"
+
+OPENERAL_INPUT="$(mktemp -d)"
+
+curl -fsS https://app.stringcost.com/v1/presign \
+  -H "Authorization: Bearer $STRINGCOST_API_KEY" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "provider": "anthropic",
+    "client_api_key": "'"$ANTHROPIC_API_KEY"'",
+    "path": ["/v1/messages"],
+    "expires_in": -1,
+    "max_uses": -1,
+    "cost_limit": 10000000,
+    "metadata": { "source": "openeral-sandbox", "client": "openclaw", "labels": ["openeral", "openclaw"] }
+  }' \
+  > "$OPENERAL_INPUT/presign.json"
+
+printf '%s' "$ANTHROPIC_API_KEY" > "$OPENERAL_INPUT/anthropic-api-key"
+printf '%s' "$DATABASE_URL"      > "$OPENERAL_INPUT/db-url"
+chmod -R go-rwx "$OPENERAL_INPUT"
+
+openshell provider create --name openclaw --type generic \
+  --credential "OPENERAL_AGENT=openclaw" \
+  || openshell provider update openclaw \
+    --credential "OPENERAL_AGENT=openclaw"
+
+openshell sandbox create --tty --name openeral-openclaw \
+  --from ghcr.io/sandys/openeral/sandbox:just-bash \
+  --upload "$OPENERAL_INPUT:/sandbox/openeral-input" \
+  --provider openclaw --auto-providers \
+  -- openeral
+
+rm -rf "$OPENERAL_INPUT"
+```
+
+Create the presign on the host. Inside OpenShell, provider secrets are placeholders; they work for HTTP headers but not as JSON body values for StringCost's `client_api_key`. The `metadata.labels: ["openeral", "openclaw"]` field is what StringCost's vendor portfolio classifier reads, so OpenClaw usage shows up separately from Claude Code in your dashboard.
+
+`setup.sh` reads the uploaded `presign.json`, exports `ANTHROPIC_BASE_URL` so the openclaw gateway routes all Anthropic traffic through the proxy, and writes the URL into `~/.openclaw/openclaw.json` so reconnect sessions also get the override. The real `ANTHROPIC_API_KEY` is still required — `openclaw onboard` writes it to `~/.openclaw/agents/main/agent/auth-profiles.json`, and the StringCost proxy ignores the inbound `x-api-key` because it authenticates via the token embedded in the proxy URL.
 
 ## Manage Sandboxes
 

@@ -72,9 +72,14 @@ The workspace schema (`_openeral`) is shared — both agents read and write the 
 
 ### StringCost integration
 
-StringCost is supported for **Claude Code only**. The presign is stored at `~/.openeral/presign.json` with `metadata.labels: ['openeral', 'claude-code']` and is created against `STRINGCOST_API_BASE` (defaults to `https://app.stringcost.com`; override for local stacks). The proxy URL regex accepts both `https://proxy.stringcost.com/...` and self-hosted shapes (`http(s)://<host>/stringcost-proxy/t/...`).
+StringCost is supported for **both agents**. The presign is stored at `~/.openeral/presign.json` with `metadata.labels: ['openeral', '<agent>']` — `claude-code` or `openclaw` — and is created against `STRINGCOST_API_BASE` (defaults to `https://app.stringcost.com`; override for local stacks). The proxy URL regex accepts both `https://proxy.stringcost.com/...` and self-hosted shapes (`http(s)://<host>/stringcost-proxy/t/...`).
 
-OpenClaw talks to the Anthropic API directly using `ANTHROPIC_API_KEY` and is not routed through StringCost. The presign-creation block, the `~/.claude/settings.json` write, and the `ANTHROPIC_BASE_URL` env wiring all skip when `OPENERAL_AGENT=openclaw`.
+How each agent consumes the proxy URL:
+
+- **Claude Code** — `setup.sh` writes `ANTHROPIC_BASE_URL` into `~/.claude/settings.json` and passes it explicitly in the `exec` env.
+- **OpenClaw** — `setup.sh` exports `ANTHROPIC_BASE_URL` so the background openclaw gateway inherits it, writes it into `~/.openclaw/openclaw.json`'s `env` block (re-applied after the gateway's own config rewrite), and passes it explicitly in the openclaw `exec` env. The real `ANTHROPIC_API_KEY` is retained in `auth-profiles.json` because `openclaw onboard` requires a key value; StringCost ignores the inbound `x-api-key` since auth is via the proxy URL token.
+
+Both flows also persist `ANTHROPIC_BASE_URL` to `/home/agent/.openeral/env.sh`, which the sandbox `.bashrc` sources on reconnect.
 
 When adding features that differ by agent, gate on `OPENERAL_AGENT` in `setup.sh` (bash) and `process.env.OPENERAL_AGENT` in Node.js.
 
