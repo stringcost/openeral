@@ -833,14 +833,14 @@ if (realKey) {
 } else {
   delete config.env.ANTHROPIC_API_KEY;
 }
-// StringCost integration: when ANTHROPIC_BASE_URL is exported (because a
-// StringCost presign resolved earlier in setup.sh), route Anthropic traffic
-// through the proxy by overriding the anthropic provider's baseUrl. Per
-// openclaw's schema, baseUrl lives at models.providers.<provider>.baseUrl —
-// NOT at agents.defaults.models.<id>.baseUrl (which only accepts alias/params
-// and is rejected as "out of place" by the gateway's config validator).
-// We also write env.ANTHROPIC_BASE_URL so any child process using the bare
-// @anthropic-ai/sdk inherits it.
+// StringCost integration: route Anthropic traffic through the proxy.
+// openclaw's built-in 'anthropic' provider hardcodes api.anthropic.com and
+// ignores models.providers.anthropic.baseUrl for routing (see openclaw
+// issue #56679 — that field is only read for header-shaping). The reliable
+// path is to register a *new* provider name with api: 'anthropic-messages'
+// and re-point anthropic/* model references to the new provider id.
+// env.ANTHROPIC_BASE_URL is still written so any child process using the
+// bare @anthropic-ai/sdk inherits it.
 const baseUrl = process.env.ANTHROPIC_BASE_URL || '';
 if (baseUrl) {
   config.env.ANTHROPIC_BASE_URL = baseUrl;
@@ -852,16 +852,55 @@ if (baseUrl) {
   if (!config.models) config.models = {};
   if (!config.models.mode) config.models.mode = 'merge';
   if (!config.models.providers) config.models.providers = {};
-  if (!config.models.providers.anthropic) config.models.providers.anthropic = {};
-  config.models.providers.anthropic.baseUrl = baseUrl;
-  // Strip stale fields — apiKey lives in env.ANTHROPIC_API_KEY, and api is
-  // implicit for the built-in anthropic provider.
-  delete config.models.providers.anthropic.apiKey;
-  delete config.models.providers.anthropic.api;
-} else if (config.models && config.models.providers && config.models.providers.anthropic) {
-  delete config.models.providers.anthropic.baseUrl;
-  delete config.models.providers.anthropic.apiKey;
-  delete config.models.providers.anthropic.api;
+  // api: 'anthropic-messages' makes openclaw use Anthropic's wire format and
+  // append '/v1/messages' to baseUrl automatically — the StringCost presign
+  // URL has no /v1 suffix so this is correct. apiKey is required by openclaw
+  // but ignored by the StringCost proxy (auth is via the presign token
+  // already embedded in baseUrl).
+  config.models.providers.stringcost = {
+    baseUrl: baseUrl,
+    api: 'anthropic-messages',
+    apiKey: realKey || 'stringcost-presign-auth',
+    models: [
+      { id: 'claude-sonnet-4-6', name: 'Claude Sonnet 4.6', contextWindow: 1000000, maxTokens: 64000 },
+      { id: 'claude-opus-4-7', name: 'Claude Opus 4.7', contextWindow: 1000000, maxTokens: 32000 },
+      { id: 'claude-haiku-4-5', name: 'Claude Haiku 4.5', contextWindow: 200000, maxTokens: 8192 },
+    ],
+  };
+  const remap = id => (typeof id === 'string' && id.startsWith('anthropic/'))
+    ? 'stringcost/' + id.slice('anthropic/'.length) : id;
+  if (config.agents.defaults.model.primary) {
+    config.agents.defaults.model.primary = remap(config.agents.defaults.model.primary);
+  }
+  if (Array.isArray(config.agents.defaults.model.fallbacks)) {
+    config.agents.defaults.model.fallbacks =
+      config.agents.defaults.model.fallbacks.map(remap);
+  }
+  // Strip dead-letter overrides on the built-in anthropic provider.
+  if (config.models.providers.anthropic) {
+    delete config.models.providers.anthropic.baseUrl;
+    delete config.models.providers.anthropic.apiKey;
+    delete config.models.providers.anthropic.api;
+  }
+} else {
+  // No StringCost — remove any stringcost provider/mapping from prior runs.
+  if (config.models && config.models.providers) {
+    delete config.models.providers.stringcost;
+    if (config.models.providers.anthropic) {
+      delete config.models.providers.anthropic.baseUrl;
+      delete config.models.providers.anthropic.apiKey;
+      delete config.models.providers.anthropic.api;
+    }
+  }
+  const restore = id => (typeof id === 'string' && id.startsWith('stringcost/'))
+    ? 'anthropic/' + id.slice('stringcost/'.length) : id;
+  if (config.agents.defaults.model.primary) {
+    config.agents.defaults.model.primary = restore(config.agents.defaults.model.primary);
+  }
+  if (Array.isArray(config.agents.defaults.model.fallbacks)) {
+    config.agents.defaults.model.fallbacks =
+      config.agents.defaults.model.fallbacks.map(restore);
+  }
 }
 fs.mkdirSync(dir, { recursive: true, mode: 0o700 });
 fs.writeFileSync(file, JSON.stringify(config, null, 2), { mode: 0o600 });
@@ -975,10 +1014,10 @@ if (realKey) {
   delete config.env.ANTHROPIC_API_KEY;
 }
 // StringCost integration — same logic as the initial openclaw config write
-// above. Re-apply after the gateway's own config rewrite so the proxy URL
-// survives the gateway's startup-time merges. baseUrl lives at
-// models.providers.anthropic.baseUrl (per openclaw's schema); writing it
-// under agents.defaults.models.<id> is rejected by the gateway validator.
+// above. Re-apply after the gateway's own config rewrite so the custom
+// 'stringcost' provider and remapped model ids survive the gateway's
+// startup-time merges. See openclaw issue #56679 for why we cannot just
+// override the built-in anthropic provider's baseUrl.
 const baseUrl = process.env.ANTHROPIC_BASE_URL || '';
 if (baseUrl) {
   config.env.ANTHROPIC_BASE_URL = baseUrl;
@@ -986,18 +1025,55 @@ if (baseUrl) {
   delete config.env.ANTHROPIC_BASE_URL;
 }
 delete config.env.ANTHROPIC_AUTH_TOKEN;
+if (!config.agents) config.agents = {};
+if (!config.agents.defaults) config.agents.defaults = {};
+if (!config.agents.defaults.model) config.agents.defaults.model = {};
 if (baseUrl) {
   if (!config.models) config.models = {};
   if (!config.models.mode) config.models.mode = 'merge';
   if (!config.models.providers) config.models.providers = {};
-  if (!config.models.providers.anthropic) config.models.providers.anthropic = {};
-  config.models.providers.anthropic.baseUrl = baseUrl;
-  delete config.models.providers.anthropic.apiKey;
-  delete config.models.providers.anthropic.api;
-} else if (config.models && config.models.providers && config.models.providers.anthropic) {
-  delete config.models.providers.anthropic.baseUrl;
-  delete config.models.providers.anthropic.apiKey;
-  delete config.models.providers.anthropic.api;
+  config.models.providers.stringcost = {
+    baseUrl: baseUrl,
+    api: 'anthropic-messages',
+    apiKey: realKey || 'stringcost-presign-auth',
+    models: [
+      { id: 'claude-sonnet-4-6', name: 'Claude Sonnet 4.6', contextWindow: 1000000, maxTokens: 64000 },
+      { id: 'claude-opus-4-7', name: 'Claude Opus 4.7', contextWindow: 1000000, maxTokens: 32000 },
+      { id: 'claude-haiku-4-5', name: 'Claude Haiku 4.5', contextWindow: 200000, maxTokens: 8192 },
+    ],
+  };
+  const remap = id => (typeof id === 'string' && id.startsWith('anthropic/'))
+    ? 'stringcost/' + id.slice('anthropic/'.length) : id;
+  if (config.agents.defaults.model.primary) {
+    config.agents.defaults.model.primary = remap(config.agents.defaults.model.primary);
+  }
+  if (Array.isArray(config.agents.defaults.model.fallbacks)) {
+    config.agents.defaults.model.fallbacks =
+      config.agents.defaults.model.fallbacks.map(remap);
+  }
+  if (config.models.providers.anthropic) {
+    delete config.models.providers.anthropic.baseUrl;
+    delete config.models.providers.anthropic.apiKey;
+    delete config.models.providers.anthropic.api;
+  }
+} else {
+  if (config.models && config.models.providers) {
+    delete config.models.providers.stringcost;
+    if (config.models.providers.anthropic) {
+      delete config.models.providers.anthropic.baseUrl;
+      delete config.models.providers.anthropic.apiKey;
+      delete config.models.providers.anthropic.api;
+    }
+  }
+  const restore = id => (typeof id === 'string' && id.startsWith('stringcost/'))
+    ? 'anthropic/' + id.slice('stringcost/'.length) : id;
+  if (config.agents.defaults.model.primary) {
+    config.agents.defaults.model.primary = restore(config.agents.defaults.model.primary);
+  }
+  if (Array.isArray(config.agents.defaults.model.fallbacks)) {
+    config.agents.defaults.model.fallbacks =
+      config.agents.defaults.model.fallbacks.map(restore);
+  }
 }
 fs.writeFileSync(file, JSON.stringify(config, null, 2), { mode: 0o600 });
 console.log('setup.sh: openclaw auth config applied');
