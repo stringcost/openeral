@@ -29,8 +29,8 @@ landlock:
   compatibility: best_effort
 
 process:
-  run_as_user: sandbox
-  run_as_group: sandbox
+  run_as_user: ubuntu
+  run_as_group: ubuntu
 
 # --- Network policies (queried per-CONNECT request) ---
 #

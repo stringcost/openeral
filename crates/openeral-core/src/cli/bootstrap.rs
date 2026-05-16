@@ -13,6 +13,7 @@ use crate::error::FsError;
 
 const BOOTSTRAP_ENV_PATH: &str = "/tmp/openeral-bootstrap.env";
 const OPENERAL_ENV_REL: &str = ".openeral/env.sh";
+const OPENERAL_CONNECT_CWD_ENV: &str = "OPENERAL_CONNECT_CWD";
 const NPMRC_PATH: &str = "/tmp/openeral-npmrc";
 const OPENCLAW_PORT: &str = "18789";
 
@@ -30,13 +31,17 @@ pub struct BootstrapArgs {
     #[arg(long, value_enum, default_value_t = BootstrapPhase::Prepare)]
     pub phase: BootstrapPhase,
 
-    /// FUSE-backed agent home.
+    /// Local agent home used by child processes.
     #[arg(long, default_value = "/home/agent")]
     pub home: PathBuf,
 
-    /// OpenShell connect-session home, usually /sandbox.
+    /// Durable workspace root used by reconnect sessions, usually /sandbox.
     #[arg(long, default_value = "/sandbox")]
     pub connect_home: PathBuf,
+
+    /// Default working directory for reconnect and exec sessions.
+    #[arg(long, default_value = "/sandbox/project")]
+    pub connect_cwd: PathBuf,
 
     /// File consumed by the OpenShell supervisor for child env additions.
     #[arg(long, default_value = BOOTSTRAP_ENV_PATH)]
@@ -60,6 +65,9 @@ fn prepare(args: BootstrapArgs) -> Result<(), FsError> {
     let agent = agent_kind();
     fs::create_dir_all(&args.home)?;
     fs::create_dir_all(args.home.join(".openeral"))?;
+    if agent == AgentKind::Claude {
+        prepare_claude_home(&args.home, &args.connect_home)?;
+    }
 
     seed_agent_home(&args.home, agent)?;
 
@@ -71,6 +79,10 @@ fn prepare(args: BootstrapArgs) -> Result<(), FsError> {
     let mut child_env = BTreeMap::new();
     child_env.insert("HOME".to_string(), args.home.display().to_string());
     child_env.insert("OPENERAL_HOME".to_string(), args.home.display().to_string());
+    child_env.insert(
+        OPENERAL_CONNECT_CWD_ENV.to_string(),
+        args.connect_cwd.display().to_string(),
+    );
     child_env.insert("NODE_NO_WARNINGS".to_string(), "1".to_string());
 
     if let Some(proxy_url) = &stringcost_proxy_url {
@@ -96,7 +108,7 @@ fn prepare(args: BootstrapArgs) -> Result<(), FsError> {
     }
 
     write_shell_env(&args.home, &child_env)?;
-    if let Err(error) = write_connect_bashrc(&args.connect_home, &args.home) {
+    if let Err(error) = write_connect_bashrc(&args.connect_home, &args.home, &args.connect_cwd) {
         warn!(
             path = %args.connect_home.display(),
             error = %error,
@@ -195,6 +207,91 @@ fn seed_agent_home(home: &Path, agent: AgentKind) -> Result<(), FsError> {
         AgentKind::OpenClaw => {
             fs::create_dir_all(home.join(".openclaw"))?;
         }
+    }
+    Ok(())
+}
+
+fn prepare_claude_home(home: &Path, durable_home: &Path) -> Result<(), FsError> {
+    fs::create_dir_all(durable_home)?;
+    fs::create_dir_all(durable_home.join(".claude"))?;
+    ensure_symlinked_path(
+        &home.join(".claude"),
+        &durable_home.join(".claude"),
+        SymlinkKind::Directory,
+    )?;
+    ensure_symlinked_path(
+        &home.join(".claude.json"),
+        &durable_home.join(".claude.json"),
+        SymlinkKind::File,
+    )?;
+    Ok(())
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum SymlinkKind {
+    File,
+    Directory,
+}
+
+fn ensure_symlinked_path(
+    link_path: &Path,
+    target_path: &Path,
+    _kind: SymlinkKind,
+) -> Result<(), FsError> {
+    if let Some(parent) = link_path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    if let Some(parent) = target_path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+
+    match fs::symlink_metadata(link_path) {
+        Ok(metadata) => {
+            if metadata.file_type().is_symlink() {
+                if fs::read_link(link_path).ok().as_deref() == Some(target_path) {
+                    return Ok(());
+                }
+                fs::remove_file(link_path)?;
+            } else if !target_path.exists() {
+                fs::rename(link_path, target_path)?;
+            } else if metadata.is_dir() {
+                merge_directory_contents(link_path, target_path)?;
+                fs::remove_dir_all(link_path)?;
+            } else {
+                fs::remove_file(link_path)?;
+            }
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => return Err(FsError::IoError(error)),
+    }
+
+    #[cfg(unix)]
+    {
+        std::os::unix::fs::symlink(target_path, link_path)?;
+    }
+    #[cfg(not(unix))]
+    {
+        match _kind {
+            SymlinkKind::File => std::os::windows::fs::symlink_file(target_path, link_path)?,
+            SymlinkKind::Directory => {
+                std::os::windows::fs::symlink_dir(target_path, link_path)?
+            }
+        }
+    }
+
+    Ok(())
+}
+
+fn merge_directory_contents(source_dir: &Path, target_dir: &Path) -> Result<(), FsError> {
+    fs::create_dir_all(target_dir)?;
+    for entry in fs::read_dir(source_dir)? {
+        let entry = entry?;
+        let source_path = entry.path();
+        let target_path = target_dir.join(entry.file_name());
+        if target_path.exists() {
+            continue;
+        }
+        fs::rename(source_path, target_path)?;
     }
     Ok(())
 }
@@ -497,24 +594,79 @@ fn write_shell_env(home: &Path, env: &BTreeMap<String, String>) -> Result<(), Fs
     Ok(())
 }
 
-fn write_connect_bashrc(connect_home: &Path, home: &Path) -> Result<(), FsError> {
+fn write_connect_bashrc(connect_home: &Path, home: &Path, connect_cwd: &Path) -> Result<(), FsError> {
     if connect_home == home {
         return Ok(());
     }
     fs::create_dir_all(connect_home)?;
     let bashrc = connect_home.join(".bashrc");
-    let marker = "openeral-connect";
     let existing = fs::read_to_string(&bashrc).unwrap_or_default();
-    if existing.contains(marker) {
+    let managed_block = render_connect_bashrc_block(home, connect_cwd);
+    if existing.contains(&managed_block) {
         return Ok(());
     }
-    let mut file = OpenOptions::new().create(true).append(true).open(bashrc)?;
-    writeln!(
-        file,
-        "\n# {marker}: set agent HOME for OpenShell reconnect sessions\nexport HOME={}\n[ -f /home/agent/.openeral/env.sh ] && . /home/agent/.openeral/env.sh",
-        shell_quote(&home.display().to_string())
-    )?;
+
+    let cleaned = strip_legacy_connect_block(&existing);
+    let mut file = OpenOptions::new()
+        .create(true)
+        .write(true)
+        .truncate(true)
+        .open(bashrc)?;
+    let needs_newline = !cleaned.is_empty() && !cleaned.ends_with('\n');
+    file.write_all(cleaned.as_bytes())?;
+    if needs_newline {
+        file.write_all(b"\n")?;
+    }
+    file.write_all(managed_block.as_bytes())?;
     Ok(())
+}
+
+fn render_connect_bashrc_block(home: &Path, connect_cwd: &Path) -> String {
+    let env_file = home.join(OPENERAL_ENV_REL);
+    format!(
+        "\n# openeral-connect: managed start\nexport HOME={home}\n[ -f {env_file} ] && . {env_file}\n[ -d {cwd} ] && cd {cwd}\n# openeral-connect: managed end\n",
+        home = shell_quote(&home.display().to_string()),
+        env_file = shell_quote(&env_file.display().to_string()),
+        cwd = shell_quote(&connect_cwd.display().to_string()),
+    )
+}
+
+fn strip_legacy_connect_block(existing: &str) -> String {
+    let mut cleaned = Vec::new();
+    let mut skipping_legacy = false;
+    let mut skipping_managed = false;
+
+    for line in existing.lines() {
+        if line.contains("# openeral-connect: managed start") {
+            skipping_managed = true;
+            continue;
+        }
+        if skipping_managed {
+            if line.contains("# openeral-connect: managed end") {
+                skipping_managed = false;
+            }
+            continue;
+        }
+        if line.contains("# openeral-connect: set agent HOME for OpenShell reconnect sessions") {
+            skipping_legacy = true;
+            continue;
+        }
+        if skipping_legacy
+            && (line.starts_with("export HOME=")
+                || line.starts_with("[ -f /home/agent/.openeral/env.sh ]")
+                || line.starts_with("[ -d /sandbox/project ] && cd "))
+        {
+            continue;
+        }
+        skipping_legacy = false;
+        cleaned.push(line);
+    }
+
+    let mut result = cleaned.join("\n");
+    if !result.is_empty() {
+        result.push('\n');
+    }
+    result
 }
 
 fn write_bootstrap_env(path: &Path, env: &BTreeMap<String, String>) -> Result<(), FsError> {
@@ -604,6 +756,7 @@ fn wait_for_openclaw_ready(timeout: Duration) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::time::{SystemTime, UNIX_EPOCH};
 
     #[test]
     fn normalize_stringcost_url_strips_api_path() {
@@ -620,5 +773,49 @@ mod tests {
     fn socket_npmrc_uses_placeholder_token() {
         let token = placeholder_for("SOCKET_TOKEN");
         assert_eq!(token, "openshell:resolve:env:SOCKET_TOKEN");
+    }
+
+    #[test]
+    fn prepare_claude_home_symlinks_to_durable_workspace() {
+        let base = temp_test_dir("bootstrap-home");
+        let home = base.join("home");
+        let durable = base.join("sandbox");
+        fs::create_dir_all(&home).unwrap();
+        fs::create_dir_all(&durable).unwrap();
+
+        prepare_claude_home(&home, &durable).unwrap();
+
+        assert_eq!(fs::read_link(home.join(".claude")).unwrap(), durable.join(".claude"));
+        assert_eq!(
+            fs::read_link(home.join(".claude.json")).unwrap(),
+            durable.join(".claude.json")
+        );
+
+        fs::remove_dir_all(base).unwrap();
+    }
+
+    #[test]
+    fn connect_bashrc_sets_home_sources_env_and_cd() {
+        let base = temp_test_dir("bootstrap-bashrc");
+        let connect_home = base.join("sandbox");
+        let home = base.join("home");
+        let connect_cwd = connect_home.join("project");
+
+        write_connect_bashrc(&connect_home, &home, &connect_cwd).unwrap();
+        let bashrc = fs::read_to_string(connect_home.join(".bashrc")).unwrap();
+        assert!(bashrc.contains("export HOME="));
+        assert!(bashrc.contains(".openeral/env.sh"));
+        assert!(bashrc.contains("cd"));
+        assert!(bashrc.contains("/project"));
+
+        fs::remove_dir_all(base).unwrap();
+    }
+
+    fn temp_test_dir(prefix: &str) -> PathBuf {
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        std::env::temp_dir().join(format!("openeral-{prefix}-{nanos}"))
     }
 }

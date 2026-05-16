@@ -8,13 +8,17 @@ use crate::error::FsError;
 
 #[derive(Args, Debug)]
 pub struct SessionArgs {
-    /// Live writable sandbox home/workspace.
-    #[arg(long, default_value = "/sandbox")]
+    /// Local agent home used by the child process.
+    #[arg(long, default_value = "/home/agent")]
     pub home: PathBuf,
 
-    /// OpenShell reconnect shell home.
+    /// Durable reconnect shell home.
     #[arg(long, default_value = "/sandbox")]
     pub connect_home: PathBuf,
+
+    /// Default working directory for the child process.
+    #[arg(long, default_value = "/sandbox/project")]
+    pub connect_cwd: PathBuf,
 
     /// Command to execute after preparing the session environment.
     #[arg(trailing_var_arg = true, allow_hyphen_values = true, required = true)]
@@ -27,6 +31,7 @@ pub async fn execute(args: SessionArgs) -> Result<(), FsError> {
         phase: crate::cli::bootstrap::BootstrapPhase::Prepare,
         home: args.home.clone(),
         connect_home: args.connect_home.clone(),
+        connect_cwd: args.connect_cwd.clone(),
         env_out: env_out.clone(),
     })
     .await?;
@@ -36,6 +41,7 @@ pub async fn execute(args: SessionArgs) -> Result<(), FsError> {
             phase: crate::cli::bootstrap::BootstrapPhase::Runtime,
             home: args.home.clone(),
             connect_home: args.connect_home.clone(),
+            connect_cwd: args.connect_cwd.clone(),
             env_out: env_out.clone(),
         })
         .await?;
@@ -51,6 +57,7 @@ pub async fn execute(args: SessionArgs) -> Result<(), FsError> {
     let status = Command::new(program)
         .args(command_args)
         .envs(extra_env)
+        .current_dir(&args.connect_cwd)
         .stdin(Stdio::inherit())
         .stdout(Stdio::inherit())
         .stderr(Stdio::inherit())

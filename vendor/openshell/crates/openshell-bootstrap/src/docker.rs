@@ -20,8 +20,12 @@ use bollard::query_parameters::{
 use futures::StreamExt;
 use miette::{IntoDiagnostic, Result, WrapErr};
 use std::collections::HashMap;
+use std::path::PathBuf;
+use std::process::Command;
 
 const REGISTRY_NAMESPACE_DEFAULT: &str = "openshell";
+const OPENERAL_HOST_PROJECT_ROOT_ENV: &str = "OPENERAL_HOST_PROJECT_ROOT";
+const OPENERAL_CLUSTER_PROJECT_MOUNT_PATH: &str = "/opt/openeral/host-project";
 
 /// Default total HTTP timeout for Docker API calls that stream large payloads
 /// (e.g. `docker save` used by `sandbox create --from`). Bollard's own
@@ -80,6 +84,50 @@ fn env_bool(key: &str) -> Option<bool> {
             "1" | "true" | "yes" | "on"
         )
     })
+}
+
+fn resolve_host_project_root() -> Result<Option<String>> {
+    if let Some(explicit) = env_non_empty(OPENERAL_HOST_PROJECT_ROOT_ENV) {
+        let path = PathBuf::from(&explicit);
+        if !path.is_absolute() {
+            return Err(miette::miette!(
+                "{OPENERAL_HOST_PROJECT_ROOT_ENV} must be an absolute path, got '{}'",
+                explicit
+            ));
+        }
+        return Ok(Some(explicit));
+    }
+
+    let raw = Command::new("git")
+        .args(["rev-parse", "--show-toplevel"])
+        .output()
+        .ok()
+        .and_then(|output| {
+            if !output.status.success() {
+                return None;
+            }
+            let path = String::from_utf8_lossy(&output.stdout).trim().to_string();
+            if path.is_empty() {
+                None
+            } else {
+                Some(PathBuf::from(path))
+            }
+        })
+        .or_else(|| std::env::current_dir().ok());
+
+    let Some(path) = raw else {
+        return Ok(None);
+    };
+    let canonical = path.canonicalize().into_diagnostic().wrap_err_with(|| {
+        format!("failed to resolve host project root '{}'", path.display())
+    })?;
+    if !canonical.is_dir() {
+        return Err(miette::miette!(
+            "host project root '{}' is not a directory",
+            canonical.display()
+        ));
+    }
+    Ok(Some(canonical.display().to_string()))
 }
 
 /// Platform information for a Docker daemon host.
@@ -640,6 +688,12 @@ pub async fn ensure_container(
         ]),
         ..Default::default()
     };
+    if let Some(host_project_root) = resolve_host_project_root()? {
+        let binds = host_config.binds.get_or_insert_with(Vec::new);
+        binds.push(format!(
+            "{host_project_root}:{OPENERAL_CLUSTER_PROJECT_MOUNT_PATH}"
+        ));
+    }
 
     // Inject GPU devices into the container based on the resolved device ID list.
     //
@@ -1341,6 +1395,7 @@ fn is_port_conflict(err: &BollardError) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::time::{SystemTime, UNIX_EPOCH};
 
     #[test]
     fn normalize_arch_x86_64() {
@@ -1496,5 +1551,34 @@ mod tests {
             "nvidia.com/gpu=1".to_string(),
         ];
         assert_eq!(resolve_gpu_device_ids(&multi, true), multi);
+    }
+
+    #[allow(unsafe_code)]
+    #[test]
+    fn resolve_host_project_root_prefers_explicit_env() {
+        let base = std::env::temp_dir().join(format!(
+            "openshell-host-project-{}",
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&base).unwrap();
+        let previous = std::env::var(OPENERAL_HOST_PROJECT_ROOT_ENV).ok();
+        unsafe {
+            std::env::set_var(OPENERAL_HOST_PROJECT_ROOT_ENV, base.display().to_string());
+        }
+
+        let resolved = resolve_host_project_root().unwrap();
+
+        unsafe {
+            match previous {
+                Some(value) => std::env::set_var(OPENERAL_HOST_PROJECT_ROOT_ENV, value),
+                None => std::env::remove_var(OPENERAL_HOST_PROJECT_ROOT_ENV),
+            }
+        }
+
+        assert_eq!(resolved, Some(base.canonicalize().unwrap().display().to_string()));
+        std::fs::remove_dir_all(base).unwrap();
     }
 }

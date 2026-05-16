@@ -702,6 +702,18 @@ fn apply_child_env(
     }
 }
 
+fn effective_workdir<'a>(
+    workdir: Option<&'a str>,
+    provider_env: &'a HashMap<String, String>,
+) -> Option<&'a str> {
+    workdir.or_else(|| {
+        provider_env
+            .get("OPENERAL_CONNECT_CWD")
+            .map(String::as_str)
+            .filter(|value| !value.is_empty())
+    })
+}
+
 #[allow(clippy::too_many_arguments)]
 fn spawn_pty_shell(
     policy: &SandboxPolicy,
@@ -765,17 +777,18 @@ fn spawn_pty_shell(
     );
     cmd.stdin(stdin).stdout(stdout).stderr(stderr);
 
-    if let Some(dir) = workdir.as_deref() {
+    let effective_workdir = effective_workdir(workdir.as_deref(), provider_env);
+    if let Some(dir) = effective_workdir {
         cmd.current_dir(dir);
     }
 
     // Probe Landlock availability from the parent process where tracing works.
     #[cfg(target_os = "linux")]
-    sandbox::linux::log_sandbox_readiness(policy, workdir.as_deref());
+    sandbox::linux::log_sandbox_readiness(policy, effective_workdir);
 
     // Phase 1 (as root): Prepare Landlock ruleset before drop_privileges.
     #[cfg(target_os = "linux")]
-    let prepared_sandbox = sandbox::linux::prepare(policy, workdir.as_deref())
+    let prepared_sandbox = sandbox::linux::prepare(policy, effective_workdir)
         .map_err(|err| anyhow::anyhow!("Failed to prepare sandbox: {err}"))?;
 
     #[cfg(unix)]
@@ -912,17 +925,18 @@ fn spawn_pipe_exec(
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
 
-    if let Some(dir) = workdir.as_deref() {
+    let effective_workdir = effective_workdir(workdir.as_deref(), provider_env);
+    if let Some(dir) = effective_workdir {
         cmd.current_dir(dir);
     }
 
     // Probe Landlock availability from the parent process where tracing works.
     #[cfg(target_os = "linux")]
-    sandbox::linux::log_sandbox_readiness(policy, workdir.as_deref());
+    sandbox::linux::log_sandbox_readiness(policy, effective_workdir);
 
     // Phase 1 (as root): Prepare Landlock ruleset before drop_privileges.
     #[cfg(target_os = "linux")]
-    let prepared_sandbox = sandbox::linux::prepare(policy, workdir.as_deref())
+    let prepared_sandbox = sandbox::linux::prepare(policy, effective_workdir)
         .map_err(|err| anyhow::anyhow!("Failed to prepare sandbox: {err}"))?;
 
     #[cfg(unix)]

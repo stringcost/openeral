@@ -53,6 +53,8 @@ mkdir -p "$runner_state_dir"
 : "${ANTHROPIC_API_KEY:?Missing ANTHROPIC_API_KEY in environment or .env}"
 
 run_id="$(date -u +%Y%m%d%H%M%S)"
+host_project_probe_rel=".tmp/openeral-project-mount-${run_id}.txt"
+host_project_probe_host="$repo_root/$host_project_probe_rel"
 gateway_name="${OPENSHELL_GATEWAY_NAME:-openeral-supabase-${run_id}}"
 gateway_host="${OPENSHELL_GATEWAY_HOST:-host.docker.internal}"
 cluster_container="openshell-cluster-${gateway_name}"
@@ -246,6 +248,7 @@ run_cli() {
       -e IMAGE_REPO_BASE="$image_repo_base" \
       -e IMAGE_TAG="$image_tag" \
       -e OPENSHELL_PUSH_IMAGES="$push_images" \
+      -e OPENERAL_HOST_PROJECT_ROOT="$repo_root" \
       -e ANTHROPIC_API_KEY="${ANTHROPIC_API_KEY:-}" \
       -e OPENERAL_DATABASE_URL="${OPENERAL_DATABASE_URL:-}" \
       -e DATABASE_URL="${DATABASE_URL:-}" \
@@ -260,6 +263,7 @@ run_cli() {
     IMAGE_REPO_BASE="$image_repo_base" \
     IMAGE_TAG="$image_tag" \
     OPENSHELL_PUSH_IMAGES="$push_images" \
+    OPENERAL_HOST_PROJECT_ROOT="$repo_root" \
     "$OPENSHELL_BIN" "$@"
   fi
 }
@@ -274,6 +278,7 @@ cleanup() {
       return
     fi
   fi
+  rm -f "$host_project_probe_host"
   run_cli sandbox delete --gateway "$gateway_name" "$sandbox_name" >/dev/null 2>&1 || true
   run_cli gateway destroy --name "$gateway_name" >/dev/null 2>&1 || true
 }
@@ -407,7 +412,7 @@ if ! DATABASE_URL="$OPENERAL_DATABASE_URL" ANTHROPIC_API_KEY="$ANTHROPIC_API_KEY
     --provider "$claude_provider" \
     --policy "$policy_path_arg" \
     --no-auto-providers \
-    --no-tty -- /usr/bin/env HOME=/sandbox /bin/true >"$create_log" 2>&1; then
+    --no-tty -- /bin/true >"$create_log" 2>&1; then
   cat "$create_log" >&2
 fi
 rm -f "$create_log"
@@ -436,11 +441,32 @@ provider_env="$(
 )"
 printf '%s\n' "$provider_env"
 printf '%s\n' "$provider_env" | grep -q '^ANTHROPIC_API_KEY=openshell:resolve:env:ANTHROPIC_API_KEY$'
+printf '%s\n' "$provider_env" | grep -q '^HOME=/home/agent$'
+printf '%s\n' "$provider_env" | grep -q '^PWD=/sandbox/project$'
 
-echo "== write workspace file =="
+echo "== verify /sandbox/project host mount =="
+rm -f "$host_project_probe_host"
 run_cli sandbox exec --gateway "$gateway_name" --name "$sandbox_name" --no-tty \
-  /usr/bin/python3 -c "from pathlib import Path; Path('/sandbox/e2e.txt').write_text('persist-ok')"
-run_cli sandbox exec --gateway "$gateway_name" --name "$sandbox_name" --no-tty /bin/cat /sandbox/e2e.txt
+  /usr/bin/python3 -c "from pathlib import Path; p = Path('/sandbox/project/$host_project_probe_rel'); p.parent.mkdir(parents=True, exist_ok=True); p.write_text('project-ok')"
+run_cli sandbox exec --gateway "$gateway_name" --name "$sandbox_name" --no-tty \
+  /bin/cat "/sandbox/project/$host_project_probe_rel"
+[ -f "$host_project_probe_host" ]
+grep -q '^project-ok$' "$host_project_probe_host"
+
+echo "== verify host project writes stay out of postgres =="
+project_row_count="$(
+psql "$OPENERAL_DATABASE_URL" -Atqc \
+  "SELECT count(*)
+   FROM _openeral.workspace_files
+   WHERE workspace_id LIKE '%:${sandbox_name}' AND path = '/project/${host_project_probe_rel}';"
+)"
+printf '%s\n' "$project_row_count"
+[ "${project_row_count:-0}" -eq 0 ]
+
+echo "== write durable claude state file =="
+run_cli sandbox exec --gateway "$gateway_name" --name "$sandbox_name" --no-tty \
+  /usr/bin/python3 -c "from pathlib import Path; p = Path('/sandbox/.claude/openeral-smoke.txt'); p.parent.mkdir(parents=True, exist_ok=True); p.write_text('persist-ok')"
+run_cli sandbox exec --gateway "$gateway_name" --name "$sandbox_name" --no-tty /bin/cat /sandbox/.claude/openeral-smoke.txt
 
 echo "== verify /.db write denied =="
 if run_cli sandbox exec --gateway "$gateway_name" --name "$sandbox_name" --no-tty \
@@ -454,12 +480,12 @@ workspace_row="$(
 psql "$OPENERAL_DATABASE_URL" -Atqc \
   "SELECT workspace_id || '|' || path || '|' || convert_from(content, 'UTF8')
    FROM _openeral.workspace_files
-   WHERE workspace_id LIKE '%:${sandbox_name}' AND path = '/e2e.txt'
+   WHERE workspace_id LIKE '%:${sandbox_name}' AND path = '/.claude/openeral-smoke.txt'
    ORDER BY workspace_id DESC
    LIMIT 1;"
 )"
 printf '%s\n' "$workspace_row"
-printf '%s\n' "$workspace_row" | grep -q '|/e2e.txt|persist-ok'
+printf '%s\n' "$workspace_row" | grep -q '|/.claude/openeral-smoke.txt|persist-ok'
 
 echo "== claude =="
 claude_stdout="$(mktemp)"
@@ -488,6 +514,16 @@ psql "$OPENERAL_DATABASE_URL" -Atqc \
 printf '%s\n' "$claude_rows"
 [ "${claude_rows:-0}" -gt 0 ]
 
+echo "== claude.json row count =="
+claude_json_rows="$(
+psql "$OPENERAL_DATABASE_URL" -Atqc \
+  "SELECT count(*)
+   FROM _openeral.workspace_files
+   WHERE workspace_id LIKE '%:${sandbox_name}' AND path = '/.claude.json';"
+)"
+printf '%s\n' "$claude_json_rows"
+[ "${claude_json_rows:-0}" -gt 0 ]
+
 echo "== recreate same sandbox name =="
 run_cli sandbox delete --gateway "$gateway_name" "$sandbox_name" >/dev/null || true
 sleep 2
@@ -502,7 +538,7 @@ if ! DATABASE_URL="$OPENERAL_DATABASE_URL" ANTHROPIC_API_KEY="$ANTHROPIC_API_KEY
     --provider "$claude_provider" \
     --policy "$policy_path_arg" \
     --no-auto-providers \
-    --no-tty -- /usr/bin/env HOME=/sandbox /bin/true >"$recreate_log" 2>&1; then
+    --no-tty -- /bin/true >"$recreate_log" 2>&1; then
   cat "$recreate_log" >&2
 fi
 rm -f "$recreate_log"
@@ -510,8 +546,8 @@ rm -f "$recreate_log"
 wait_for_sandbox_ready
 wait_for_exec_ready
 
-echo "== persisted file after recreate =="
-run_cli sandbox exec --gateway "$gateway_name" --name "$sandbox_name" --no-tty /bin/cat /sandbox/e2e.txt
+echo "== persisted claude file after recreate =="
+run_cli sandbox exec --gateway "$gateway_name" --name "$sandbox_name" --no-tty /bin/cat /sandbox/.claude/openeral-smoke.txt
 
 echo "== persisted claude rows after recreate =="
 persisted_claude_rows="$(
@@ -522,6 +558,16 @@ psql "$OPENERAL_DATABASE_URL" -Atqc \
 )"
 printf '%s\n' "$persisted_claude_rows"
 [ "${persisted_claude_rows:-0}" -gt 0 ]
+
+echo "== persisted claude.json after recreate =="
+persisted_claude_json_rows="$(
+psql "$OPENERAL_DATABASE_URL" -Atqc \
+  "SELECT count(*)
+   FROM _openeral.workspace_files
+   WHERE workspace_id LIKE '%:${sandbox_name}' AND path = '/.claude.json';"
+)"
+printf '%s\n' "$persisted_claude_json_rows"
+[ "${persisted_claude_json_rows:-0}" -gt 0 ]
 
 echo "== claude after recreate =="
 claude_stdout="$(mktemp)"

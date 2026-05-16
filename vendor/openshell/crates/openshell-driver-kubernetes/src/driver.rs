@@ -101,6 +101,12 @@ const WORKSPACE_SENTINEL: &str = ".workspace-initialized";
 
 /// When true, skip seeding `/sandbox` contents into the workspace PVC.
 const SKIP_WORKSPACE_SEED_ENV: &str = "OPENSHELL_K8S_SKIP_WORKSPACE_SEED";
+const OPENERAL_BOOTSTRAP_VOLUME_NAME: &str = "openeral-bootstrap-bin";
+const OPENERAL_BOOTSTRAP_NODE_PATH: &str = "/opt/openeral/bin/openeral";
+const OPENERAL_BOOTSTRAP_MOUNT_PATH: &str = "/usr/local/bin/openeral";
+const OPENERAL_PROJECT_VOLUME_NAME: &str = "openeral-host-project";
+const OPENERAL_PROJECT_NODE_PATH: &str = "/opt/openeral/host-project";
+const OPENERAL_PROJECT_MOUNT_PATH: &str = "/sandbox/project";
 
 #[derive(Clone)]
 pub struct KubernetesComputeDriver {
@@ -920,6 +926,70 @@ fn apply_workspace_persistence(
     }
 }
 
+/// Mount the Openeral bootstrap binary and the host project tree into sandbox pods.
+///
+/// The local embedded-k3s runtime ships the `openeral` binary and a bind-mounted
+/// host project directory inside the cluster node filesystem. Sandbox pods mount
+/// both via hostPath so the stock sandbox image can still use Openeral bootstrap
+/// and so `/sandbox/project` stays local instead of persisting through the
+/// workspace PVC.
+fn apply_openeral_local_mounts(pod_template: &mut serde_json::Value) {
+    let Some(spec) = pod_template.get_mut("spec").and_then(|v| v.as_object_mut()) else {
+        return;
+    };
+
+    let volumes = spec
+        .entry("volumes")
+        .or_insert_with(|| serde_json::json!([]))
+        .as_array_mut();
+    if let Some(volumes) = volumes {
+        volumes.push(serde_json::json!({
+            "name": OPENERAL_BOOTSTRAP_VOLUME_NAME,
+            "hostPath": {
+                "path": OPENERAL_BOOTSTRAP_NODE_PATH,
+                "type": "File"
+            }
+        }));
+        volumes.push(serde_json::json!({
+            "name": OPENERAL_PROJECT_VOLUME_NAME,
+            "hostPath": {
+                "path": OPENERAL_PROJECT_NODE_PATH,
+                "type": "Directory"
+            }
+        }));
+    }
+
+    let containers = spec.get_mut("containers").and_then(|v| v.as_array_mut());
+    if let Some(containers) = containers {
+        let mut target_index = None;
+        for (i, c) in containers.iter().enumerate() {
+            if c.get("name").and_then(|v| v.as_str()) == Some("agent") {
+                target_index = Some(i);
+                break;
+            }
+        }
+        let index = target_index.unwrap_or(0);
+
+        if let Some(container) = containers.get_mut(index).and_then(|v| v.as_object_mut()) {
+            let volume_mounts = container
+                .entry("volumeMounts")
+                .or_insert_with(|| serde_json::json!([]))
+                .as_array_mut();
+            if let Some(volume_mounts) = volume_mounts {
+                volume_mounts.push(serde_json::json!({
+                    "name": OPENERAL_BOOTSTRAP_VOLUME_NAME,
+                    "mountPath": OPENERAL_BOOTSTRAP_MOUNT_PATH,
+                    "readOnly": true
+                }));
+                volume_mounts.push(serde_json::json!({
+                    "name": OPENERAL_PROJECT_VOLUME_NAME,
+                    "mountPath": OPENERAL_PROJECT_MOUNT_PATH
+                }));
+            }
+        }
+    }
+}
+
 /// Build the default `volumeClaimTemplates` array for sandbox pods.
 ///
 /// Provides a single PVC named "workspace" that backs the `/sandbox`
@@ -1201,6 +1271,7 @@ fn sandbox_template_to_k8s(
     if inject_workspace {
         apply_workspace_persistence(&mut result, image, image_pull_policy);
     }
+    apply_openeral_local_mounts(&mut result);
 
     result
 }
@@ -2052,5 +2123,52 @@ mod tests {
             !has_workspace_mount,
             "workspace mount must NOT be present when inject_workspace is false"
         );
+    }
+
+    #[test]
+    fn openeral_local_mounts_add_bootstrap_binary_and_host_project() {
+        let pod_template = sandbox_template_to_k8s(
+            &SandboxTemplate::default(),
+            false,
+            "openshell/sandbox:latest",
+            "",
+            "openshell/supervisor:latest",
+            "",
+            "sandbox-id",
+            "sandbox-name",
+            "https://gateway.example.com",
+            "0.0.0.0:2222",
+            "secret",
+            300,
+            &std::collections::HashMap::new(),
+            "",
+            "",
+            true,
+        );
+
+        let volumes = pod_template["spec"]["volumes"]
+            .as_array()
+            .expect("volumes should exist");
+        assert!(volumes.iter().any(|volume| {
+            volume["name"] == OPENERAL_BOOTSTRAP_VOLUME_NAME
+                && volume["hostPath"]["path"] == OPENERAL_BOOTSTRAP_NODE_PATH
+        }));
+        assert!(volumes.iter().any(|volume| {
+            volume["name"] == OPENERAL_PROJECT_VOLUME_NAME
+                && volume["hostPath"]["path"] == OPENERAL_PROJECT_NODE_PATH
+        }));
+
+        let mounts = pod_template["spec"]["containers"][0]["volumeMounts"]
+            .as_array()
+            .expect("volumeMounts should exist");
+        assert!(mounts.iter().any(|mount| {
+            mount["name"] == OPENERAL_BOOTSTRAP_VOLUME_NAME
+                && mount["mountPath"] == OPENERAL_BOOTSTRAP_MOUNT_PATH
+                && mount["readOnly"] == true
+        }));
+        assert!(mounts.iter().any(|mount| {
+            mount["name"] == OPENERAL_PROJECT_VOLUME_NAME
+                && mount["mountPath"] == OPENERAL_PROJECT_MOUNT_PATH
+        }));
     }
 }
