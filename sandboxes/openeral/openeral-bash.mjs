@@ -16,8 +16,8 @@
  *
  * Claude Code calls `bash -c '<command>'` — this script intercepts that.
  *
- * Database: uses getDatabaseConnection() which picks up external PostgreSQL
- * when DATABASE_URL is set, or starts embedded PGlite otherwise.
+ * Database: uses getDatabaseConnection() which connects to the external
+ * PostgreSQL instance at DATABASE_URL (required).
  */
 
 import { createServer, createConnection } from 'node:net';
@@ -122,12 +122,25 @@ async function startDaemon() {
     pool,
   });
 
+  // Skip the background fs.watch when OpenClaw is the active agent.
+  //
+  // OpenClaw doesn't run an interactive bash between commands — when it shells
+  // out, execCommandWithSync already does pre-sync (FS→DB) and post-sync (DB→FS)
+  // around each invocation, so any /home/agent change is captured. The watcher
+  // only buys us coverage for processes that write to /home/agent OUTSIDE the
+  // bash daemon, and openclaw's runtime writes go almost entirely to
+  // /home/agent/.openclaw, which is partially excluded anyway. Keeping it on
+  // for openclaw wastes inotify slots and would still occasionally fire and
+  // schedule a redundant walk during startup bursts. Off is the safe default.
+  const isOpenclaw = (process.env.OPENERAL_AGENT || '').toLowerCase().includes('openclaw');
   let syncWatch = null;
-  try {
-    const { watchAndSync, createHomeSyncOptions } = await syncModulePromise;
-    syncWatch = watchAndSync(pool, workspaceId, HOME_DIR, createHomeSyncOptions({ prune: true }));
-  } catch (err) {
-    process.stderr.write(`${formatError(err, 'openeral-bash: watcher failed')}\n`);
+  if (!isOpenclaw) {
+    try {
+      const { watchAndSync, createHomeSyncOptions } = await syncModulePromise;
+      syncWatch = watchAndSync(pool, workspaceId, HOME_DIR, createHomeSyncOptions({ prune: true }));
+    } catch (err) {
+      process.stderr.write(`${formatError(err, 'openeral-bash: watcher failed')}\n`);
+    }
   }
 
   // Clean up stale socket

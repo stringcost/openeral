@@ -20,8 +20,11 @@
  *   If not → set ANTHROPIC_API_KEY + STRINGCOST_API_KEY to create one on first run.
  *   Run `npx openeral presign renew` to replace the stored presign.
  *
+ * Required env:
+ *   DATABASE_URL            PostgreSQL connection string (Supabase, Neon, etc.)
+ *                           Store once with: npx openeral db-url postgresql://...
+ *
  * Optional env:
- *   DATABASE_URL            Database connection string (uses PGlite if not provided)
  *   OPENERAL_WORKSPACE_ID   Workspace ID (default: openeral-claude, normalized to lowercase)
  *   OPENERAL_SANDBOX_IMAGE  Override sandbox image (default: ghcr.io/sandys/openeral/sandbox:just-bash)
  *   OPENERAL_DEV_IMAGE      Override dev sandbox image (default: openeral-sandbox:dev, used with --dev)
@@ -32,7 +35,6 @@
  *   - Automatic sandbox cleanup to prevent duplicate errors
  *   - Kubernetes-compliant workspace name normalization
  *   - Extended startup timeout (8 minutes) for first-time setup
- *   - PGlite support for local development (no PostgreSQL required)
  */
 
 import { spawn, spawnSync } from 'node:child_process';
@@ -161,39 +163,41 @@ export function parseCliArgs(args: string[]): ParsedArgs {
     }
   }
 
-  // Check for memory refresh command
-  if (args[0] === 'memory' && args[1] === 'refresh') {
-    let workspaceId = process.env.OPENERAL_WORKSPACE_ID || 'openeral-claude';
-    let projectRoot = '';
-    let query = '';
-    let dryRun = false;
-    let backup = true;
+  // Check for memory subcommands
+  if (args[0] === 'memory') {
+    if (args[1] === 'refresh') {
+      let workspaceId = process.env.OPENERAL_WORKSPACE_ID || 'openeral-claude';
+      let projectRoot = '';
+      let query = '';
+      let dryRun = false;
+      let backup = true;
 
-    for (let i = 2; i < args.length; i++) {
-      if ((args[i] === '--workspace' || args[i] === '-w') && args[i + 1]) {
-        workspaceId = args[++i];
-      } else if (args[i] === '--project-root' && args[i + 1]) {
-        projectRoot = args[++i];
-      } else if (args[i] === '--query' && args[i + 1]) {
-        query = args[++i];
-      } else if (args[i] === '--dry-run') {
-        dryRun = true;
-      } else if (args[i] === '--no-backup') {
-        backup = false;
+      for (let i = 2; i < args.length; i++) {
+        if ((args[i] === '--workspace' || args[i] === '-w') && args[i + 1]) {
+          workspaceId = args[++i];
+        } else if (args[i] === '--project-root' && args[i + 1]) {
+          projectRoot = args[++i];
+        } else if (args[i] === '--query' && args[i + 1]) {
+          query = args[++i];
+        } else if (args[i] === '--dry-run') {
+          dryRun = true;
+        } else if (args[i] === '--no-backup') {
+          backup = false;
+        }
       }
-    }
 
-    // Normalize workspace ID to be Kubernetes-compliant
-    const originalId = workspaceId;
-    workspaceId = workspaceId.toLowerCase().replace(/[^a-z0-9-]/g, '-').replace(/^-+|-+$/g, '').replace(/-{2,}/g, '-');
-    
-    // Prevent empty workspace ID
-    if (workspaceId.length === 0) {
-      workspaceId = 'openeral-claude';
-      process.stderr.write(`\x1b[33mwarning: workspace ID "${originalId}" normalized to empty string, using default: ${workspaceId}\x1b[0m\n`);
-    }
+      // Normalize workspace ID to be Kubernetes-compliant
+      const originalId = workspaceId;
+      workspaceId = workspaceId.toLowerCase().replace(/[^a-z0-9-]/g, '-').replace(/^-+|-+$/g, '').replace(/-{2,}/g, '-');
 
-    return { kind: 'memory-refresh', workspaceId, projectRoot, query, dryRun, backup };
+      // Prevent empty workspace ID
+      if (workspaceId.length === 0) {
+        workspaceId = 'openeral-claude';
+        process.stderr.write(`\x1b[33mwarning: workspace ID "${originalId}" normalized to empty string, using default: ${workspaceId}\x1b[0m\n`);
+      }
+
+      return { kind: 'memory-refresh', workspaceId, projectRoot, query, dryRun, backup };
+    }
   }
 
   // Default: launch mode
@@ -267,8 +271,11 @@ Auth (presign-first model):
   The presign is created once and stored permanently — subsequent runs need no keys.
   Run \`npx openeral presign renew\` to replace the stored presign at any time.
 
+Required env:
+  DATABASE_URL             PostgreSQL connection string (Supabase, Neon, etc.)
+                           Store once with: npx openeral db-url postgresql://...
+
 Optional env:
-  DATABASE_URL             Database connection string (uses PGlite if not provided)
   OPENERAL_WORKSPACE_ID    Default workspace ID (will be normalized to lowercase)
   OPENERAL_SANDBOX_IMAGE   Override prod sandbox image (default: ghcr.io/sandys/openeral/sandbox:just-bash)
   OPENERAL_DEV_IMAGE       Override dev sandbox image (default: openeral-sandbox:dev, used with --dev/-d)
@@ -277,7 +284,7 @@ Optional env:
 Features:
   - Presign-first auth — no env vars needed once the presign is stored
   - Claude has automatic access to your home directory and mounted drives
-  - Database persistence with PGlite (or external PostgreSQL)
+  - Persistent /home/agent backed by external PostgreSQL
   - API usage statistics and optimization suggestions
 
 Notes:
@@ -1426,7 +1433,7 @@ async function launchViaSandbox(workspaceId: string, claudeArgs: string[], devMo
     // The openclaw provider credential arrives inside the sandbox as an opaque
     // openshell:resolve:env:* placeholder that OpenClaw cannot use. Deliver the
     // real key by writing it to a temp file and uploading it as a file so
-    // setup.sh can write the actual value into ~/.openclaw/openclaw.json.
+    // setup.sh can export the actual value as ANTHROPIC_API_KEY before exec'ing openclaw.
     const anthropicKey = (process.env.ANTHROPIC_API_KEY ?? '').trim();
     if (!anthropicKey) {
       process.stderr.write(
@@ -1581,15 +1588,17 @@ if [ -n "\${STRINGCOST_PROXY_URL:-}" ]; then
   echo "setup: using StringCost proxy at \${ANTHROPIC_BASE_URL}"
 fi
 
-mkdir -p /home/agent/.claude /home/agent/.claude/projects /home/agent/.openeral/data
+mkdir -p /home/agent/.claude /home/agent/.claude/projects
 
 # Org skills are written after the workspace restore so syncToFs cannot prune
 # freshly downloaded host-side skills before Claude starts.
 
-# Stable PGlite data directory — must be set before starting the daemon so that
-# getDatabaseConnection() in embedded.js uses /home/agent regardless of what HOME
-# is set to in the sandbox process at daemon startup time.
-export OPENERAL_DATA_DIR="/home/agent/.openeral/data"
+if [ -z "\${DATABASE_URL:-}" ]; then
+  echo "setup: error: DATABASE_URL is required." >&2
+  echo "setup:   Store one with: npx openeral db-url postgresql://user:pass@host/db" >&2
+  echo "setup:   Or set DATABASE_URL in your environment before launching." >&2
+  exit 1
+fi
 
 echo "setup: running migrations..."
 node -e "
@@ -1705,7 +1714,7 @@ DAEMON_PID=$!
 _d=0
 while [ $_d -lt 300 ]; do
   [ -S /tmp/openeral-bash.sock ] && break
-  [ $_d -eq 50 ] && echo "setup: waiting for daemon to initialize (PGlite WASM)..." >&2
+  [ $_d -eq 50 ] && echo "setup: waiting for daemon to initialize..." >&2
   sleep 0.1
   _d=$((_d+1))
 done

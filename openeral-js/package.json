@@ -21,7 +21,6 @@
     "check": "npm run typecheck && npm run lint && npm run test"
   },
   "dependencies": {
-    "@electric-sql/pglite": "^0.2.0",
     "just-bash": "^2.0.0",
     "pg": "^8.13.0"
   },

@@ -187,9 +187,7 @@ Claude's Read, Write, Edit, Bash, and Glob tools all work on `/mnt/...` paths.
 ## What happens after launch
 
 - Claude Code starts with `HOME` pointing to the isolated sandbox workspace.
-- **Workspace persistence**:
-  - Without `DATABASE_URL`: embedded PGlite runs in-process. Files survive restarts/reconnects within the sandbox's lifetime; lost when the sandbox is deleted.
-  - With `DATABASE_URL` or `POSTGRES_URL` delivered via `/sandbox/openeral-input/db-url`: pg tunnels through OpenShell's HTTP CONNECT proxy (via `openeral-js/src/db/http-connect-socket.ts`) to Supabase / Neon / RDS. Workspace survives sandbox delete and is shared across machines. The host must be allowlisted in the image's `postgres` network policy — common Supabase poolers are pre-allowlisted.
+- **Workspace persistence** (DATABASE_URL is required): `DATABASE_URL` or `POSTGRES_URL` delivered via `/sandbox/openeral-input/db-url` (or `/sandbox/db-url`). pg tunnels through OpenShell's HTTP CONNECT proxy (via `openeral-js/src/db/http-connect-socket.ts`) to Supabase / Neon / RDS. Workspace survives sandbox delete and is shared across machines. The host must be allowlisted in the image's `postgres` network policy — common Supabase poolers are pre-allowlisted. Sandboxes launched without a DB URL fail fast at setup time.
 - **With `STRINGCOST_API_KEY`**: Claude's API calls route through the uploaded StringCost presign for billing and usage metering.
 - **First Claude launch**: Claude Code may ask for theme, security acknowledgement, trust for `/sandbox`, and API usage billing. This is expected first-run setup.
 

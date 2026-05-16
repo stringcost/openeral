@@ -152,6 +152,7 @@ function buildFocusMemoryFile(
 ): { docs: MemoryFileSpec[]; topSources: RankedMemoryChunk[] } {
   const ranked = rankMemoryChunks(chunks, query, { now, dirtyPaths });
   const top = selectTopChunks(ranked, { limit: 10, maxPerFile: 2 });
+
   const template: MemoryDocumentTemplate = {
     filename: `focus-${slugifyQuery(query)}.md`,
     name: `Focus: ${query}`,
