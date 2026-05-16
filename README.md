@@ -190,7 +190,7 @@ openshell provider create --name openclaw --type generic \
   || openshell provider update openclaw \
     --credential "OPENERAL_AGENT=openclaw"
 
-openshell sandbox create --tty --name openeral-openclaw-stringcost23 \
+openshell sandbox create --tty --name openeral-openclaw-stringcost \
   --from ghcr.io/sandys/openeral/sandbox:just-bash \
   --upload "$OPENERAL_INPUT:/sandbox/openeral-input" \
   --provider openclaw --auto-providers \
