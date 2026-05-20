@@ -25,7 +25,7 @@ use std::process::Command;
 
 const REGISTRY_NAMESPACE_DEFAULT: &str = "openshell";
 const OPENERAL_HOST_PROJECT_ROOT_ENV: &str = "OPENERAL_HOST_PROJECT_ROOT";
-const OPENERAL_CLUSTER_PROJECT_MOUNT_PATH: &str = "/opt/openeral/host-project";
+const OPENERAL_CLUSTER_PROJECT_SOURCE_PATH: &str = "/opt/openeral/host-project-src";
 
 /// Default total HTTP timeout for Docker API calls that stream large payloads
 /// (e.g. `docker save` used by `sandbox create --from`). Bollard's own
@@ -691,7 +691,7 @@ pub async fn ensure_container(
     if let Some(host_project_root) = resolve_host_project_root()? {
         let binds = host_config.binds.get_or_insert_with(Vec::new);
         binds.push(format!(
-            "{host_project_root}:{OPENERAL_CLUSTER_PROJECT_MOUNT_PATH}"
+            "{host_project_root}:{OPENERAL_CLUSTER_PROJECT_SOURCE_PATH}"
         ));
     }
 
