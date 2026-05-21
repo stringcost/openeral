@@ -105,7 +105,9 @@ mod tests {
     #[test]
     fn detects_openclaw_runtime_from_command() {
         assert!(should_start_runtime(&["openclaw".to_string()]));
-        assert!(should_start_runtime(&["/usr/local/bin/openclaw".to_string()]));
+        assert!(should_start_runtime(&[
+            "/usr/local/bin/openclaw".to_string()
+        ]));
         assert!(!should_start_runtime(&["claude".to_string()]));
     }
 }

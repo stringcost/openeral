@@ -747,6 +747,42 @@ if [ "$fuse3_ws_ready" -eq 1 ]; then
     fuse3_ws_content=$(cat "$FUSE3_WS_MNT/fuse3_test.txt" 2>/dev/null)
     assert_eq "$fuse3_ws_content" "fuse3 workspace test" "mount.fuse3: workspace write+read"
 
+    mkdir -p "$FUSE3_WS_MNT/.claude" 2>/dev/null
+    fuse3_long_json='{"openeralSmoke":{"runId":"long"},"padding":"this suffix must disappear after a shorter rewrite"}'
+    fuse3_short_json='{"openeralSmoke":{"runId":"short"}}'
+    printf '%s' "$fuse3_long_json" > "$FUSE3_WS_MNT/.claude/.claude.json" 2>/dev/null
+    printf '%s' "$fuse3_short_json" > "$FUSE3_WS_MNT/.claude/.claude.json" 2>/dev/null
+    fuse3_truncated_content=$(cat "$FUSE3_WS_MNT/.claude/.claude.json" 2>/dev/null)
+    assert_eq "$fuse3_truncated_content" "$fuse3_short_json" "mount.fuse3: shorter rewrite drops stale tail bytes"
+
+    fuse3_truncated_row=$(psql "$DB_CONN" -Atqc \
+        "SELECT size || '|' || octet_length(content) || '|' || convert_from(content, 'UTF8') FROM _openeral.workspace_files WHERE workspace_id = 'fuse3-test' AND path = '/.claude/.claude.json'" 2>/dev/null)
+    assert_eq "$fuse3_truncated_row" "${#fuse3_short_json}|${#fuse3_short_json}|$fuse3_short_json" "mount.fuse3: shorter rewrite persists exact DB content"
+
+    fuse3_atomic_old='{"openeralSmoke":{"version":"old"},"padding":"replace me"}'
+    fuse3_atomic_new='{"openeralSmoke":{"version":"new"}}'
+    printf '%s' "$fuse3_atomic_old" > "$FUSE3_WS_MNT/.claude/atomic.json" 2>/dev/null
+    printf '%s' "$fuse3_atomic_new" > "$FUSE3_WS_MNT/.claude/atomic.json.tmp" 2>/dev/null
+    mv "$FUSE3_WS_MNT/.claude/atomic.json.tmp" "$FUSE3_WS_MNT/.claude/atomic.json" 2>/dev/null
+    fuse3_atomic_content=$(cat "$FUSE3_WS_MNT/.claude/atomic.json" 2>/dev/null)
+    assert_eq "$fuse3_atomic_content" "$fuse3_atomic_new" "mount.fuse3: atomic rename replaces target content"
+
+    fuse3_atomic_row=$(psql "$DB_CONN" -Atqc \
+        "SELECT size || '|' || octet_length(content) || '|' || convert_from(content, 'UTF8') FROM _openeral.workspace_files WHERE workspace_id = 'fuse3-test' AND path = '/.claude/atomic.json'" 2>/dev/null)
+    assert_eq "$fuse3_atomic_row" "${#fuse3_atomic_new}|${#fuse3_atomic_new}|$fuse3_atomic_new" "mount.fuse3: atomic rename persists exact DB content"
+
+    if timeout 10s ls -la "$FUSE3_WS_MNT/.claude" >/dev/null 2>&1; then
+        pass "mount.fuse3: Claude config directory ls completes"
+    else
+        fail "mount.fuse3: Claude config directory ls timed out"
+    fi
+
+    if timeout 10s find "$FUSE3_WS_MNT/.claude" -maxdepth 1 -type f >/dev/null 2>&1; then
+        pass "mount.fuse3: Claude config directory find completes"
+    else
+        fail "mount.fuse3: Claude config directory find timed out"
+    fi
+
     if mkdir "$FUSE3_WS_MNT/.ssh" 2>/dev/null; then
         fail "mount.fuse3: sensitive .ssh directory should be denied"
     else

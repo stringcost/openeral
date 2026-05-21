@@ -51,7 +51,7 @@ jobs:
         uses: dtolnay/rust-toolchain@stable
         with:
           toolchain: "1.95.0"
-          components: clippy
+          components: clippy,rustfmt
 
       - name: Cache Rust dependencies and build outputs
         uses: Swatinem/rust-cache@v2
@@ -108,28 +108,61 @@ jobs:
           }
 
           configure_apt_for_act
-          retry apt_index_ready libfuse3-dev fuse3 pkg-config libpq-dev postgresql-client
-          retry sudo apt-get install -y --no-install-recommends libfuse3-dev fuse3 pkg-config libpq-dev postgresql-client
+          retry apt_index_ready libfuse3-dev fuse3 pkg-config libpq-dev postgresql-client shellcheck
+          retry sudo apt-get install -y --no-install-recommends libfuse3-dev fuse3 pkg-config libpq-dev postgresql-client shellcheck
+
+      - name: Formatting and shell lint
+        run: |
+          cargo fmt --check
+          cargo fmt --manifest-path vendor/openshell/Cargo.toml --all --check
+          shellcheck \
+            tests/test_live_supabase_env.sh \
+            tests/test_live_secret_injection.sh \
+            tests/test_fuse_mount.sh \
+            deploy/docker/openeral-cluster-entrypoint.sh
+          bash -n tests/test_live_supabase_env.sh
+          bash -n tests/test_live_secret_injection.sh
+          bash -n tests/test_fuse_mount.sh
+          sh -n deploy/docker/openeral-cluster-entrypoint.sh
 
       - name: Build and clippy openeral
         env:
           TEST_DATABASE_URL: "host=localhost user=pgmount password=pgmount dbname=testdb"
         run: |
-          cargo clippy --all-targets
-          cargo test -p openeral-core --no-run
+          cargo clippy --all-targets -- -D warnings
+          cargo test -p openeral-core -p openeral-csi --no-run
 
       - name: Build patched OpenShell crates
         run: |
-          cargo test --manifest-path vendor/openshell/Cargo.toml \
+          cargo clippy --manifest-path vendor/openshell/Cargo.toml \
             -p openshell-driver-docker \
+            -p openshell-driver-kubernetes \
             -p openshell-policy \
             -p openshell-sandbox \
+            -p openshell-bootstrap \
+            --all-targets -- \
+            -D warnings \
+            -A clippy::option_if_let_else \
+            -A clippy::map_unwrap_or \
+            -A clippy::too_many_arguments \
+            -A clippy::single_match_else \
+            -A clippy::redundant_pub_crate \
+            -A clippy::unnecessary_wraps \
+            -A clippy::redundant_clone
+          cargo test --manifest-path vendor/openshell/Cargo.toml \
+            -p openshell-driver-docker \
+            -p openshell-driver-kubernetes \
+            -p openshell-policy \
+            -p openshell-sandbox \
+            -p openshell-bootstrap \
             --no-run
 
       - name: Rust integration tests
         env:
           TEST_DATABASE_URL: "host=localhost user=pgmount password=pgmount dbname=testdb"
-        run: cargo test -p openeral-core
+        run: |
+          cargo test -p openeral-core
+          cargo test -p openeral-csi
 
       - name: FUSE mount integration tests
         env:

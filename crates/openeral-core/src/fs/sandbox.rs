@@ -4,10 +4,9 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use dashmap::DashMap;
 use fuser::{
-    Errno, FileAttr, FileHandle, FileType, Filesystem, FopenFlags, Generation, INodeNo,
-    InitFlags, KernelConfig, OpenFlags, RenameFlags, ReplyAttr, ReplyCreate, ReplyData,
-    ReplyDirectory, ReplyEmpty, ReplyEntry, ReplyOpen, ReplyWrite, Request, TimeOrNow,
-    WriteFlags,
+    Errno, FileAttr, FileHandle, FileType, Filesystem, FopenFlags, Generation, INodeNo, InitFlags,
+    KernelConfig, OpenFlags, RenameFlags, ReplyAttr, ReplyCreate, ReplyData, ReplyDirectory,
+    ReplyEmpty, ReplyEntry, ReplyOpen, ReplyWrite, Request, TimeOrNow, WriteFlags,
 };
 use tracing::{debug, warn};
 
@@ -224,13 +223,11 @@ impl SandboxFilesystem {
             return cached.ok_or(FsError::NotFound);
         }
 
-        match self
-            .rt
-            .block_on(ws_queries::get_file_metadata(
-                &self.pool,
-                &self.workspace_id,
-                path,
-            )) {
+        match self.rt.block_on(ws_queries::get_file_metadata(
+            &self.pool,
+            &self.workspace_id,
+            path,
+        )) {
             Ok(file) => {
                 self.workspace_cache
                     .set_file(path, Some(Self::metadata_only(&file)));
@@ -249,13 +246,11 @@ impl SandboxFilesystem {
             return Ok(cached);
         }
 
-        let children = self
-            .rt
-            .block_on(ws_queries::list_children_metadata(
-                &self.pool,
-                &self.workspace_id,
-                parent_path,
-            ))?;
+        let children = self.rt.block_on(ws_queries::list_children_metadata(
+            &self.pool,
+            &self.workspace_id,
+            parent_path,
+        ))?;
 
         for child in &children {
             self.workspace_cache
@@ -295,12 +290,12 @@ impl SandboxFilesystem {
 
     fn db_attr_for_path(&self, path: &str) -> Result<FileAttr, FsError> {
         if path == DB_ROOT {
-            return Ok(crate::fs::attr::dir_attr(self.inodes.get_or_insert(DB_ROOT)));
+            return Ok(crate::fs::attr::dir_attr(
+                self.inodes.get_or_insert(DB_ROOT),
+            ));
         }
 
-        let identity = self
-            .db_identity_for_path(path)
-            .ok_or(FsError::NotFound)?;
+        let identity = self.db_identity_for_path(path).ok_or(FsError::NotFound)?;
         let ino = self.inodes.get_or_insert(path);
         let attr = self
             .rt
@@ -405,6 +400,12 @@ pub fn mount_at<P: AsRef<Path>>(
     mount_point: P,
 ) -> Result<(), FsError> {
     let fs = SandboxFilesystem::new(pool, config, rt);
+    let fuse_config = workspace_fuse_config();
+
+    fuser::mount2(fs, mount_point, &fuse_config).map_err(FsError::IoError)
+}
+
+fn workspace_fuse_config() -> fuser::Config {
     let mut fuse_config = fuser::Config::default();
     // Claude startup fans out many metadata and open calls across /sandbox.
     // With fuser's default single-thread event loop, one slow lookup against
@@ -423,8 +424,7 @@ pub fn mount_at<P: AsRef<Path>>(
         fuser::MountOption::CUSTOM("allow_other".to_string()),
     ];
     fuse_config.acl = fuser::SessionACL::All;
-
-    fuser::mount2(fs, mount_point, &fuse_config).map_err(FsError::IoError)
+    fuse_config
 }
 
 impl Filesystem for SandboxFilesystem {
@@ -464,14 +464,8 @@ impl Filesystem for SandboxFilesystem {
         if parent_path == "/" && name_str == ".db" {
             let db_path = DB_ROOT.to_string();
             let child_ino = self.inodes.get_or_insert(&db_path);
-            self.db_nodes
-                .entry(db_path)
-                .or_insert(NodeIdentity::Root);
-            reply.entry(
-                &TTL,
-                &crate::fs::attr::dir_attr(child_ino),
-                Generation(0),
-            );
+            self.db_nodes.entry(db_path).or_insert(NodeIdentity::Root);
+            reply.entry(&TTL, &crate::fs::attr::dir_attr(child_ino), Generation(0));
             return;
         }
 
@@ -1284,8 +1278,9 @@ impl Filesystem for SandboxFilesystem {
 
 #[cfg(test)]
 mod tests {
-    use super::SandboxFilesystem;
+    use super::{workspace_fuse_config, SandboxFilesystem, TTL};
     use fuser::OpenFlags;
+    use std::time::Duration;
 
     #[test]
     fn sensitive_home_paths_are_denied() {
@@ -1304,7 +1299,9 @@ mod tests {
     #[test]
     fn reserved_db_paths_are_not_sensitive() {
         assert!(!SandboxFilesystem::is_sensitive_path("/.db"));
-        assert!(!SandboxFilesystem::is_sensitive_path("/.db/public/users/.info/count"));
+        assert!(!SandboxFilesystem::is_sensitive_path(
+            "/.db/public/users/.info/count"
+        ));
         assert!(SandboxFilesystem::is_reserved_path("/.db"));
         assert!(SandboxFilesystem::is_reserved_path("/.db/public"));
     }
@@ -1317,5 +1314,25 @@ mod tests {
         assert!(!SandboxFilesystem::should_truncate_on_open(OpenFlags(
             libc::O_WRONLY
         )));
+    }
+
+    #[test]
+    fn kernel_cache_ttl_is_long_lived() {
+        assert!(TTL >= Duration::from_secs(60 * 60 * 24));
+    }
+
+    #[test]
+    fn fuse_config_enables_parallel_workers_with_cloned_fds() {
+        let config = workspace_fuse_config();
+
+        assert!(config.clone_fd);
+        assert!(matches!(config.n_threads, Some(4..=16)));
+        assert_eq!(config.acl, fuser::SessionACL::All);
+        assert!(config.mount_options.iter().any(|option| {
+            matches!(
+                option,
+                fuser::MountOption::Subtype(subtype) if subtype == "openeral"
+            )
+        }));
     }
 }

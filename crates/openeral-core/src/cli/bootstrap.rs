@@ -555,7 +555,11 @@ fn write_shell_env(home: &Path, env: &BTreeMap<String, String>) -> Result<(), Fs
     Ok(())
 }
 
-fn write_connect_bashrc(connect_home: &Path, home: &Path, connect_cwd: &Path) -> Result<(), FsError> {
+fn write_connect_bashrc(
+    connect_home: &Path,
+    home: &Path,
+    connect_cwd: &Path,
+) -> Result<(), FsError> {
     if connect_home == home {
         return Ok(());
     }
@@ -717,7 +721,10 @@ fn wait_for_openclaw_ready(timeout: Duration) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::Mutex;
     use std::time::{SystemTime, UNIX_EPOCH};
+
+    static ENV_LOCK: Mutex<()> = Mutex::new(());
 
     #[test]
     fn normalize_stringcost_url_strips_api_path() {
@@ -798,6 +805,44 @@ mod tests {
             fs::read_to_string(home.join(".claude/.claude.json")).unwrap(),
             "{\"legacy\":true}"
         );
+
+        fs::remove_dir_all(base).unwrap();
+    }
+
+    #[test]
+    fn prepare_writes_local_home_and_mounted_claude_env() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        std::env::remove_var("OPENERAL_AGENT");
+
+        let base = temp_test_dir("bootstrap-prepare-env");
+        let home = base.join("home");
+        let durable = base.join("sandbox");
+        let connect_cwd = durable.join("project");
+        let env_out = base.join("bootstrap.env");
+
+        prepare(BootstrapArgs {
+            phase: BootstrapPhase::Prepare,
+            home: home.clone(),
+            connect_home: durable.clone(),
+            connect_cwd: connect_cwd.clone(),
+            env_out: env_out.clone(),
+        })
+        .unwrap();
+
+        let bootstrap_env = fs::read_to_string(env_out).unwrap();
+        assert!(bootstrap_env.contains(&format!("HOME={}\n", home.display())));
+        assert!(bootstrap_env.contains(&format!("OPENERAL_HOME={}\n", home.display())));
+        assert!(bootstrap_env.contains(&format!(
+            "{OPENERAL_CONNECT_CWD_ENV}={}\n",
+            connect_cwd.display()
+        )));
+        assert!(bootstrap_env.contains(&format!(
+            "{CLAUDE_CONFIG_DIR_ENV}={}\n",
+            home.join(".claude").display()
+        )));
+        assert!(bootstrap_env.contains("NODE_NO_WARNINGS=1\n"));
+        assert!(!home.join(".claude.json").exists());
+        assert!(home.join(".claude/.claude.json").is_file());
 
         fs::remove_dir_all(base).unwrap();
     }

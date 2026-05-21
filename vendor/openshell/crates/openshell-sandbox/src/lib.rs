@@ -3182,4 +3182,21 @@ filesystem_policy:
         assert_eq!(after.uid(), before.uid());
         assert_eq!(after.gid(), before.gid());
     }
+
+    #[cfg(unix)]
+    #[test]
+    fn chown_existing_read_write_exception_is_limited_to_home_agent() {
+        assert!(should_chown_existing_read_write_path(std::path::Path::new(
+            "/home/agent"
+        )));
+        assert!(!should_chown_existing_read_write_path(
+            std::path::Path::new("/home/agent/.claude")
+        ));
+        assert!(!should_chown_existing_read_write_path(
+            std::path::Path::new("/sandbox/project")
+        ));
+        assert!(!should_chown_existing_read_write_path(
+            std::path::Path::new("/tmp/home/agent")
+        ));
+    }
 }

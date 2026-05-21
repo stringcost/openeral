@@ -118,9 +118,10 @@ fn resolve_host_project_root() -> Result<Option<String>> {
     let Some(path) = raw else {
         return Ok(None);
     };
-    let canonical = path.canonicalize().into_diagnostic().wrap_err_with(|| {
-        format!("failed to resolve host project root '{}'", path.display())
-    })?;
+    let canonical = path
+        .canonicalize()
+        .into_diagnostic()
+        .wrap_err_with(|| format!("failed to resolve host project root '{}'", path.display()))?;
     if !canonical.is_dir() {
         return Err(miette::miette!(
             "host project root '{}' is not a directory",
@@ -1578,7 +1579,10 @@ mod tests {
             }
         }
 
-        assert_eq!(resolved, Some(base.canonicalize().unwrap().display().to_string()));
+        assert_eq!(
+            resolved,
+            Some(base.canonicalize().unwrap().display().to_string())
+        );
         std::fs::remove_dir_all(base).unwrap();
     }
 }

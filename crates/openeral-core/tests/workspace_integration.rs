@@ -249,7 +249,10 @@ async fn test_metadata_queries_omit_content() {
     let full = ws_queries::get_file(&pool, &ws_id, "/meta/blob.txt")
         .await
         .unwrap();
-    assert_eq!(full.content, Some(b"metadata-should-not-fetch-content".to_vec()));
+    assert_eq!(
+        full.content,
+        Some(b"metadata-should-not-fetch-content".to_vec())
+    );
 
     ws_queries::delete_workspace(&pool, &ws_id).await.unwrap();
 }
@@ -284,6 +287,38 @@ async fn test_update_file_content() {
 }
 
 #[tokio::test]
+async fn test_update_file_content_replaces_longer_content_without_tail() {
+    let pool = get_pool().await;
+    let ws_id = unique_ws_id("ws-update-shorter");
+    let layout = WorkspaceLayout::default();
+    ws_queries::create_workspace(&pool, &ws_id, None, &layout)
+        .await
+        .unwrap();
+    ws_queries::seed_from_config(&pool, &ws_id, &layout)
+        .await
+        .unwrap();
+
+    let longer =
+        br#"{"openeralSmoke":{"runId":"initial"},"padding":"this content must disappear"}"#;
+    let shorter = br#"{"openeralSmoke":{"runId":"short"}}"#;
+    let file = test_file(&ws_id, "/.claude/.claude.json", "/", ".claude.json", longer);
+    ws_queries::create_file(&pool, &file).await.unwrap();
+
+    ws_queries::update_file_content(&pool, &ws_id, "/.claude/.claude.json", shorter, now_ns())
+        .await
+        .unwrap();
+
+    let fetched = ws_queries::get_file(&pool, &ws_id, "/.claude/.claude.json")
+        .await
+        .unwrap();
+    assert_eq!(fetched.size, shorter.len() as i64);
+    assert_eq!(fetched.content.as_deref(), Some(shorter.as_slice()));
+    serde_json::from_slice::<serde_json::Value>(fetched.content.as_ref().unwrap()).unwrap();
+
+    ws_queries::delete_workspace(&pool, &ws_id).await.unwrap();
+}
+
+#[tokio::test]
 async fn test_update_file_attrs_truncate_and_overwrite_sequence() {
     let pool = get_pool().await;
     let ws_id = unique_ws_id("ws-truncate");
@@ -298,29 +333,16 @@ async fn test_update_file_attrs_truncate_and_overwrite_sequence() {
     let file = test_file(&ws_id, "/truncate.txt", "/", "truncate.txt", b"persist-ok");
     ws_queries::create_file(&pool, &file).await.unwrap();
 
-    let truncated = ws_queries::update_file_attrs(
-        &pool,
-        &ws_id,
-        "/truncate.txt",
-        None,
-        Some(0),
-        None,
-        None,
-    )
-    .await
-    .unwrap();
+    let truncated =
+        ws_queries::update_file_attrs(&pool, &ws_id, "/truncate.txt", None, Some(0), None, None)
+            .await
+            .unwrap();
     assert_eq!(truncated.size, 0);
     assert_eq!(truncated.content, Some(Vec::new()));
 
-    ws_queries::update_file_content(
-        &pool,
-        &ws_id,
-        "/truncate.txt",
-        b"overwrite-ok",
-        now_ns(),
-    )
-    .await
-    .unwrap();
+    ws_queries::update_file_content(&pool, &ws_id, "/truncate.txt", b"overwrite-ok", now_ns())
+        .await
+        .unwrap();
 
     let overwritten = ws_queries::get_file(&pool, &ws_id, "/truncate.txt")
         .await

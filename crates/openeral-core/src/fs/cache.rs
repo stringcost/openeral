@@ -218,3 +218,91 @@ impl WorkspaceCache {
         self.children.clear();
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn workspace_file(path: &str, content: Option<&[u8]>) -> WorkspaceFile {
+        let name = path.rsplit('/').find(|part| !part.is_empty()).unwrap_or("");
+        WorkspaceFile {
+            workspace_id: "test-workspace".to_string(),
+            path: path.to_string(),
+            parent_path: "/".to_string(),
+            name: name.to_string(),
+            is_dir: content.is_none(),
+            content: content.map(Vec::from),
+            mode: if content.is_some() { 0o100644 } else { 0o40755 },
+            size: content.map_or(0, |bytes| bytes.len() as i64),
+            mtime_ns: 1,
+            ctime_ns: 1,
+            atime_ns: 1,
+            nlink: if content.is_some() { 1 } else { 2 },
+            uid: 998,
+            gid: 998,
+        }
+    }
+
+    #[test]
+    fn workspace_cache_stores_positive_and_negative_file_results() {
+        let cache = WorkspaceCache::new(Duration::from_secs(60));
+        let file = workspace_file("/.claude/settings.json", Some(br#"{"ok":true}"#));
+
+        cache.set_file(&file.path, Some(file.clone()));
+        cache.set_file("/missing", None);
+
+        assert_eq!(
+            cache
+                .get_file("/.claude/settings.json")
+                .expect("cache entry should exist")
+                .expect("file should be present")
+                .content,
+            file.content
+        );
+        assert!(matches!(cache.get_file("/missing"), Some(None)));
+    }
+
+    #[test]
+    fn workspace_cache_stores_and_invalidates_children() {
+        let cache = WorkspaceCache::new(Duration::from_secs(60));
+        let children = vec![
+            workspace_file("/.claude/.claude.json", Some(b"{}")),
+            workspace_file("/.claude/projects", None),
+        ];
+
+        cache.set_children("/.claude", children.clone());
+        assert_eq!(
+            cache
+                .get_children("/.claude")
+                .expect("children should be cached")
+                .len(),
+            children.len()
+        );
+
+        cache.invalidate_children("/.claude");
+        assert!(cache.get_children("/.claude").is_none());
+    }
+
+    #[test]
+    fn workspace_cache_invalidates_file_entries() {
+        let cache = WorkspaceCache::new(Duration::from_secs(60));
+        let file = workspace_file("/.claude/.claude.json", Some(b"{}"));
+
+        cache.set_file(&file.path, Some(file.clone()));
+        assert!(cache.get_file(&file.path).is_some());
+
+        cache.invalidate_file(&file.path);
+        assert!(cache.get_file(&file.path).is_none());
+    }
+
+    #[test]
+    fn workspace_cache_honors_zero_ttl() {
+        let cache = WorkspaceCache::new(Duration::ZERO);
+
+        cache.set_file("/expired", Some(workspace_file("/expired", Some(b"x"))));
+        cache.set_children("/", vec![workspace_file("/expired", Some(b"x"))]);
+
+        assert!(cache.get_file("/expired").is_none());
+        assert!(cache.get_children("/").is_none());
+    }
+}

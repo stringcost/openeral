@@ -214,7 +214,9 @@ impl csi::identity_server::Identity for NodeServiceImpl {
         &self,
         _request: Request<csi::GetPluginCapabilitiesRequest>,
     ) -> Result<Response<csi::GetPluginCapabilitiesResponse>, Status> {
-        Ok(Response::new(csi::GetPluginCapabilitiesResponse { capabilities: vec![] }))
+        Ok(Response::new(csi::GetPluginCapabilitiesResponse {
+            capabilities: vec![],
+        }))
     }
 
     async fn probe(
@@ -267,9 +269,8 @@ impl csi::controller_server::Controller for ControllerServiceImpl {
             capabilities: vec![csi::ControllerServiceCapability {
                 r#type: Some(csi::controller_service_capability::Type::Rpc(
                     csi::controller_service_capability::Rpc {
-                        r#type:
-                            csi::controller_service_capability::rpc::Type::CreateDeleteVolume
-                                as i32,
+                        r#type: csi::controller_service_capability::rpc::Type::CreateDeleteVolume
+                            as i32,
                     },
                 )),
             }],
@@ -298,10 +299,8 @@ impl csi::node_server::Node for NodeServiceImpl {
         }
 
         fs::create_dir_all(&target_path).map_err(io_status)?;
-        let pod_namespace = volume_context_required(
-            &request.volume_context,
-            "csi.storage.k8s.io/pod.namespace",
-        )?;
+        let pod_namespace =
+            volume_context_required(&request.volume_context, "csi.storage.k8s.io/pod.namespace")?;
         let pod_name =
             volume_context_required(&request.volume_context, "csi.storage.k8s.io/pod.name")?;
 
@@ -321,8 +320,8 @@ impl csi::node_server::Node for NodeServiceImpl {
             &workspace_key,
             target_path.display().to_string(),
         )
-            .await
-            .map_err(|err| Status::internal(err.to_string()))?;
+        .await
+        .map_err(|err| Status::internal(err.to_string()))?;
 
         let pool = create_pool(&database_url, mount_config.statement_timeout_secs)
             .map_err(|err| Status::internal(err.to_string()))?;
@@ -361,7 +360,10 @@ impl csi::node_server::Node for NodeServiceImpl {
         if is_path_mounted(&target_path) {
             unmount_path(&target_path).map_err(io_status)?;
         }
-        self.mounted_targets.lock().await.remove(&request.target_path);
+        self.mounted_targets
+            .lock()
+            .await
+            .remove(&request.target_path);
         Ok(Response::new(csi::NodeUnpublishVolumeResponse {}))
     }
 
@@ -392,6 +394,7 @@ struct SandboxRef {
     sandbox_name: String,
 }
 
+#[allow(clippy::result_large_err)]
 fn load_sandbox_ref(namespace: &str, pod_name: &str) -> Result<SandboxRef, Status> {
     let output = Command::new("kubectl")
         .args(["-n", namespace, "get", "pod", pod_name, "-o", "json"])
@@ -451,7 +454,8 @@ async fn prepare_workspace_mount(
         Ok(workspace) => workspace,
         Err(_) => {
             let layout = WorkspaceLayout::default();
-            ws_queries::create_workspace(&pool, workspace_key, Some(workspace_key), &layout).await?;
+            ws_queries::create_workspace(&pool, workspace_key, Some(workspace_key), &layout)
+                .await?;
             ws_queries::seed_from_config(&pool, workspace_key, &layout).await?;
             ws_queries::get_workspace(&pool, workspace_key).await?
         }
@@ -475,10 +479,7 @@ async fn prepare_workspace_mount(
     })
 }
 
-async fn ensure_claude_workspace_state(
-    pool: &DbPool,
-    workspace_key: &str,
-) -> Result<(), FsError> {
+async fn ensure_claude_workspace_state(pool: &DbPool, workspace_key: &str) -> Result<(), FsError> {
     let now_ns = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap()
@@ -544,6 +545,7 @@ async fn ensure_claude_workspace_state(
     Ok(())
 }
 
+#[allow(clippy::result_large_err)]
 fn workspace_key(database_url: &str, sandbox_name: &str) -> Result<String, Status> {
     let normalized = normalize_database_identity(database_url)
         .map_err(|err| Status::invalid_argument(format!("invalid DATABASE_URL: {err}")))?;
@@ -600,6 +602,7 @@ fn normalize_database_identity(raw: &str) -> Result<String, tokio_postgres::Erro
     ))
 }
 
+#[allow(clippy::result_large_err)]
 fn volume_context_required(
     volume_context: &HashMap<String, String>,
     key: &str,
@@ -621,6 +624,7 @@ fn is_path_mounted(path: &Path) -> bool {
     })
 }
 
+#[allow(clippy::result_large_err)]
 fn wait_for_mount(path: &Path) -> Result<(), Status> {
     for _ in 0..100 {
         if is_path_mounted(path) {
@@ -668,12 +672,10 @@ struct SandboxSecretInterceptor {
 }
 
 impl tonic::service::Interceptor for SandboxSecretInterceptor {
-    fn call(
-        &mut self,
-        mut req: tonic::Request<()>,
-    ) -> Result<tonic::Request<()>, tonic::Status> {
+    fn call(&mut self, mut req: tonic::Request<()>) -> Result<tonic::Request<()>, tonic::Status> {
         if let Some(ref secret) = self.secret {
-            req.metadata_mut().insert("x-sandbox-secret", secret.clone());
+            req.metadata_mut()
+                .insert("x-sandbox-secret", secret.clone());
         }
         Ok(req)
     }
@@ -730,8 +732,208 @@ async fn connect_gateway(endpoint: &str) -> Result<AuthenticatedClient, String> 
     let secret = std::env::var("OPENSHELL_SSH_HANDSHAKE_SECRET")
         .ok()
         .and_then(|value| value.parse().ok());
-    Ok(openshell::open_shell_client::OpenShellClient::with_interceptor(
-        channel,
-        SandboxSecretInterceptor { secret },
-    ))
+    Ok(
+        openshell::open_shell_client::OpenShellClient::with_interceptor(
+            channel,
+            SandboxSecretInterceptor { secret },
+        ),
+    )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::atomic::{AtomicU32, Ordering};
+    use tokio::sync::OnceCell;
+
+    static SETUP_CELL: OnceCell<()> = OnceCell::const_new();
+    static COUNTER: AtomicU32 = AtomicU32::new(1);
+
+    fn connection_string() -> String {
+        std::env::var("TEST_DATABASE_URL").unwrap_or_else(|_| {
+            "host=postgres user=pgmount password=pgmount dbname=testdb".to_string()
+        })
+    }
+
+    async fn setup_db(pool: &DbPool) {
+        SETUP_CELL
+            .get_or_init(|| async {
+                migrate::run_migrations(pool).await.unwrap();
+            })
+            .await;
+    }
+
+    async fn test_pool() -> DbPool {
+        let pool = create_pool(&connection_string(), 30).unwrap();
+        setup_db(&pool).await;
+        pool
+    }
+
+    async fn create_test_workspace(pool: &DbPool, workspace_id: &str) {
+        let layout = WorkspaceLayout::default();
+        ws_queries::create_workspace(pool, workspace_id, Some(workspace_id), &layout)
+            .await
+            .unwrap();
+        ws_queries::seed_from_config(pool, workspace_id, &layout)
+            .await
+            .unwrap();
+    }
+
+    fn unique_workspace_id(prefix: &str) -> String {
+        let n = COUNTER.fetch_add(1, Ordering::Relaxed);
+        format!("{prefix}-{}-{}-{n}", std::process::id(), now_ns())
+    }
+
+    fn now_ns() -> i64 {
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos() as i64
+    }
+
+    fn workspace_file(
+        workspace_id: &str,
+        path: &str,
+        parent_path: &str,
+        name: &str,
+        content: Option<&[u8]>,
+    ) -> WorkspaceFile {
+        let now = now_ns();
+        WorkspaceFile {
+            workspace_id: workspace_id.to_string(),
+            path: path.to_string(),
+            parent_path: parent_path.to_string(),
+            name: name.to_string(),
+            is_dir: content.is_none(),
+            content: content.map(Vec::from),
+            mode: if content.is_some() { 0o100644 } else { 0o40755 },
+            size: content.map_or(0, |bytes| bytes.len() as i64),
+            mtime_ns: now,
+            ctime_ns: now,
+            atime_ns: now,
+            nlink: if content.is_some() { 1 } else { 2 },
+            uid: 1000,
+            gid: 1000,
+        }
+    }
+
+    #[tokio::test]
+    async fn ensure_claude_workspace_state_creates_directory_and_config_file() {
+        let pool = test_pool().await;
+        let workspace_id = unique_workspace_id("csi-claude-create");
+        create_test_workspace(&pool, &workspace_id).await;
+
+        ensure_claude_workspace_state(&pool, &workspace_id)
+            .await
+            .unwrap();
+
+        let dir = ws_queries::get_file_metadata(&pool, &workspace_id, CLAUDE_DIR_PATH)
+            .await
+            .unwrap();
+        assert!(dir.is_dir);
+        assert_eq!(dir.uid, DEFAULT_SANDBOX_UID);
+        assert_eq!(dir.gid, DEFAULT_SANDBOX_GID);
+
+        let config = ws_queries::get_file(&pool, &workspace_id, CLAUDE_CONFIG_PATH)
+            .await
+            .unwrap();
+        assert!(!config.is_dir);
+        assert_eq!(config.parent_path, CLAUDE_DIR_PATH);
+        assert_eq!(config.name, ".claude.json");
+        assert_eq!(config.content.as_deref(), Some(b"{}".as_slice()));
+        assert_eq!(config.uid, DEFAULT_SANDBOX_UID);
+        assert_eq!(config.gid, DEFAULT_SANDBOX_GID);
+
+        ws_queries::delete_workspace(&pool, &workspace_id)
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn ensure_claude_workspace_state_migrates_legacy_top_level_config() {
+        let pool = test_pool().await;
+        let workspace_id = unique_workspace_id("csi-claude-legacy");
+        create_test_workspace(&pool, &workspace_id).await;
+        ws_queries::create_file(
+            &pool,
+            &workspace_file(
+                &workspace_id,
+                LEGACY_CLAUDE_CONFIG_PATH,
+                "/",
+                ".claude.json",
+                Some(br#"{"legacy":true}"#),
+            ),
+        )
+        .await
+        .unwrap();
+
+        ensure_claude_workspace_state(&pool, &workspace_id)
+            .await
+            .unwrap();
+
+        let config = ws_queries::get_file(&pool, &workspace_id, CLAUDE_CONFIG_PATH)
+            .await
+            .unwrap();
+        assert_eq!(
+            config.content.as_deref(),
+            Some(br#"{"legacy":true}"#.as_slice())
+        );
+
+        ws_queries::delete_workspace(&pool, &workspace_id)
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn ensure_claude_workspace_state_preserves_existing_mounted_config() {
+        let pool = test_pool().await;
+        let workspace_id = unique_workspace_id("csi-claude-preserve");
+        create_test_workspace(&pool, &workspace_id).await;
+        ws_queries::create_file(
+            &pool,
+            &workspace_file(&workspace_id, CLAUDE_DIR_PATH, "/", ".claude", None),
+        )
+        .await
+        .unwrap();
+        ws_queries::create_file(
+            &pool,
+            &workspace_file(
+                &workspace_id,
+                CLAUDE_CONFIG_PATH,
+                CLAUDE_DIR_PATH,
+                ".claude.json",
+                Some(br#"{"existing":true}"#),
+            ),
+        )
+        .await
+        .unwrap();
+        ws_queries::create_file(
+            &pool,
+            &workspace_file(
+                &workspace_id,
+                LEGACY_CLAUDE_CONFIG_PATH,
+                "/",
+                ".claude.json",
+                Some(br#"{"legacy":true}"#),
+            ),
+        )
+        .await
+        .unwrap();
+
+        ensure_claude_workspace_state(&pool, &workspace_id)
+            .await
+            .unwrap();
+
+        let config = ws_queries::get_file(&pool, &workspace_id, CLAUDE_CONFIG_PATH)
+            .await
+            .unwrap();
+        assert_eq!(
+            config.content.as_deref(),
+            Some(br#"{"existing":true}"#.as_slice())
+        );
+
+        ws_queries::delete_workspace(&pool, &workspace_id)
+            .await
+            .unwrap();
+    }
 }

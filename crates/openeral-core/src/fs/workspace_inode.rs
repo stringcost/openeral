@@ -112,4 +112,27 @@ mod tests {
         );
         assert_eq!(table.get_path(overwritten_ino), None);
     }
+
+    #[test]
+    fn remove_drops_path_and_inode_mapping() {
+        let table = WorkspaceInodeTable::new();
+        let ino = table.get_or_insert("/.claude/session.json");
+
+        table.remove("/.claude/session.json");
+
+        assert_eq!(table.get_ino("/.claude/session.json"), None);
+        assert_eq!(table.get_path(ino), None);
+    }
+
+    #[test]
+    fn rename_missing_source_allocates_destination_inode() {
+        let table = WorkspaceInodeTable::new();
+
+        table.rename("/missing", "/created-by-rename");
+
+        let ino = table
+            .get_ino("/created-by-rename")
+            .expect("destination inode should be allocated");
+        assert_eq!(table.get_path(ino), Some("/created-by-rename".to_string()));
+    }
 }

@@ -620,8 +620,10 @@ where
                 if openshell_workload_exists(&target_docker, &name).await? {
                     restart_openshell_deployment(&target_docker, &name).await?;
                 } else {
-                    log("[progress] Skipping deployment restart until the initial workload exists"
-                        .to_string());
+                    log(
+                        "[progress] Skipping deployment restart until the initial workload exists"
+                            .to_string(),
+                    );
                 }
             }
         }

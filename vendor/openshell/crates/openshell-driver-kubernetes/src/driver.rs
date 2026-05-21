@@ -2137,6 +2137,18 @@ mod tests {
             !has_workspace_mount,
             "workspace mounts must NOT be present when inject_workspace is false"
         );
+
+        let has_claude_config_mount = pod_template["spec"]["containers"][0]["volumeMounts"]
+            .as_array()
+            .is_some_and(|mounts| {
+                mounts
+                    .iter()
+                    .any(|m| m["mountPath"] == CLAUDE_CONFIG_MOUNT_PATH)
+            });
+        assert!(
+            !has_claude_config_mount,
+            "Claude config mount must NOT be present when inject_workspace is false"
+        );
     }
 
     #[test]
@@ -2166,10 +2178,12 @@ mod tests {
         assert!(volumes.iter().any(|volume| {
             volume["name"] == OPENERAL_BOOTSTRAP_VOLUME_NAME
                 && volume["hostPath"]["path"] == OPENERAL_BOOTSTRAP_NODE_PATH
+                && volume["hostPath"]["type"] == "File"
         }));
         assert!(volumes.iter().any(|volume| {
             volume["name"] == OPENERAL_PROJECT_VOLUME_NAME
                 && volume["hostPath"]["path"] == OPENERAL_PROJECT_NODE_PATH
+                && volume["hostPath"]["type"] == "Directory"
         }));
 
         let mounts = pod_template["spec"]["containers"][0]["volumeMounts"]
