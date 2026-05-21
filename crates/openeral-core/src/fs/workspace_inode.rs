@@ -56,9 +56,60 @@ impl WorkspaceInodeTable {
         }
     }
 
-    /// Rename: remove old path, insert new path with a fresh inode.
+    /// Rename: keep the moved node's inode stable at its new path.
     pub fn rename(&self, old_path: &str, new_path: &str) {
-        self.remove(old_path);
-        self.get_or_insert(new_path);
+        let old_ino = self.path_to_ino.remove(old_path).map(|(_, ino)| ino);
+        if let Some((_, overwritten_ino)) = self.path_to_ino.remove(new_path) {
+            self.ino_to_path.remove(&overwritten_ino);
+        }
+
+        if let Some(ino) = old_ino {
+            self.path_to_ino.insert(new_path.to_string(), ino);
+            self.ino_to_path.insert(ino, new_path.to_string());
+        } else {
+            self.get_or_insert(new_path);
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::WorkspaceInodeTable;
+
+    #[test]
+    fn rename_preserves_source_inode() {
+        let table = WorkspaceInodeTable::new();
+        let old_ino = table.get_or_insert("/.claude/.claude.json");
+
+        table.rename(
+            "/.claude/.claude.json",
+            "/.claude/backups/.claude.json.backup",
+        );
+
+        assert_eq!(
+            table.get_ino("/.claude/backups/.claude.json.backup"),
+            Some(old_ino)
+        );
+        assert_eq!(
+            table.get_path(old_ino),
+            Some("/.claude/backups/.claude.json.backup".to_string())
+        );
+        assert_eq!(table.get_ino("/.claude/.claude.json"), None);
+    }
+
+    #[test]
+    fn rename_drops_overwritten_destination_inode() {
+        let table = WorkspaceInodeTable::new();
+        let old_ino = table.get_or_insert("/tmp/new-config");
+        let overwritten_ino = table.get_or_insert("/.claude/.claude.json");
+
+        table.rename("/tmp/new-config", "/.claude/.claude.json");
+
+        assert_eq!(table.get_ino("/.claude/.claude.json"), Some(old_ino));
+        assert_eq!(
+            table.get_path(old_ino),
+            Some("/.claude/.claude.json".to_string())
+        );
+        assert_eq!(table.get_path(overwritten_ino), None);
     }
 }

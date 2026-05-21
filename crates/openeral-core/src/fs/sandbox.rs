@@ -96,7 +96,11 @@ impl SandboxFilesystem {
             db_nodes,
             db_inode_table: InodeTable::new(),
             db_cache: MetadataCache::new(db_config.cache_ttl),
-            workspace_cache: WorkspaceCache::new(Duration::from_secs(1)),
+            // The mounted workspace is written through this daemon, and all
+            // mutation paths invalidate the affected cache entries. Keep
+            // metadata hot across Claude's startup scan instead of forcing
+            // repeated Supabase round-trips for the same paths.
+            workspace_cache: WorkspaceCache::new(Duration::from_secs(60 * 60)),
             db_config,
             open_files: DashMap::new(),
             next_fh: std::sync::atomic::AtomicU64::new(1),
@@ -277,6 +281,10 @@ impl SandboxFilesystem {
         file
     }
 
+    fn should_truncate_on_open(flags: OpenFlags) -> bool {
+        flags.0 & libc::O_TRUNC != 0
+    }
+
     fn invalidate_workspace_path(&self, path: &str) {
         self.workspace_cache.invalidate_file(path);
         self.workspace_cache.invalidate_children(path);
@@ -421,9 +429,14 @@ pub fn mount_at<P: AsRef<Path>>(
 
 impl Filesystem for SandboxFilesystem {
     fn init(&mut self, _req: &Request, config: &mut KernelConfig) -> std::io::Result<()> {
+        // Keep metadata/directory parallelism from the smfs-style adapter, but do
+        // not enable FUSE_WRITEBACK_CACHE. Openeral's workspace is backed
+        // directly by Postgres, so close(2) must mean the database row is durable;
+        // kernel-delayed writeback can leave Postgres with a stale pre-truncate
+        // tail while reads from the same mount still look correct from page cache.
         let _ = config.add_capabilities(
             InitFlags::FUSE_ASYNC_READ
-                | InitFlags::FUSE_WRITEBACK_CACHE
+                | InitFlags::FUSE_ATOMIC_O_TRUNC
                 | InitFlags::FUSE_PARALLEL_DIROPS
                 | InitFlags::FUSE_NO_OPENDIR_SUPPORT,
         );
@@ -725,7 +738,7 @@ impl Filesystem for SandboxFilesystem {
         reply.ok();
     }
 
-    fn open(&self, _req: &Request, ino: INodeNo, _flags: OpenFlags, reply: ReplyOpen) {
+    fn open(&self, _req: &Request, ino: INodeNo, flags: OpenFlags, reply: ReplyOpen) {
         let ino_u64: u64 = ino.into();
         let path = match self.inodes.get_path(ino_u64) {
             Some(p) => p,
@@ -779,12 +792,28 @@ impl Filesystem for SandboxFilesystem {
                     reply.error(Errno::EISDIR);
                     return;
                 }
+                let mut content = file.content.unwrap_or_default();
+                if Self::should_truncate_on_open(flags) {
+                    content.clear();
+                    let now_ns = Self::now_ns();
+                    if let Err(e) = self.rt.block_on(ws_queries::update_file_content(
+                        &self.pool,
+                        &self.workspace_id,
+                        &path,
+                        &content,
+                        now_ns,
+                    )) {
+                        reply.error(e.to_errno());
+                        return;
+                    }
+                    self.invalidate_workspace_path(&path);
+                }
                 let fh = self.alloc_fh();
                 self.open_files.insert(
                     fh,
                     OpenFileHandle {
                         kind: OpenFileKind::Workspace { path },
-                        content: file.content.unwrap_or_default(),
+                        content,
                         dirty: false,
                     },
                 );
@@ -1256,6 +1285,7 @@ impl Filesystem for SandboxFilesystem {
 #[cfg(test)]
 mod tests {
     use super::SandboxFilesystem;
+    use fuser::OpenFlags;
 
     #[test]
     fn sensitive_home_paths_are_denied() {
@@ -1277,5 +1307,15 @@ mod tests {
         assert!(!SandboxFilesystem::is_sensitive_path("/.db/public/users/.info/count"));
         assert!(SandboxFilesystem::is_reserved_path("/.db"));
         assert!(SandboxFilesystem::is_reserved_path("/.db/public"));
+    }
+
+    #[test]
+    fn open_truncate_flag_is_detected() {
+        assert!(SandboxFilesystem::should_truncate_on_open(OpenFlags(
+            libc::O_WRONLY | libc::O_TRUNC
+        )));
+        assert!(!SandboxFilesystem::should_truncate_on_open(OpenFlags(
+            libc::O_WRONLY
+        )));
     }
 }

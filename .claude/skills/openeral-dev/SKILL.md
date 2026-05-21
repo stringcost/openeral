@@ -14,6 +14,9 @@ Optimize for one product result:
 - OpenShell runs through the embedded-k3s path
 - Openeral storage is mounted at `/sandbox`
 - `/.db` is read-only database context under `/sandbox/.db`
+- Claude uses local `HOME=/home/agent`
+- Claude config is persisted by mounting `/.claude` at `/home/agent/.claude`
+- source code is host-mounted at `/sandbox/project`
 - workspace rows persist in PostgreSQL
 
 ## Current Verified State
@@ -25,12 +28,20 @@ Verified:
 - provider placeholders are visible on the real `sandbox exec` path
 - same-name recreate preserves workspace state
 - the truncate/overwrite storage bug against Supabase is fixed
+- `/home/agent/.claude` is mounted as a real directory, not symlinked
+- `CLAUDE_CONFIG_DIR=/home/agent/.claude` is projected into `sandbox exec`
+- `/home/agent/.claude.json` is absent; top-level Claude config lives at
+  `/home/agent/.claude/.claude.json`
+- `/sandbox/project` is host-mounted and excluded from workspace persistence
+- first-run `claude -p` has returned `READY` through the live exec path
 
 Still open:
 
-- clean final `claude -p` completion through `openshell sandbox exec`
-- the latest live failure is after storage, provider env, and Anthropic access
-  are already working
+- rerun the full READY / READY-AGAIN smoke after the latest FUSE `O_TRUNC`
+  fix
+- the latest live failure was stale-tail JSON in `/.claude/.claude.json` after
+  a truncating rewrite; code now handles `FUSE_ATOMIC_O_TRUNC`, but the stack
+  was stopped before a full rerun completed
 
 Do not collapse those into one “everything is green” story.
 
@@ -91,19 +102,34 @@ Current smoke mechanics:
   returns before later `sandbox exec` checks
 - `OPENERAL_KEEP_CLUSTER_ON_FAILURE=1` preserves the live cluster for
   inspection
+- the smoke asserts `HOME=/home/agent` and
+  `CLAUDE_CONFIG_DIR=/home/agent/.claude`
+- the smoke asserts `/home/agent/.claude` is a mount and
+  `/home/agent/.claude.json` is absent
+- the smoke writes a semantic marker through
+  `/home/agent/.claude/.claude.json` and verifies the Postgres row at
+  `/.claude/.claude.json`
+- the smoke asserts `/sandbox/project` writes stay out of Postgres
 
 ## Files That Matter Most
 
 - `crates/openeral-core/src/fs/sandbox.rs`
+- `crates/openeral-core/src/fs/workspace_inode.rs`
+- `crates/openeral-core/src/cli/bootstrap.rs`
 - `crates/openeral-core/src/db/queries/workspace.rs`
 - `crates/openeral-csi/src/main.rs`
+- `vendor/openshell/crates/openshell-driver-kubernetes/src/driver.rs`
+- `vendor/openshell/crates/openshell-sandbox/src/lib.rs`
 - `tests/test_live_supabase_env.sh`
 - `sandboxes/openeral/policy.yaml`
 
 ## Hard Rules
 
-- Do not switch the docs back to `/home/agent`.
+- Do not make the whole home directory durable again.
+- Do not replace the mounted `.claude` directory design with copy-in/copy-out
+  sync unless the product requirement changes.
+- Do not describe `/home/agent/.claude.json` as the active config path.
 - Do not reintroduce `POSTGRES_URL` as the supported external contract.
 - Do not treat a failing `psql` preflight as an Openeral runtime bug.
-- Keep the known Claude completion gap explicit until it is actually fixed and
-  reverified.
+- Keep the full-smoke verification gap explicit until READY / READY-AGAIN is
+  rerun after the FUSE `O_TRUNC` fix.

@@ -14,6 +14,7 @@ use crate::error::FsError;
 const BOOTSTRAP_ENV_PATH: &str = "/tmp/openeral-bootstrap.env";
 const OPENERAL_ENV_REL: &str = ".openeral/env.sh";
 const OPENERAL_CONNECT_CWD_ENV: &str = "OPENERAL_CONNECT_CWD";
+const CLAUDE_CONFIG_DIR_ENV: &str = "CLAUDE_CONFIG_DIR";
 const NPMRC_PATH: &str = "/tmp/openeral-npmrc";
 const OPENCLAW_PORT: &str = "18789";
 
@@ -83,6 +84,12 @@ fn prepare(args: BootstrapArgs) -> Result<(), FsError> {
         OPENERAL_CONNECT_CWD_ENV.to_string(),
         args.connect_cwd.display().to_string(),
     );
+    if agent == AgentKind::Claude {
+        child_env.insert(
+            CLAUDE_CONFIG_DIR_ENV.to_string(),
+            args.home.join(".claude").display().to_string(),
+        );
+    }
     child_env.insert("NODE_NO_WARNINGS".to_string(), "1".to_string());
 
     if let Some(proxy_url) = &stringcost_proxy_url {
@@ -213,85 +220,39 @@ fn seed_agent_home(home: &Path, agent: AgentKind) -> Result<(), FsError> {
 
 fn prepare_claude_home(home: &Path, durable_home: &Path) -> Result<(), FsError> {
     fs::create_dir_all(durable_home)?;
-    fs::create_dir_all(durable_home.join(".claude"))?;
-    ensure_symlinked_path(
-        &home.join(".claude"),
-        &durable_home.join(".claude"),
-        SymlinkKind::Directory,
-    )?;
-    ensure_symlinked_path(
-        &home.join(".claude.json"),
-        &durable_home.join(".claude.json"),
-        SymlinkKind::File,
-    )?;
-    Ok(())
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum SymlinkKind {
-    File,
-    Directory,
-}
-
-fn ensure_symlinked_path(
-    link_path: &Path,
-    target_path: &Path,
-    _kind: SymlinkKind,
-) -> Result<(), FsError> {
-    if let Some(parent) = link_path.parent() {
-        fs::create_dir_all(parent)?;
+    let config_dir = home.join(".claude");
+    if fs::symlink_metadata(&config_dir)
+        .map(|metadata| metadata.file_type().is_symlink())
+        .unwrap_or(false)
+    {
+        fs::remove_file(&config_dir)?;
     }
-    if let Some(parent) = target_path.parent() {
-        fs::create_dir_all(parent)?;
-    }
+    fs::create_dir_all(&config_dir)?;
 
-    match fs::symlink_metadata(link_path) {
-        Ok(metadata) => {
-            if metadata.file_type().is_symlink() {
-                if fs::read_link(link_path).ok().as_deref() == Some(target_path) {
-                    return Ok(());
-                }
-                fs::remove_file(link_path)?;
-            } else if !target_path.exists() {
-                fs::rename(link_path, target_path)?;
-            } else if metadata.is_dir() {
-                merge_directory_contents(link_path, target_path)?;
-                fs::remove_dir_all(link_path)?;
-            } else {
-                fs::remove_file(link_path)?;
-            }
+    let local_legacy_file = home.join(".claude.json");
+    match fs::symlink_metadata(&local_legacy_file) {
+        Ok(metadata) if metadata.file_type().is_symlink() || metadata.is_file() => {
+            fs::remove_file(&local_legacy_file)?;
         }
+        Ok(metadata) if metadata.is_dir() => {
+            warn!(
+                path = %local_legacy_file.display(),
+                "leaving unexpected directory at legacy Claude config path"
+            );
+        }
+        Ok(_) => {}
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
         Err(error) => return Err(FsError::IoError(error)),
     }
 
-    #[cfg(unix)]
-    {
-        std::os::unix::fs::symlink(target_path, link_path)?;
-    }
-    #[cfg(not(unix))]
-    {
-        match _kind {
-            SymlinkKind::File => std::os::windows::fs::symlink_file(target_path, link_path)?,
-            SymlinkKind::Directory => {
-                std::os::windows::fs::symlink_dir(target_path, link_path)?
-            }
+    let config_file = config_dir.join(".claude.json");
+    if !config_file.exists() {
+        let legacy_durable_file = durable_home.join(".claude.json");
+        if legacy_durable_file.is_file() {
+            fs::copy(&legacy_durable_file, &config_file)?;
+        } else {
+            write_json_file(&config_file, &json!({}))?;
         }
-    }
-
-    Ok(())
-}
-
-fn merge_directory_contents(source_dir: &Path, target_dir: &Path) -> Result<(), FsError> {
-    fs::create_dir_all(target_dir)?;
-    for entry in fs::read_dir(source_dir)? {
-        let entry = entry?;
-        let source_path = entry.path();
-        let target_path = target_dir.join(entry.file_name());
-        if target_path.exists() {
-            continue;
-        }
-        fs::rename(source_path, target_path)?;
     }
     Ok(())
 }
@@ -776,7 +737,7 @@ mod tests {
     }
 
     #[test]
-    fn prepare_claude_home_symlinks_to_durable_workspace() {
+    fn prepare_claude_home_uses_mounted_config_directory() {
         let base = temp_test_dir("bootstrap-home");
         let home = base.join("home");
         let durable = base.join("sandbox");
@@ -785,10 +746,57 @@ mod tests {
 
         prepare_claude_home(&home, &durable).unwrap();
 
-        assert_eq!(fs::read_link(home.join(".claude")).unwrap(), durable.join(".claude"));
+        assert!(home.join(".claude").is_dir());
+        assert!(!fs::symlink_metadata(home.join(".claude"))
+            .unwrap()
+            .file_type()
+            .is_symlink());
+        assert!(!home.join(".claude.json").exists());
         assert_eq!(
-            fs::read_link(home.join(".claude.json")).unwrap(),
-            durable.join(".claude.json")
+            fs::read_to_string(home.join(".claude/.claude.json")).unwrap(),
+            "{}"
+        );
+
+        fs::remove_dir_all(base).unwrap();
+    }
+
+    #[test]
+    fn prepare_claude_home_migrates_legacy_durable_config() {
+        let base = temp_test_dir("bootstrap-home-legacy");
+        let home = base.join("home");
+        let durable = base.join("sandbox");
+        fs::create_dir_all(&home).unwrap();
+        fs::create_dir_all(&durable).unwrap();
+        fs::write(durable.join(".claude.json"), "{\"legacy\":true}").unwrap();
+
+        prepare_claude_home(&home, &durable).unwrap();
+
+        assert_eq!(
+            fs::read_to_string(home.join(".claude/.claude.json")).unwrap(),
+            "{\"legacy\":true}"
+        );
+
+        fs::remove_dir_all(base).unwrap();
+    }
+
+    #[test]
+    fn prepare_claude_home_removes_legacy_local_config_symlink() {
+        let base = temp_test_dir("bootstrap-home-symlink");
+        let home = base.join("home");
+        let durable = base.join("sandbox");
+        fs::create_dir_all(&home).unwrap();
+        fs::create_dir_all(&durable).unwrap();
+        fs::write(durable.join(".claude.json"), "{\"legacy\":true}").unwrap();
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(durable.join(".claude.json"), home.join(".claude.json"))
+            .unwrap();
+
+        prepare_claude_home(&home, &durable).unwrap();
+
+        assert!(!home.join(".claude.json").exists());
+        assert_eq!(
+            fs::read_to_string(home.join(".claude/.claude.json")).unwrap(),
+            "{\"legacy\":true}"
         );
 
         fs::remove_dir_all(base).unwrap();

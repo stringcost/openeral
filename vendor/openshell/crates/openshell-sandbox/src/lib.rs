@@ -2210,6 +2210,16 @@ fn prepare_read_write_path(path: &std::path::Path) -> Result<bool> {
     }
 }
 
+#[cfg(unix)]
+fn should_chown_existing_read_write_path(path: &std::path::Path) -> bool {
+    // /home/agent is container-local scratch state for the sandbox identity.
+    // Some base images ship it as root-owned, but Openeral bootstrap runs after
+    // dropping to the sandbox user and must write .openeral plus local HOME
+    // files there. Keep the exception exact so host/project mounts are not
+    // accidentally re-owned.
+    path == std::path::Path::new("/home/agent")
+}
+
 /// Prepare filesystem for the sandboxed process.
 ///
 /// Creates `read_write` directories if they don't exist and sets ownership
@@ -2258,12 +2268,14 @@ fn prepare_filesystem(policy: &SandboxPolicy) -> Result<()> {
 
     // Create missing read_write paths and only chown the ones we created.
     for path in &policy.filesystem.read_write {
-        if prepare_read_write_path(path)? {
+        let created = prepare_read_write_path(path)?;
+        if created || should_chown_existing_read_write_path(path) {
             debug!(
                 path = %path.display(),
                 ?uid,
                 ?gid,
-                "Setting ownership on newly created read_write path"
+                created,
+                "Setting ownership on sandbox-local read_write path"
             );
             chown(path, uid, gid).into_diagnostic()?;
         }

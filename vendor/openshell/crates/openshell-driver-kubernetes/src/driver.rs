@@ -83,6 +83,8 @@ const WORKSPACE_VOLUME_NAME: &str = "workspace";
 /// the image's `/sandbox` directory — the init container copies the image
 /// contents into the PVC before the agent starts.
 const WORKSPACE_MOUNT_PATH: &str = "/sandbox";
+const CLAUDE_CONFIG_MOUNT_PATH: &str = "/home/agent/.claude";
+const CLAUDE_CONFIG_WORKSPACE_SUBPATH: &str = ".claude";
 
 /// Mount path for the workspace PVC in the **init** container.  A temporary
 /// path so the init container can see the image's original `/sandbox` and
@@ -866,6 +868,11 @@ fn apply_workspace_persistence(
                 volume_mounts.push(serde_json::json!({
                     "name": WORKSPACE_VOLUME_NAME,
                     "mountPath": WORKSPACE_MOUNT_PATH
+                }));
+                volume_mounts.push(serde_json::json!({
+                    "name": WORKSPACE_VOLUME_NAME,
+                    "mountPath": CLAUDE_CONFIG_MOUNT_PATH,
+                    "subPath": CLAUDE_CONFIG_WORKSPACE_SUBPATH
                 }));
             }
         }
@@ -2021,6 +2028,13 @@ mod tests {
             .find(|m| m["name"] == WORKSPACE_VOLUME_NAME)
             .expect("workspace mount should exist on agent container");
         assert_eq!(workspace_mount["mountPath"], WORKSPACE_MOUNT_PATH);
+        let claude_mount = agent_mounts
+            .iter()
+            .find(|m| {
+                m["name"] == WORKSPACE_VOLUME_NAME && m["mountPath"] == CLAUDE_CONFIG_MOUNT_PATH
+            })
+            .expect("Claude config mount should exist on agent container");
+        assert_eq!(claude_mount["subPath"], CLAUDE_CONFIG_WORKSPACE_SUBPATH);
 
         // The PVC volume is NOT created by apply_workspace_persistence — the
         // Sandbox CRD controller adds it from the volumeClaimTemplates.
@@ -2121,7 +2135,7 @@ mod tests {
             .is_some_and(|mounts| mounts.iter().any(|m| m["name"] == WORKSPACE_VOLUME_NAME));
         assert!(
             !has_workspace_mount,
-            "workspace mount must NOT be present when inject_workspace is false"
+            "workspace mounts must NOT be present when inject_workspace is false"
         );
     }
 

@@ -1,18 +1,23 @@
 ---
 name: openeral-shell
-description: Run the current Openeral/OpenShell k3s flow with durable /sandbox, read-only /.db, and shell-sourced OPENERAL_DATABASE_URL
+description: Run the current Openeral/OpenShell k3s flow with durable /sandbox, mounted Claude config, read-only /.db, and shell-sourced OPENERAL_DATABASE_URL
 ---
 
 # OpenEral Shell
 
 Use this when the goal is to operate the current Openeral stack, not the old
-`/home/agent` Docker-driver path.
+whole-home persistence path.
 
 Assume:
 
 - the durable writable path is `/sandbox`
 - the database browser path is `/sandbox/.db`
-- `HOME=/sandbox`
+- the fast local home is `/home/agent`
+- `CLAUDE_CONFIG_DIR=/home/agent/.claude`
+- `/home/agent/.claude` is a mounted directory backed by workspace path
+  `/.claude`
+- `/home/agent/.claude/.claude.json` is the active top-level Claude config
+- `/sandbox/project` is the host-mounted source tree
 - the external DB variable is `OPENERAL_DATABASE_URL`
 - `.env` must be sourced explicitly by the shell
 
@@ -39,11 +44,14 @@ Verified now:
 - workspace writes persist to `_openeral.workspace_files`
 - same-name recreate on the same database restores state
 - Claude starts and reaches Anthropic
+- `sandbox exec` uses `HOME=/home/agent`
+- Claude config persists through the mounted `.claude` directory
+- host project writes stay out of the Postgres workspace
 
 Known gap:
 
-- the final `claude -p ...` completion path still does not return cleanly
-  within the current smoke timeout
+- rerun the full READY / READY-AGAIN smoke after the latest FUSE `O_TRUNC`
+  fix; the stack was stopped before that final verification completed
 
 ## Live Validation
 
@@ -54,8 +62,8 @@ bash tests/test_live_supabase_env.sh
 ```
 
 Treat that as the current live harness for the shell-sourced Supabase flow. It
-is the best storage/persistence proof, but it should not yet be described as a
-fully green Claude smoke.
+is the storage, Claude-config, host-project, and recreate proof. Do not describe
+it as green until it passes after the current FUSE truncate fix.
 
 Current harness behavior that matters:
 
@@ -64,6 +72,9 @@ Current harness behavior that matters:
   `openshell/ci:dev`
 - it mirrors the stock community base sandbox image into the local registry
 - it uses a short-lived initial create command so `sandbox create` returns
+- it checks `/home/agent/.claude` mount semantics and semantic persistence of
+  `/.claude/.claude.json`
+- it checks `/sandbox/project` is host-mounted and not persisted to Postgres
 
 ## OpenShell CLI
 
@@ -81,7 +92,10 @@ mirror to exist or be built first.
 
 ## Hard Rules
 
-- Do not document `/home/agent` or top-level `/db` as the current runtime.
+- Do not document whole-home persistence as the current runtime.
+- Do not document `/home/agent/.claude.json` as the active config path.
+- Do not document top-level `/db` as the current runtime.
 - Do not use `POSTGRES_URL` as the supported Openeral input variable.
 - Do not rely on implicit `.env` loading.
-- Keep docs honest about the current Claude completion gap.
+- Keep docs honest about the pending full-smoke rerun after the FUSE `O_TRUNC`
+  fix.

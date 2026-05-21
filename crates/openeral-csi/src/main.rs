@@ -10,9 +10,10 @@ use std::sync::Arc;
 use clap::{Args, Parser, Subcommand};
 use openeral_core::config::types::WorkspaceMountConfig;
 use openeral_core::db::migrate;
-use openeral_core::db::pool::create_pool;
+use openeral_core::db::pool::{create_pool, DbPool};
 use openeral_core::db::queries::workspace as ws_queries;
-use openeral_core::db::types::WorkspaceLayout;
+use openeral_core::db::types::{WorkspaceFile, WorkspaceLayout};
+use openeral_core::error::FsError;
 use serde_json::Value;
 use sha2::{Digest, Sha256};
 use tokio::net::UnixListener;
@@ -38,6 +39,9 @@ const DEFAULT_ENDPOINT: &str = "/csi/csi.sock";
 const DEFAULT_GATEWAY_ENDPOINT: &str = "https://openshell.openshell.svc.cluster.local:8080";
 const DEFAULT_SANDBOX_UID: i32 = 998;
 const DEFAULT_SANDBOX_GID: i32 = 998;
+const CLAUDE_DIR_PATH: &str = "/.claude";
+const CLAUDE_CONFIG_PATH: &str = "/.claude/.claude.json";
+const LEGACY_CLAUDE_CONFIG_PATH: &str = "/.claude.json";
 
 #[derive(Parser, Debug)]
 #[command(name = "openeral-csi", about = "Openeral CSI plugin")]
@@ -453,6 +457,7 @@ async fn prepare_workspace_mount(
         }
     };
     ws_queries::seed_from_config(&pool, workspace_key, &workspace.config).await?;
+    ensure_claude_workspace_state(&pool, workspace_key).await?;
     ws_queries::normalize_workspace_owner(
         &pool,
         workspace_key,
@@ -468,6 +473,75 @@ async fn prepare_workspace_mount(
         display_name: workspace.display_name,
         statement_timeout_secs: 30,
     })
+}
+
+async fn ensure_claude_workspace_state(
+    pool: &DbPool,
+    workspace_key: &str,
+) -> Result<(), FsError> {
+    let now_ns = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_nanos() as i64;
+
+    let dir = WorkspaceFile {
+        workspace_id: workspace_key.to_string(),
+        path: CLAUDE_DIR_PATH.to_string(),
+        parent_path: "/".to_string(),
+        name: ".claude".to_string(),
+        is_dir: true,
+        content: None,
+        mode: 0o40755,
+        size: 0,
+        mtime_ns: now_ns,
+        ctime_ns: now_ns,
+        atime_ns: now_ns,
+        nlink: 2,
+        uid: DEFAULT_SANDBOX_UID,
+        gid: DEFAULT_SANDBOX_GID,
+    };
+    match ws_queries::create_file(pool, &dir).await {
+        Ok(()) | Err(FsError::FileExists) => {}
+        Err(err) => return Err(err),
+    }
+
+    match ws_queries::get_file_metadata(pool, workspace_key, CLAUDE_CONFIG_PATH).await {
+        Ok(_) => return Ok(()),
+        Err(FsError::NotFound) => {}
+        Err(err) => return Err(err),
+    }
+
+    let content = match ws_queries::get_file(pool, workspace_key, LEGACY_CLAUDE_CONFIG_PATH).await {
+        Ok(file) if !file.is_dir => match file.content {
+            Some(content) if !content.is_empty() => content,
+            _ => b"{}".to_vec(),
+        },
+        Err(FsError::NotFound) => b"{}".to_vec(),
+        Err(err) => return Err(err),
+        _ => b"{}".to_vec(),
+    };
+
+    let config = WorkspaceFile {
+        workspace_id: workspace_key.to_string(),
+        path: CLAUDE_CONFIG_PATH.to_string(),
+        parent_path: CLAUDE_DIR_PATH.to_string(),
+        name: ".claude.json".to_string(),
+        is_dir: false,
+        size: content.len() as i64,
+        content: Some(content),
+        mode: 0o100644,
+        mtime_ns: now_ns,
+        ctime_ns: now_ns,
+        atime_ns: now_ns,
+        nlink: 1,
+        uid: DEFAULT_SANDBOX_UID,
+        gid: DEFAULT_SANDBOX_GID,
+    };
+    match ws_queries::create_file(pool, &config).await {
+        Ok(()) | Err(FsError::FileExists) => {}
+        Err(err) => return Err(err),
+    }
+    Ok(())
 }
 
 fn workspace_key(database_url: &str, sandbox_name: &str) -> Result<String, Status> {

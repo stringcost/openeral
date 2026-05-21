@@ -46,6 +46,10 @@ elif docker image inspect openeral/openshell-cli-runner:dev >/dev/null 2>&1; the
 else
   RUNNER_IMAGE="openshell/ci:dev"
 fi
+run_cli_uses_runner=false
+if [ -f "$OPENSHELL_BIN" ] && docker image inspect "$RUNNER_IMAGE" >/dev/null 2>&1; then
+  run_cli_uses_runner=true
+fi
 runner_state_dir="$repo_root/.tmp/openshell-cli"
 mkdir -p "$runner_state_dir"
 
@@ -65,11 +69,13 @@ sandbox_source_image="${OPENERAL_SUPABASE_SANDBOX_SOURCE_IMAGE:-ghcr.io/nvidia/o
 sandbox_image="${OPENERAL_SUPABASE_SANDBOX_IMAGE:-$sandbox_source_image}"
 policy_path="${OPENERAL_SUPABASE_POLICY_PATH:-$repo_root/sandboxes/openeral/policy.yaml}"
 policy_path_arg="$policy_path"
-case "$policy_path_arg" in
-  "$repo_root"/*)
-    policy_path_arg="/workspace${policy_path_arg#$repo_root}"
-    ;;
-esac
+if [ "$run_cli_uses_runner" = true ]; then
+  case "$policy_path_arg" in
+    "$repo_root"/*)
+      policy_path_arg="/workspace${policy_path_arg#$repo_root}"
+      ;;
+  esac
+fi
 local_registry_container="${OPENERAL_LOCAL_REGISTRY_CONTAINER:-openeral-registry}"
 
 cluster_image="${OPENSHELL_CLUSTER_IMAGE:-127.0.0.1:5000/openeral/cluster:dev}"
@@ -224,7 +230,7 @@ PY
 }
 
 run_cli() {
-  if [ -f "$OPENSHELL_BIN" ] && docker image inspect "$RUNNER_IMAGE" >/dev/null 2>&1; then
+  if [ "$run_cli_uses_runner" = true ]; then
     runner_bin="$OPENSHELL_BIN"
     case "$runner_bin" in
       "$repo_root"/*)
@@ -265,6 +271,15 @@ run_cli() {
     OPENSHELL_PUSH_IMAGES="$push_images" \
     OPENERAL_HOST_PROJECT_ROOT="$repo_root" \
     "$OPENSHELL_BIN" "$@"
+  fi
+}
+
+assert_no_claude_config_warning() {
+  local stderr_file="$1"
+  if grep -qiE 'claude\.json.*(missing|not found|backup|reset)|(missing|not found|backup|reset).*claude\.json' "$stderr_file"; then
+    echo "Claude reported config reset or missing .claude.json" >&2
+    cat "$stderr_file" >&2
+    exit 1
   fi
 }
 
@@ -442,7 +457,14 @@ provider_env="$(
 printf '%s\n' "$provider_env"
 printf '%s\n' "$provider_env" | grep -q '^ANTHROPIC_API_KEY=openshell:resolve:env:ANTHROPIC_API_KEY$'
 printf '%s\n' "$provider_env" | grep -q '^HOME=/home/agent$'
+printf '%s\n' "$provider_env" | grep -q '^CLAUDE_CONFIG_DIR=/home/agent/.claude$'
 printf '%s\n' "$provider_env" | grep -q '^PWD=/sandbox/project$'
+
+echo "== verify Claude config directory mount =="
+run_cli sandbox exec --gateway "$gateway_name" --name "$sandbox_name" --no-tty \
+  /usr/bin/python3 -c "from pathlib import Path; p = Path('/home/agent/.claude'); legacy = Path('/home/agent/.claude.json'); assert p.is_dir(); assert not p.is_symlink(); assert Path('/home/agent/.claude/.claude.json').is_file(); assert not legacy.exists(); assert not legacy.is_symlink()"
+run_cli sandbox exec --gateway "$gateway_name" --name "$sandbox_name" --no-tty \
+  /bin/sh -lc "awk '\$2 == \"/home/agent/.claude\" { found=1 } END { exit(found ? 0 : 1) }' /proc/mounts"
 
 echo "== verify /sandbox/project host mount =="
 rm -f "$host_project_probe_host"
@@ -502,6 +524,7 @@ fi
 cat "$claude_stdout"
 cat "$claude_stderr" >&2
 grep -q 'READY' "$claude_stdout"
+assert_no_claude_config_warning "$claude_stderr"
 rm -f "$claude_stdout" "$claude_stderr"
 
 echo "== claude row count =="
@@ -514,15 +537,22 @@ psql "$OPENERAL_DATABASE_URL" -Atqc \
 printf '%s\n' "$claude_rows"
 [ "${claude_rows:-0}" -gt 0 ]
 
-echo "== claude.json row count =="
-claude_json_rows="$(
+echo "== write Claude config semantic marker =="
+run_cli sandbox exec --gateway "$gateway_name" --name "$sandbox_name" --no-tty \
+  /usr/bin/env OPENERAL_SMOKE_ID="$run_id" \
+  /usr/bin/python3 -c "import json, os; from pathlib import Path; p = Path('/home/agent/.claude/.claude.json'); data = json.loads(p.read_text() or '{}'); data.setdefault('openeralSmoke', {})['runId'] = os.environ['OPENERAL_SMOKE_ID']; p.write_text(json.dumps(data, sort_keys=True) + '\n')"
+
+echo "== Claude config marker row =="
+claude_config_marker="$(
 psql "$OPENERAL_DATABASE_URL" -Atqc \
-  "SELECT count(*)
+  "SELECT convert_from(content, 'UTF8')::jsonb #>> '{openeralSmoke,runId}'
    FROM _openeral.workspace_files
-   WHERE workspace_id LIKE '%:${sandbox_name}' AND path = '/.claude.json';"
+   WHERE workspace_id LIKE '%:${sandbox_name}' AND path = '/.claude/.claude.json'
+   ORDER BY workspace_id DESC
+   LIMIT 1;"
 )"
-printf '%s\n' "$claude_json_rows"
-[ "${claude_json_rows:-0}" -gt 0 ]
+printf '%s\n' "$claude_config_marker"
+[ "$claude_config_marker" = "$run_id" ]
 
 echo "== recreate same sandbox name =="
 run_cli sandbox delete --gateway "$gateway_name" "$sandbox_name" >/dev/null || true
@@ -549,6 +579,13 @@ wait_for_exec_ready
 echo "== persisted claude file after recreate =="
 run_cli sandbox exec --gateway "$gateway_name" --name "$sandbox_name" --no-tty /bin/cat /sandbox/.claude/openeral-smoke.txt
 
+echo "== persisted Claude config directory after recreate =="
+run_cli sandbox exec --gateway "$gateway_name" --name "$sandbox_name" --no-tty \
+  /usr/bin/python3 -c "from pathlib import Path; p = Path('/home/agent/.claude'); legacy = Path('/home/agent/.claude.json'); assert p.is_dir(); assert not p.is_symlink(); assert Path('/home/agent/.claude/.claude.json').is_file(); assert not legacy.exists(); assert not legacy.is_symlink()"
+run_cli sandbox exec --gateway "$gateway_name" --name "$sandbox_name" --no-tty \
+  /usr/bin/env OPENERAL_SMOKE_ID="$run_id" \
+  /usr/bin/python3 -c "import json, os; from pathlib import Path; data = json.loads(Path('/home/agent/.claude/.claude.json').read_text() or '{}'); assert data.get('openeralSmoke', {}).get('runId') == os.environ['OPENERAL_SMOKE_ID']"
+
 echo "== persisted claude rows after recreate =="
 persisted_claude_rows="$(
 psql "$OPENERAL_DATABASE_URL" -Atqc \
@@ -559,15 +596,17 @@ psql "$OPENERAL_DATABASE_URL" -Atqc \
 printf '%s\n' "$persisted_claude_rows"
 [ "${persisted_claude_rows:-0}" -gt 0 ]
 
-echo "== persisted claude.json after recreate =="
-persisted_claude_json_rows="$(
+echo "== persisted Claude config marker after recreate =="
+persisted_claude_config_marker="$(
 psql "$OPENERAL_DATABASE_URL" -Atqc \
-  "SELECT count(*)
+  "SELECT convert_from(content, 'UTF8')::jsonb #>> '{openeralSmoke,runId}'
    FROM _openeral.workspace_files
-   WHERE workspace_id LIKE '%:${sandbox_name}' AND path = '/.claude.json';"
+   WHERE workspace_id LIKE '%:${sandbox_name}' AND path = '/.claude/.claude.json'
+   ORDER BY workspace_id DESC
+   LIMIT 1;"
 )"
-printf '%s\n' "$persisted_claude_json_rows"
-[ "${persisted_claude_json_rows:-0}" -gt 0 ]
+printf '%s\n' "$persisted_claude_config_marker"
+[ "$persisted_claude_config_marker" = "$run_id" ]
 
 echo "== claude after recreate =="
 claude_stdout="$(mktemp)"
@@ -584,6 +623,7 @@ fi
 cat "$claude_stdout"
 cat "$claude_stderr" >&2
 grep -q 'READY-AGAIN' "$claude_stdout"
+assert_no_claude_config_warning "$claude_stderr"
 rm -f "$claude_stdout" "$claude_stderr"
 
 echo "Supabase .env validation passed"
